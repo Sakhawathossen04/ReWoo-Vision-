@@ -1,13 +1,23 @@
 // download_page/logic/download_logic.dart
+//
+// Priority 1 + Priority 2 implementation:
+//  - Authentication is fully automatic. The app uses the developer's bundled
+//    Hugging Face read token (constants.dart) so the end user never has to
+//    create a Hugging Face account or type a login.
+//  - The download itself runs as an Android background task
+//    (flutter_downloader / WorkManager + foreground notification) and keeps
+//    running when the app goes to the background, is minimised, or the phone
+//    switches from Wi-Fi to mobile data (allowCellular: true).
+//  - Transient failures are resumed automatically a few times before the
+//    user is asked to intervene.
 
 import 'dart:async';
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_downloader/flutter_downloader.dart';
-import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:gemma_chat/chat_page/gemma_vision_chat.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../config/constants.dart';
 import '../models/enums.dart';
@@ -15,8 +25,6 @@ import '../models/models.dart';
 import '../services/logger.dart';
 import '../services/download_state_manager.dart';
 import '../services/download_manager.dart';
-import '../services/token_manager.dart';
-import '../services/huggingface_oauth.dart';
 
 /// Business logic class that handles all download-related operations.
 class DownloadPageLogic {
@@ -24,16 +32,18 @@ class DownloadPageLogic {
   final Function(DownloadStatus) setDownloadStatus;
   final Function(DownloadProgress?) setProgress;
   final Function(List<String>) setErrorMessages;
-  final Function(bool) setShowAgreementSheet;
 
   // Timer for monitoring download progress - needs to be tracked for cleanup
   Timer? _monitoringTimer;
+
+  // Auto-recovery bookkeeping (Priority 2: downloads must not just die).
+  int _autoResumeAttempts = 0;
+  static const int _maxAutoResumeAttempts = 5;
 
   DownloadPageLogic({
     required this.setDownloadStatus,
     required this.setProgress,
     required this.setErrorMessages,
-    required this.setShowAgreementSheet,
   });
 
   /// Clean up resources when this logic instance is no longer needed.
@@ -90,7 +100,7 @@ class DownloadPageLogic {
         'Checking download state - saved: $savedState, taskId: $savedTaskId',
       );
 
-      // If we had a download in progress, try to resume it
+      // If we had a download in progress, re-attach and keep it running
       if (savedState == 'in_progress' && savedTaskId != null) {
         Logger.info(
           'Found saved download in progress with task ID: $savedTaskId',
@@ -132,14 +142,27 @@ class DownloadPageLogic {
         // Resume appropriate behavior based on the task's current status
         switch (task.status) {
           case DownloadTaskStatus.paused:
-            setDownloadStatus(DownloadStatus.paused);
-            monitorDownload(task.taskId, context);
-            Logger.info('Found paused download, showing resume option');
+            // Priority 2: never leave a paused download stuck — resume it.
+            Logger.info('Auto-resuming paused download from previous session');
+            await resumeDownload();
             break;
           case DownloadTaskStatus.running:
           case DownloadTaskStatus.enqueued:
             setDownloadStatus(DownloadStatus.downloading);
             monitorDownload(task.taskId, context);
+            break;
+          case DownloadTaskStatus.failed:
+            // Priority 2: a failed download from a killed app is retried
+            // automatically instead of showing an error immediately.
+            Logger.info('Auto-retrying failed download from previous session');
+            final retriedId = await DownloadManager.retryDownload();
+            if (retriedId != null) {
+              await DownloadStateManager.saveDownloadInProgress(retriedId);
+              setDownloadStatus(DownloadStatus.downloading);
+              monitorDownload(retriedId, context);
+            } else {
+              await resumeDownload();
+            }
             break;
           case DownloadTaskStatus.complete:
             // Verify the file actually exists before declaring success
@@ -155,11 +178,6 @@ class DownloadPageLogic {
               // File missing despite completion - clean up state
               await DownloadStateManager.clearDownloadState();
             }
-            break;
-          case DownloadTaskStatus.failed:
-            setDownloadStatus(DownloadStatus.failed);
-            await DownloadStateManager.clearDownloadState();
-            handleError('Download failed while app was in background');
             break;
           case DownloadTaskStatus.canceled:
           default:
@@ -189,157 +207,85 @@ class DownloadPageLogic {
     }
   }
 
-  /// Initiates the download process, handling authentication if required.
-  /// This is the main entry point for starting a new download.
+  /// Whether the automatic (no-touch) download can run right now.
+  /// Used by the download page to start the pipeline without any tap.
+  Future<bool> canAutoStartDownload() async {
+    if (!hfTokenConfigured) {
+      Logger.warning(
+        'hfAppToken is not configured — automatic download disabled.',
+      );
+      return false;
+    }
+    if (await checkIfModelExists()) return false;
+
+    final savedState = await DownloadStateManager.getDownloadState();
+    return savedState != 'in_progress';
+  }
+
+  /// Initiates the download process. Authentication is automatic:
+  /// the bundled developer token is validated against Hugging Face and the
+  /// download starts without any user interaction.
   Future<void> startDownload() async {
     setDownloadStatus(DownloadStatus.checkingAccess);
     setErrorMessages([]); // Clear any previous errors
 
     Logger.info('Starting download process for $modelFullName');
 
-    // First, check if the model requires authentication
-    final responseCode = await DownloadManager.checkModelAccess(downloadUrl);
+    if (!hfTokenConfigured) {
+      handleError(
+        'অ্যাপ সেটআপ অসম্পূর্ণ: ডেভেলপার Hugging Face টোকেন যোগ করা হয়নি। '
+        'ডাউনলোড শুরু করতে অ্যাডমিনের সহায়তা নিন।',
+      );
+      return;
+    }
 
-    if (responseCode == 200) {
-      // Public model - can download directly without authentication
-      await downloadModel(null);
+    setDownloadStatus(DownloadStatus.authenticating);
+
+    // Automatic Hugging Face authentication with the bundled token.
+    final responseCode = await DownloadManager.checkModelAccess(
+      downloadUrl,
+      hfAppToken,
+    );
+
+    Logger.info('Automatic authentication check returned $responseCode');
+
+    if (responseCode == 200 || responseCode == 302) {
+      // Token accepted — start the background download right away.
+      await downloadModel(hfAppToken);
+      return;
+    } else if (responseCode == 401 || responseCode == 403) {
+      // The token's account has not accepted the model license, or the token
+      // was revoked. This is a developer-side setup issue, not user error.
+      handleError(
+        'মডেল ডাউনলোডের অনুমতি যাচাই করা যায়নি (কোড $responseCode)। '
+        'অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন অথবা কিছুক্ষণ পর আবার চেষ্টা করুন।',
+      );
       return;
     } else if (responseCode < 0) {
       // Network error occurred during access check
-      handleError('ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।');
+      handleError('ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।');
+      return;
+    } else {
+      handleError(
+        'মডেল সার্ভার থেকে অপ্রত্যাশিত উত্তর এসেছে (কোড $responseCode)। '
+        'আবার চেষ্টা করুন।',
+      );
       return;
     }
-
-    // Model requires authentication - proceed with auth flow
-    await handleAuthentication();
-  }
-
-  /// Handles the authentication process for protected models.
-  /// Determines the appropriate authentication method based on stored tokens.
-  Future<void> handleAuthentication() async {
-    setDownloadStatus(DownloadStatus.authenticating);
-
-    Logger.info('Model requires authentication');
-
-    // Check the status of any previously stored authentication tokens
-    final tokenStatus = await TokenManager.getTokenStatus();
-
-    switch (tokenStatus) {
-      case TokenStatus.notStored:
-      case TokenStatus.expired:
-        // No valid token - start OAuth flow to get a new one
-        await startOAuthFlow();
-        break;
-      case TokenStatus.valid:
-        // We have a valid token - try using it
-        final token = await TokenManager.getStoredToken();
-        final responseCode = await DownloadManager.checkModelAccess(
-          downloadUrl,
-          token?.accessToken,
-        );
-
-        if (responseCode == 200) {
-          // Token works - proceed with download
-          await downloadModel(token?.accessToken);
-        } else if (responseCode == 403) {
-          // Token is valid but user needs to accept license agreement
-          showUserAgreement();
-        } else {
-          // Token might be invalid - retry OAuth flow
-          await startOAuthFlow();
-        }
-        break;
-    }
-  }
-
-  /// Initiates the OAuth authentication flow with HuggingFace.
-  /// Uses web authentication to get user consent and authorization code.
-  Future<void> startOAuthFlow() async {
-    try {
-      Logger.info('Starting OAuth flow');
-      // Generate the authorization URL with proper scopes and redirect
-      final authUrl = await HuggingFaceOAuth.generateAuthUrl();
-
-      // Launch web authentication flow - this opens a browser
-      final result = await FlutterWebAuth2.authenticate(
-        url: authUrl,
-        callbackUrlScheme: 'com.tommasogiovannini.gemma', // Custom URL scheme
-      );
-
-      // Parse the callback URL to extract the authorization code
-      final uri = Uri.parse(result);
-      final code = uri.queryParameters['code'];
-
-      if (code != null) {
-        // Successfully got authorization code - exchange it for access token
-        await handleAuthorizationCode(code);
-      } else {
-        // OAuth flow completed but no code received - this shouldn't happen
-        handleError('অনুমোদন সম্পন্ন হয়নি। আবার চেষ্টা করুন।');
-      }
-    } catch (e) {
-      // Handle user cancellation gracefully vs actual errors
-      if (e.toString().contains('CANCELED') ||
-          e.toString().contains('USER_CANCELED')) {
-        setDownloadStatus(DownloadStatus.notStarted);
-        Logger.info('OAuth flow cancelled by user');
-      } else {
-        handleError('Hugging Face লগইন ব্যর্থ হয়েছে: $e');
-      }
-    }
-  }
-
-  /// Exchanges the OAuth authorization code for an access token.
-  /// Then attempts to use the token to access the model.
-  Future<void> handleAuthorizationCode(String code) async {
-    setDownloadStatus(DownloadStatus.authenticating);
-
-    try {
-      // Exchange authorization code for access token
-      final tokenData = await HuggingFaceOAuth.exchangeCodeForToken(code);
-      if (tokenData != null) {
-        // Test the new token by checking model access
-        final responseCode = await DownloadManager.checkModelAccess(
-          downloadUrl,
-          tokenData.accessToken,
-        );
-
-        if (responseCode == 200) {
-          // Token works - start download
-          await downloadModel(tokenData.accessToken);
-        } else if (responseCode == 403) {
-          // Token is valid but user needs to accept license
-          showUserAgreement();
-        } else {
-          // Token doesn't work for some reason
-          handleError('মডেল অ্যাক্সেস করা যায়নি। লাইসেন্স গ্রহণ করা হয়েছে কি না পরীক্ষা করুন।');
-        }
-      } else {
-        // Token exchange failed
-        handleError('Hugging Face অনুমোদন সম্পন্ন করা যায়নি।');
-      }
-    } catch (e) {
-      handleError('অ্যাকাউন্ট যাচাইয়ে সমস্যা হয়েছে: $e');
-    }
-  }
-
-  /// Shows the license agreement UI when the model requires user acceptance.
-  /// This happens for some models that have specific licensing terms.
-  void showUserAgreement() {
-    setDownloadStatus(DownloadStatus.awaitingLicenseAcceptance);
-    setShowAgreementSheet(true);
-    Logger.info('Model requires license acceptance');
   }
 
   /// Actually starts the file download process.
-  /// This is called after authentication is complete (if required).
+  /// This is called after automatic authentication succeeds.
   Future<void> downloadModel(String? accessToken) async {
     setDownloadStatus(DownloadStatus.downloading);
+    _autoResumeAttempts = 0;
 
     // Clean up any failed downloads from previous attempts
     await DownloadManager.cleanupFailedDownloads();
 
-    // Start the actual download with flutter_downloader
+    // Start the actual download with flutter_downloader.
+    // The task keeps running in the background (WorkManager foreground
+    // service) even when the app leaves the screen.
     final taskId = await DownloadManager.startDownload(
       url: downloadUrl,
       fileName: modelName,
@@ -351,7 +297,7 @@ class DownloadPageLogic {
       await DownloadStateManager.saveDownloadInProgress(taskId);
       monitorDownload(taskId, null); // Start monitoring progress
     } else {
-      handleError('ডাউনলোড শুরু করা যায়নি।');
+      handleError('ডাউনলোড শুরু করা যায়নি।');
     }
   }
 
@@ -428,11 +374,7 @@ class DownloadPageLogic {
             Logger.error('Download failed for task: $taskId');
             timer.cancel();
             _monitoringTimer = null;
-            setDownloadStatus(DownloadStatus.failed);
-            await DownloadStateManager.clearDownloadState();
-            handleError(
-              'ডাউনলোড ব্যর্থ হয়েছে। ইন্টারনেট বা ফোনের খালি জায়গা পরীক্ষা করুন।',
-            );
+            await _autoRecoverOrFail(taskId, context);
             break;
 
           case DownloadTaskStatus.canceled:
@@ -447,7 +389,15 @@ class DownloadPageLogic {
             break;
 
           case DownloadTaskStatus.paused:
-            setDownloadStatus(DownloadStatus.paused);
+            // Priority 2: if the platform paused the task on its own
+            // (network switch, battery saver…), resume it automatically.
+            setDownloadStatus(DownloadStatus.downloading);
+            final resumed = await DownloadManager.resumeDownload();
+            if (resumed != null) {
+              Logger.info('Auto-resumed paused task → $resumed');
+              monitorDownload(resumed, context);
+              timer.cancel();
+            }
             break;
 
           case DownloadTaskStatus.running:
@@ -467,12 +417,54 @@ class DownloadPageLogic {
             break;
         }
       } catch (e) {
-        Logger.error('ডাউনলোড পর্যবেক্ষণে সমস্যা হয়েছে: $e');
+        Logger.error('ডাউনলোড পর্যবেক্ষণে সমস্যা হয়েছে: $e');
         timer.cancel();
         _monitoringTimer = null;
-        handleError('ডাউনলোড পর্যবেক্ষণে সমস্যা হয়েছে: $e');
+        handleError('ডাউনলোড পর্যবেক্ষণে সমস্যা হয়েছে: $e');
       }
     });
+  }
+
+  /// Priority 2 recovery path: transient failures (network blips, data
+  /// switch) are retried automatically by resuming the task. After
+  /// [_maxAutoResumeAttempts] attempts the user sees a proper error.
+  Future<void> _autoRecoverOrFail(String taskId, BuildContext? context) async {
+    if (_autoResumeAttempts < _maxAutoResumeAttempts) {
+      _autoResumeAttempts++;
+      final attempt = _autoResumeAttempts;
+      Logger.warning(
+        'Download failed — auto-retry attempt $attempt/$_maxAutoResumeAttempts in 4s',
+      );
+
+      setDownloadStatus(DownloadStatus.downloading);
+      await Future.delayed(const Duration(seconds: 4));
+
+      final resumed = await DownloadManager.retryDownload();
+      if (resumed != null) {
+        await DownloadStateManager.saveDownloadInProgress(resumed);
+        monitorDownload(resumed, context);
+        return;
+      }
+
+      // Retry refused (task dead) — fall back to a fresh download attempt.
+      Logger.warning('Retry unavailable; restarting download from scratch');
+      final tasks = await DownloadManager.getAllTasks();
+      for (final t in tasks) {
+        if (t.taskId == taskId) {
+          await FlutterDownloader.remove(taskId: t.taskId, shouldDeleteContent: true);
+        }
+      }
+      await downloadModel(hfTokenConfigured ? hfAppToken : null);
+      return;
+    }
+
+    // Out of automatic attempts.
+    setDownloadStatus(DownloadStatus.failed);
+    await DownloadStateManager.clearDownloadState();
+    handleError(
+      'ডাউনলোড ব্যর্থ হয়েছে। ইন্টারনেট বা ফোনের খালি জায়গা পরীক্ষা করুন। '
+      'ডাউনলোড বোতাম চেপে আবার শুরু করুন।',
+    );
   }
 
   /// Handles error states by updating UI and logging the error.
@@ -568,7 +560,7 @@ class DownloadPageLogic {
                             ),
                           ),
                           child: Text(
-                            'ডাউনলোড চালিয়ে যান',
+                            'ডাউনলোড চালিয়ে যান',
                             style: TextStyle(
                               color: Colors.grey[700],
                               fontSize: 16,
@@ -641,6 +633,7 @@ class DownloadPageLogic {
     // Stop monitoring first to prevent timer conflicts
     _monitoringTimer?.cancel();
     _monitoringTimer = null;
+    _autoResumeAttempts = 0;
 
     // Cancel the download and delete any partial files
     await DownloadManager.cancelAndDeleteDownload();
@@ -666,7 +659,7 @@ class DownloadPageLogic {
     // Ask the download manager to resume and get the new task ID
     final newTaskId = await DownloadManager.resumeDownload();
     if (newTaskId == null) {
-      handleError('ডাউনলোড আবার চালু করা যায়নি। নতুন করে শুরু করুন।');
+      handleError('ডাউনলোড আবার চালু করা যায়নি। নতুন করে শুরু করুন।');
       return;
     }
 
@@ -677,30 +670,5 @@ class DownloadPageLogic {
     monitorDownload(newTaskId, null);
 
     setDownloadStatus(DownloadStatus.downloading);
-  }
-
-  /// Opens the license agreement in the user's browser.
-  /// Called when a model requires explicit license acceptance.
-  Future<void> openLicenseAgreement() async {
-    setShowAgreementSheet(false);
-
-    // Try to open the model's license page in external browser
-    if (await canLaunchUrl(Uri.parse(modelCardUrl))) {
-      await launchUrl(
-        Uri.parse(modelCardUrl),
-        mode: LaunchMode.externalApplication, // Force external browser
-      );
-      Logger.info('Opened license agreement in browser');
-
-      // After opening the license, allow user to manually retry download
-      setDownloadStatus(DownloadStatus.awaitingLicenseAcceptance);
-    }
-  }
-
-  /// Cancels the license agreement process and returns to initial state.
-  /// Called when user dismisses the license agreement sheet.
-  void cancelLicenseAgreement() {
-    setShowAgreementSheet(false);
-    setDownloadStatus(DownloadStatus.notStarted);
   }
 }

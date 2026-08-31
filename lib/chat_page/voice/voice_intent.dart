@@ -5,6 +5,9 @@ enum VoiceIntent {
   describeLeft,
   identifyObject,
   readText,
+  takePhoto,
+  startVideo,
+  stopVideo,
   repeatLast,
   stopSpeaking,
   help,
@@ -25,7 +28,13 @@ extension VoiceIntentLabel on VoiceIntent {
       case VoiceIntent.identifyObject:
         return 'এটা কী';
       case VoiceIntent.readText:
-        return 'লেখাটা পড়ে শোনাও';
+        return 'লেখাটা পড়ে শোনাও';
+      case VoiceIntent.takePhoto:
+        return 'ছবি তোলো';
+      case VoiceIntent.startVideo:
+        return 'ভিডিও রেকর্ড শুরু করো';
+      case VoiceIntent.stopVideo:
+        return 'ভিডিও রেকর্ড বন্ধ করো';
       case VoiceIntent.repeatLast:
         return 'আবার বলো';
       case VoiceIntent.stopSpeaking:

@@ -3,12 +3,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_gemma/pigeon.g.dart';
 
+import '../auth/auth_page.dart';
 import '../error_recovery_page.dart';
 import '../settings_page.dart';
 import 'config/system_prompts.dart';
 import 'models/message_models.dart';
 import 'services/bootstrap_manager.dart';
 import 'services/chat_helpers.dart';
+import 'services/chat_history_store.dart';
 import 'services/speech_service.dart';
 import 'services/streaming_tts_service.dart';
 import 'services/text_recognition_service.dart';
@@ -70,6 +72,18 @@ class _ChatPageState extends State<ChatPage>
     if (_disposed) return;
 
     try {
+      // Priority 6: restore the previous conversation before services come
+      // online, so returning users immediately see their chat history.
+      final restored = await ChatHistoryStore.load();
+      if (restored.isNotEmpty && mounted && !_disposed) {
+        setState(() {
+          _msgs
+            ..clear()
+            ..addAll(restored);
+          _showMessages = true;
+        });
+      }
+
       final result = await BootstrapManager.bootstrap(
         context: context,
         systemContext: _systemCtx,
@@ -100,6 +114,9 @@ class _ChatPageState extends State<ChatPage>
         canAcceptCommand: () {
           final helpers = _chatHelpers;
           if (helpers == null) return false;
+          // While a video is being recorded the mic stays free (silent
+          // recording) and "ভিডিও বন্ধ করো" MUST be heard — keep accepting.
+          if (helpers.isRecording) return true;
           return !helpers.isBusy && !helpers.isSpeaking;
         },
       );
@@ -113,14 +130,14 @@ class _ChatPageState extends State<ChatPage>
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-              'এই ফোনে বাংলা স্পিচ-রিকগনিশন লোকেল পাওয়া যায়নি। Google Speech Services-এ বাংলা ভাষা চালু করুন।',
+              'এই ফোনে বাংলা স্পিচ-রিকগনিশন লোকেল পাওয়া যায়নি। Google Speech Services-এ বাংলা ভাষা চালু করুন।',
             ),
           ),
         );
       }
 
       await _speechService!.speak(
-        'সহায়ক প্রস্তুত। আপনি বলতে পারেন, সামনে কী আছে, এটা কী, অথবা লেখাটা পড়ে শোনাও।',
+        'সহায়ক প্রস্তুত। আপনি বলতে পারেন, সামনে কী আছে দেখো, এটা কী, লেখাটা পড়ে শোনাও, ছবি তোলো অথবা ভিডিও রেকর্ড করো।',
       );
       await _speechService!.startCommandListening();
     } catch (e) {
@@ -133,7 +150,6 @@ class _ChatPageState extends State<ChatPage>
       }
     }
   }
-
 
   Future<void> _disposeCurrentVoiceRuntime({bool disposeOcr = false}) async {
     try {
@@ -156,9 +172,20 @@ class _ChatPageState extends State<ChatPage>
     _chatHelpers = null;
   }
 
-  Future<void> _handleVoiceIntent(VoiceIntent intent) async {
+  Future<void> _handleVoiceIntent(VoiceIntent intent, String heardText) async {
     if (_disposed || _chatHelpers == null) return;
-    await _chatHelpers!.handleVoiceIntent(intent, _msgs, _promptBarKey);
+    try {
+      await _chatHelpers!.handleVoiceIntent(
+        intent,
+        _msgs,
+        _promptBarKey,
+        commandText: heardText,
+      );
+    } finally {
+      // Priority 3: the microphone MUST come back after every finished
+      // command — generation, camera work and spoken answers included.
+      _speechService?.scheduleRestartSoon();
+    }
   }
 
   void _scheduleAutoScroll() {
@@ -195,7 +222,12 @@ class _ChatPageState extends State<ChatPage>
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
       _resumeVoiceOnForeground = _speechService!.commandModeEnabled;
-      unawaited(_speechService!.stopCommandListening());
+      // Keep recording alive in the background; only pause recognition.
+      if (!_chatHelpers!.isRecording) {
+        unawaited(_speechService!.pauseLoop());
+      } else {
+        unawaited(_speechService!.stopCommandListening());
+      }
     }
   }
 
@@ -206,6 +238,8 @@ class _ChatPageState extends State<ChatPage>
     _autoScrollTimer?.cancel();
     _scrollController.dispose();
     _fadeController.dispose();
+    // Persist the conversation before the runtime goes away.
+    unawaited(ChatHistoryStore.save(_msgs));
     // dispose() cannot await; detach listeners before disposing their notifiers.
     _chatHelpers?.dispose();
     _speechService?.dispose();
@@ -241,10 +275,19 @@ class _ChatPageState extends State<ChatPage>
               onToggleListening: speech.toggleDictation,
             ),
             ChatUIBuilder.buildQuickActions(
-              disabled: helpers.isBusy,
-              onDescribeFront: () => _handleVoiceIntent(VoiceIntent.describeFront),
-              onIdentifyObject: () => _handleVoiceIntent(VoiceIntent.identifyObject),
-              onReadText: () => _handleVoiceIntent(VoiceIntent.readText),
+              disabled: helpers.isBusy || helpers.isRecording,
+              onDescribeFront: () => _handleVoiceIntent(
+                VoiceIntent.describeFront,
+                VoiceIntent.describeFront.banglaLabel,
+              ),
+              onIdentifyObject: () => _handleVoiceIntent(
+                VoiceIntent.identifyObject,
+                VoiceIntent.identifyObject.banglaLabel,
+              ),
+              onReadText: () => _handleVoiceIntent(
+                VoiceIntent.readText,
+                VoiceIntent.readText.banglaLabel,
+              ),
             ),
             ChatUIBuilder.buildViewToggleButtons(
               showMessages: _showMessages,
@@ -255,6 +298,13 @@ class _ChatPageState extends State<ChatPage>
               onNewChat: _newChat,
               isResetting: helpers.resetting,
             ),
+            if (helpers.isRecording)
+              ChatUIBuilder.buildRecordingBanner(
+                onStop: () => _handleVoiceIntent(
+                  VoiceIntent.stopVideo,
+                  VoiceIntent.stopVideo.banglaLabel,
+                ),
+              ),
             if (_showMessages)
               ChatUIBuilder.buildMessagesContainer(_msgs, _scrollController)
             else
@@ -291,6 +341,7 @@ class _ChatPageState extends State<ChatPage>
         builder: (_) => SettingsPage(
           systemContext: _systemCtx,
           backend: _backend,
+          wakeWordMode: _speechService?.wakeWordMode ?? false,
         ),
       ),
     );
@@ -298,6 +349,21 @@ class _ChatPageState extends State<ChatPage>
     if (result != null && mounted && !_disposed) {
       final newSystemContext = result['systemContext'] as String?;
       final newBackend = result['backend'] as PreferredBackend?;
+      final wakeWordMode = result['wakeWordMode'] as bool?;
+      final signedOut = result['signedOut'] as bool? ?? false;
+
+      if (signedOut) {
+        // Session cleared — back to the auth screen.
+        if (!mounted) return;
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => const AuthPage()),
+        );
+        return;
+      }
+
+      if (wakeWordMode != null) {
+        await _speechService?.setWakeWordMode(wakeWordMode);
+      }
 
       if (newSystemContext != null && newBackend != null) {
         final backendChanged = _backend != newBackend;

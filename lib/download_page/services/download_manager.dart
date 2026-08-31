@@ -109,7 +109,18 @@ class DownloadManager {
       }
 
       Logger.info('Starting download: $fileName to ${dir.path}');
-      // Enqueue download task with flutter_downloader
+      // Enqueue download task with flutter_downloader.
+      //
+      // Priority 2 notes:
+      //  - showNotification: true keeps a progress notification alive; on
+      //    Android this promotes WorkManager to a foreground service so the
+      //    download survives the app being minimised or the screen turning
+      //    off.
+      //  - allowCellular: true is CRITICAL. The default is false, which
+      //    silently pauses the download when the phone is on mobile data —
+      //    the most common "download stops in background" report.
+      //  - requiresStorageNotLow: false prevents Android from postponing
+      //    the 3-4 GB model download on devices with low free space.
       final taskId = await FlutterDownloader.enqueue(
         url: url,
         savedDir: dir.path,
@@ -118,6 +129,8 @@ class DownloadManager {
         showNotification: true,
         openFileFromNotification: false,
         saveInPublicStorage: false, // Use app-specific storage
+        allowCellular: true,
+        requiresStorageNotLow: false,
       );
 
       _currentTaskId = taskId;
@@ -156,6 +169,29 @@ class DownloadManager {
       return newTaskId;
     } catch (e) {
       Logger.error('Error while resuming download: $e');
+      return null;
+    }
+  }
+
+  /// Retries a FAILED task (Priority 2 auto-recovery). flutter_downloader
+  /// creates a new task id, same semantics as resume().
+  static Future<String?> retryDownload() async {
+    if (_currentTaskId == null) {
+      Logger.warning('No failed task to retry');
+      return null;
+    }
+
+    try {
+      final newTaskId = await FlutterDownloader.retry(taskId: _currentTaskId!);
+      if (newTaskId != null) {
+        _currentTaskId = newTaskId;
+        Logger.info('Download retried with new ID: $newTaskId');
+      } else {
+        Logger.warning('Retry returned a null taskId');
+      }
+      return newTaskId;
+    } catch (e) {
+      Logger.error('Error while retrying download: $e');
       return null;
     }
   }

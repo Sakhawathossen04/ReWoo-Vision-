@@ -1,11 +1,14 @@
 // main.dart
 import 'dart:isolate';
 import 'dart:ui';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_downloader/flutter_downloader.dart';
+
+import 'package:gemma_chat/auth/auth_page.dart';
+import 'package:gemma_chat/auth/auth_service.dart';
 import 'package:gemma_chat/download_page/model_download_page.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// Top-level callback function for handling download progress updates.
 /// This function is called by the background isolate when download status changes.
@@ -43,14 +46,22 @@ Future<void> main() async {
   // The downloader will use this callback to report progress updates
   FlutterDownloader.registerCallback(downloadCallback);
 
-  // This prevents the device from sleeping and potentially interrupting downloads
-  await WakelockPlus.enable();
+  // NOTE: a global wakelock was removed on purpose. Keeping the screen awake
+  // for the whole app lifetime drains the battery and makes some OEMs kill
+  // the app. Background downloads rely on the WorkManager foreground service
+  // instead, and the voice assistant manages the screen normally.
 
-  runApp(const MyApp());
+  // Priority 1: skip straight to the assistant when the user already
+  // signed in; otherwise show the simple email + password + consent screen.
+  final bool signedIn = await AuthService.hasSession();
+
+  runApp(MyApp(startSignedIn: signedIn));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  const MyApp({super.key, required this.startSignedIn});
+
+  final bool startSignedIn;
 
   @override
   Widget build(BuildContext context) {
@@ -58,9 +69,9 @@ class MyApp extends StatelessWidget {
       title: 'ReWoo Vision',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
 
-      // Set the initial page to the model download screen
-      // Users must download the ML model before they can use the chat feature
-      home: const ModelDownloadPage(),
+      // First run: Sign Up / Sign In → consent → automatic model download.
+      // Returning users: straight to the download/chat pipeline.
+      home: startSignedIn ? const ModelDownloadPage() : const AuthPage(),
     );
   }
 }

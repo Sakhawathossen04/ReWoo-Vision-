@@ -1,6 +1,12 @@
 // download_page/model_download_page.dart
+//
+// Shows the model download progress. Thanks to the automatic Hugging Face
+// authentication (Priority 1) this page needs no login: the download starts
+// by itself shortly after the page opens and continues in the background
+// (Priority 2) even if the user leaves the app.
 
 import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:gemma_chat/chat_page/gemma_vision_chat.dart';
@@ -14,8 +20,6 @@ import 'ui/modern_ui_widgets.dart';
 import 'ui/ui_helpers.dart';
 
 /// Main page widget that handles the model download UI and state management.
-/// This is a StatefulWidget that manages the download process for ML models,
-/// including authentication, progress tracking, error handling, and user interactions.
 class ModelDownloadPage extends StatefulWidget {
   const ModelDownloadPage({Key? key}) : super(key: key);
 
@@ -34,14 +38,14 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // List of error messages to display to the user when downloads fail
   List<String> _errorMessages = [];
 
-  // Controls visibility of the license agreement bottom sheet
-  bool _showAgreementSheet = false;
-
   // Subscription to listen for log updates and refresh UI accordingly
   late StreamSubscription _logSubscription;
 
   // Business logic handler that manages all download operations
   late DownloadPageLogic _logic;
+
+  // Prevents double auto-starts and re-entry after status changes.
+  bool _autoStartAttempted = false;
 
   @override
   void initState() {
@@ -59,12 +63,13 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // Clean up resources to prevent memory leaks
     _logSubscription.cancel();
     _logic.dispose(); // Dispose the logic to clean up timers
-    _tts.stop();
+    try {
+      _tts.stop();
+    } catch (_) {}
     super.dispose();
   }
 
   /// Initializes the download logic with callback functions that update the UI state.
-  /// This separates business logic from UI concerns by passing state setters as callbacks.
   void _initializeLogic() {
     _logic = DownloadPageLogic(
       // Callback to update download status (triggers UI rebuilds)
@@ -73,23 +78,25 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       setProgress: (progress) => setState(() => _progress = progress),
       // Callback to update error messages (shows error dialogs/messages)
       setErrorMessages: (messages) => setState(() => _errorMessages = messages),
-      // Callback to show/hide license agreement sheet
-      setShowAgreementSheet: (show) =>
-          setState(() => _showAgreementSheet = show),
     );
   }
-
 
   Future<void> _announceInitialSetup() async {
     try {
       await _tts.setLanguage('bn-BD');
+    } catch (_) {
+      // Bengali voice missing on this device — platform default is fine.
+    }
+    try {
       await _tts.setSpeechRate(0.46);
-      await _tts.awaitSpeakCompletion(true);
+      await _tts.setVolume(1.0);
+      await _tts.awaitSpeakCompletion(false);
       await Future.delayed(const Duration(milliseconds: 650));
       if (!mounted) return;
       await _tts.speak(
-        'ReWoo Vision বাংলা ব্যবহার করতে প্রথমবার AI মডেল ডাউনলোড করতে হবে। ডাউনলোড বোতাম চাপুন এবং প্রয়োজন হলে Hugging Face লাইসেন্স গ্রহণ করুন।',
-        focus: false,
+        'ReWoo Vision প্রস্তুত হচ্ছে। প্রয়োজনীয় AI মডেল স্বয়ংক্রিয়ভাবে ডাউনলোড হবে। '
+        'ইন্টারনেট সংযোগ চালু রাখুন। ডাউনলোড চলাকালীন আপনি অন্য কাজ করতে পারেন।',
+        focus: true,
       );
     } catch (e) {
       debugPrint('[ModelDownloadPage] onboarding TTS unavailable: $e');
@@ -97,24 +104,40 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   }
 
   /// Sets up a listener for log entries to refresh the UI when new logs are added.
-  /// This ensures the logs dialog shows real-time updates without manual refresh.
   void _setupLogListener() {
     _logSubscription = Logger.logStream.listen((logEntry) {
-      setState(() {}); // Trigger rebuild to update logs display
+      if (mounted) setState(() {});
     });
   }
 
   /// Initializes the download manager system.
-  /// This prepares the underlying download infrastructure for use.
   Future<void> _initializeDownloader() async {
     await DownloadManager.initialize();
     Logger.info('Download manager initialized');
   }
 
-  /// Checks if there are any ongoing downloads from previous app sessions.
-  /// This handles app restarts gracefully by resuming interrupted downloads.
+  /// Checks for previous download sessions and, when everything is ready,
+  /// automatically starts the download — the user does not have to tap
+  /// anything (Priority 1: automatic model download).
   Future<void> _checkDownloadState() async {
     await _logic.checkForOngoingDownloads(context);
+
+    if (!mounted) return;
+    if (_autoStartAttempted) return;
+    _autoStartAttempted = true;
+
+    final canAutoStart = await _logic.canAutoStartDownload();
+    if (!canAutoStart) return;
+
+    Logger.info('Auto-starting model download (no user action required)');
+    // Small delay so the first frame, TTS greeting and permission prompts
+    // are all settled before the network work begins.
+    Future.delayed(const Duration(milliseconds: 1600), () {
+      if (!mounted) return;
+      if (_downloadStatus == DownloadStatus.notStarted) {
+        _logic.startDownload();
+      }
+    });
   }
 
   @override
@@ -216,14 +239,6 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
           ],
         ),
       ),
-      // License agreement bottom sheet - shown when model requires acceptance
-      bottomSheet: _showAgreementSheet
-          ? ModernUIWidgets.buildLicenseBottomSheet(
-              context,
-              () => _logic.cancelLicenseAgreement(), // Cancel agreement
-              () => _logic.openLicenseAgreement(), // Open license in browser
-            )
-          : null,
     );
   }
 }

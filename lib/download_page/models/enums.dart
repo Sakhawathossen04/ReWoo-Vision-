@@ -12,6 +12,3 @@ enum DownloadStatus {
   failed,
   cancelled,
 }
-
-// OAuth token validation states
-enum TokenStatus { notStored, expired, valid }

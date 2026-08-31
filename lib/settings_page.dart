@@ -1,17 +1,22 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_gemma/pigeon.g.dart';
 
+import 'auth/auth_service.dart';
+import 'chat_page/services/tts_engine_service.dart';
 import 'chat_page/voice/bengali_voice_commands.dart';
 
 /// Minimal, controller-free settings page for the Bengali assistant.
 class SettingsPage extends StatefulWidget {
   final String systemContext;
   final PreferredBackend backend;
+  final bool wakeWordMode;
 
   const SettingsPage({
     super.key,
     required this.systemContext,
     required this.backend,
+    this.wakeWordMode = false,
   });
 
   @override
@@ -21,17 +26,26 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   late final TextEditingController _systemContextController;
   late PreferredBackend _selectedBackend;
+  late bool _wakeWordMode;
+  bool _testingTts = false;
+
+  late final FlutterTts _tts;
 
   @override
   void initState() {
     super.initState();
     _systemContextController = TextEditingController(text: widget.systemContext);
     _selectedBackend = widget.backend;
+    _wakeWordMode = widget.wakeWordMode;
+    _tts = FlutterTts();
   }
 
   @override
   void dispose() {
     _systemContextController.dispose();
+    try {
+      _tts.stop();
+    } catch (_) {}
     super.dispose();
   }
 
@@ -39,11 +53,82 @@ class _SettingsPageState extends State<SettingsPage> {
     Navigator.of(context).pop({
       'systemContext': _systemContextController.text.trim(),
       'backend': _selectedBackend,
+      'wakeWordMode': _wakeWordMode,
+      'signedOut': false,
     });
+  }
+
+  Future<void> _testTts() async {
+    setState(() => _testingTts = true);
+    try {
+      final result = TtsEngineService.lastResult;
+      await TtsEngineService.configure(_tts);
+      await _tts.stop();
+      await TtsEngineService.speakWithTimeout(
+        _tts,
+        'এটি একটি বাংলা কণ্ঠস্বর পরীক্ষা। যদি এই কথা শুনতে পান, তাহলে ভয়েস আউটপুট ঠিক আছে।',
+      );
+      if (!mounted) return;
+      final engine = result?.engine ?? 'ফোনের ডিফল্ট';
+      final lang = result?.language ?? 'ডিফল্ট';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'টেস্ট চালানো হয়েছে। ইঞ্জিন: $engine, ভাষা: $lang, '
+            'বাংলা ভয়েস: ${result?.bengaliVoiceAvailable == true ? "পাওয়া গেছে" : "পাওয়া যায়নি (ডিফল্ট ভয়েস ব্যবহার হচ্ছে)"}',
+          ),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('টেস্ট ব্যর্থ: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _testingTts = false);
+    }
+  }
+
+  Future<void> _signOut() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('লগআউট করবেন?'),
+        content: const Text(
+          'অ্যাকাউন্ট থেকে লগআউট করলে আবার সাইন ইন করতে হবে। '
+          'ডাউনলোড করা মডেল ও ছবি-ভিডিও ফোনেই থাকবে।',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('বাতিল'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('লগআউট'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await AuthService.signOut();
+      if (mounted) {
+        Navigator.of(context).pop({
+          'systemContext': _systemContextController.text.trim(),
+          'backend': _selectedBackend,
+          'wakeWordMode': _wakeWordMode,
+          'signedOut': true,
+        });
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
+    final ttsResult = TtsEngineService.lastResult;
     return Scaffold(
       backgroundColor: const Color(0xFFF7F8FA),
       appBar: AppBar(
@@ -65,13 +150,72 @@ class _SettingsPageState extends State<SettingsPage> {
               leading: Icon(Icons.language_rounded),
               title: Text('বাংলা'),
               subtitle: Text(
-                'ভয়েস কমান্ড, AI উত্তর ও টেক্সট-টু-স্পিচ বাংলা-প্রথম হিসেবে কনফিগার করা হয়েছে।',
+                'ভয়েস কমান্ড, AI উত্তর ও টেক্সট-টু-স্পিচ বাংলা-প্রথম হিসেবে কনফিগার করা হয়েছে।',
               ),
             ),
           ),
           const SizedBox(height: 14),
           _section(
-            title: 'ভয়েস কমান্ড',
+            title: 'ভয়েস আউটপুট পরীক্ষা',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ListTile(
+                  leading: _testingTts
+                      ? const SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.volume_up_rounded),
+                  title: const Text('কণ্ঠস্বর পরীক্ষা চালান'),
+                  subtitle: Text(
+                    ttsResult == null
+                        ? 'ইঞ্জিন ও ভাষা যাচাই করতে চাপুন'
+                        : 'ইঞ্জিন: ${ttsResult.engine ?? "ডিফল্ট"} • '
+                            'ভাষা: ${ttsResult.language ?? "ডিফল্ট"} • '
+                            'বাংলা: ${ttsResult.bengaliVoiceAvailable ? "উপলব্ধ" : "ডিফল্ট ভয়েস"}',
+                  ),
+                  onTap: _testingTts ? null : _testTts,
+                ),
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Text(
+                    'কোনো ফোনে আওয়াজ না শুনলে এই টেস্ট চালিয়ে দেখুন। সমস্যা হলে ফোনের TTS সেটিংসে Google Text-to-Speech-এ বাংলা ভাষা ইনস্টল করুন।',
+                    style: TextStyle(fontSize: 13, height: 1.4),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          _section(
+            title: 'ভয়েস অ্যাক্টিভেশন',
+            child: Column(
+              children: [
+                SwitchListTile(
+                  value: _wakeWordMode,
+                  onChanged: (value) =>
+                      setState(() => _wakeWordMode = value),
+                  title: const Text('Wake Word মোড'),
+                  subtitle: const Text(
+                    'চালু করলে "রিউ" বা "সহায়ক" বলে ডাকলে অ্যাসিস্ট্যান্ট জেগে উঠবে, '
+                    'তারপর কমান্ড বলুন। বন্ধ থাকলে সরাসরি কমান্ড শোনা যায়।',
+                  ),
+                ),
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Text(
+                    'ব্যাটারি ও প্রাইভেসি: অ্যাসিস্ট্যান্ট শুধু অ্যাপ খোলা থাকা অবস্থায় শোনে — ব্যাকগ্রাউন্ডে কখনও নয়।',
+                    style: TextStyle(fontSize: 13, height: 1.4),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+          _section(
+            title: 'ভয়েস কমান্ড',
             child: Column(
               children: [
                 for (final command in BengaliVoiceCommands.primaryHelpCommands)
@@ -113,6 +257,16 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 14),
           _section(
+            title: 'অ্যাকাউন্ট',
+            child: ListTile(
+              leading: const Icon(Icons.logout_rounded),
+              title: const Text('লগআউট'),
+              subtitle: const Text('অ্যাকাউন্ট থেকে বেরিয়ে যান'),
+              onTap: _signOut,
+            ),
+          ),
+          const SizedBox(height: 14),
+          _section(
             title: 'উন্নত AI নির্দেশনা',
             child: Padding(
               padding: const EdgeInsets.all(14),
@@ -123,7 +277,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 decoration: const InputDecoration(
                   border: OutlineInputBorder(),
                   helperText:
-                      'এটি AI-এর নিরাপত্তা, সংক্ষিপ্ত উত্তর ও বাংলা ভাষার আচরণ নিয়ন্ত্রণ করে। না বুঝলে পরিবর্তন করবেন না।',
+                      'এটি AI-এর নিরাপত্তা, সংক্ষিপ্ত উত্তর ও বাংলা ভাষার আচরণ নিয়ন্ত্রণ করে। না বুঝলে পরিবর্তন করবেন না।',
                 ),
               ),
             ),
@@ -134,7 +288,7 @@ class _SettingsPageState extends State<SettingsPage> {
             child: const Padding(
               padding: EdgeInsets.all(16),
               child: Text(
-                'এই অ্যাপ পরিবেশ সম্পর্কে সহায়ক তথ্য দেয়। এটি সাদা ছড়ি, গাইড ডগ বা নিরাপদ চলাচল পদ্ধতির বিকল্প নয়। ক্যামেরার ডান/বাম কমান্ড বর্তমান ছবির ডান/বাম অংশকে বোঝায়।',
+                'এই অ্যাপ পরিবেশ সম্পর্কে সহায়ক তথ্য দেয়। এটি সাদা ছড়ি, গাইড ডগ বা নিরাপদ চলাচল পদ্ধতির বিকল্প নয়। ক্যামেরার ডান/বাম কমান্ড বর্তমান ছবির ডান/বাম অংশকে বোঝায়। ভিডিও নীরব (অডিও ছাড়া) রেকর্ড হয় যাতে ভয়েস কমান্ড চালু থাকে।',
                 style: TextStyle(height: 1.5),
               ),
             ),

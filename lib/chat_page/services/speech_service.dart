@@ -1,21 +1,31 @@
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
 import '../voice/bengali_voice_commands.dart';
 import '../voice/voice_intent.dart';
+import '../../download_page/config/constants.dart';
 import 'sound_manager.dart';
+import 'tts_engine_service.dart';
 
 /// Bengali-first voice control service.
 ///
-/// The existing application used speech recognition as manually toggled
-/// dictation. This version keeps a command-recognition loop active while the
-/// chat page is open and only forwards a small, deterministic command set.
+/// Priority 3 — continuous listening: the command loop must survive every
+/// command. The loop is restarted:
+///   * after every recognised command,
+///   * after every TTS announcement finishes,
+///   * whenever the platform reports notListening/done,
+///   * by a watchdog timer that catches silent engine death.
+/// A dead TTS engine can no longer freeze the loop because every speak call
+/// is wrapped in a timeout (see TtsEngineService.speakWithTimeout).
 ///
-/// Important platform limitation: speech_to_text is backed by the device speech
-/// recognizer. Some Android devices stop listening after a pause. We therefore
-/// restart recognition whenever the platform reports `notListening` or `done`.
+/// Priority 4 — wake word: optional "রিউ / সহায়ক / hey assistant" gating.
+/// In wake mode only utterances containing a wake word trigger commands;
+/// hearing only the wake word primes the assistant for ~12 seconds.
 class SpeechService {
   final SpeechToText _speech = SpeechToText();
   final FlutterTts _tts;
@@ -26,6 +36,8 @@ class SpeechService {
   bool _commandListening = false;
   bool _disposed = false;
   bool _startingSession = false;
+  bool _pausedForMedia = false;
+
   Timer? _restartTimer;
   Timer? _watchdogTimer;
 
@@ -34,7 +46,10 @@ class SpeechService {
   String _lastHeard = '';
   String _lastError = '';
 
-  Future<void> Function(VoiceIntent intent)? _onCommand;
+  bool _wakeWordMode = false;
+  DateTime _wakePrimedUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  Future<void> Function(VoiceIntent intent, String heardText)? _onCommand;
   bool Function()? _canAcceptCommand;
 
   VoiceIntent? _lastIntent;
@@ -43,7 +58,8 @@ class SpeechService {
   SpeechService({
     required FlutterTts tts,
     required VoidCallback onStateChanged,
-  }) : _tts = tts, _onStateChanged = onStateChanged;
+  }) : _tts = tts,
+       _onStateChanged = onStateChanged;
 
   bool get speechEnabled => _speechEnabled;
   bool get commandModeEnabled => _commandModeEnabled;
@@ -53,10 +69,21 @@ class SpeechService {
   String get lastError => _lastError;
   String get bengaliLocaleId => _bengaliLocaleId;
   bool get hasBengaliSpeechLocale => _bengaliLocaleAvailable;
+  bool get wakeWordMode => _wakeWordMode;
+  bool get pausedForMedia => _pausedForMedia;
 
   Future<void> initialize() async {
     try {
-      await _configureBanglaTts();
+      // Priority 3/TTS: robust engine + language selection with fallbacks.
+      // This is what fixes "no sound" on phones without a bn-BD voice or
+      // with a broken default TTS engine.
+      await TtsEngineService.configure(_tts);
+
+      // Ensure the microphone permission is granted before starting the
+      // recogniser. On some devices speech_to_text fails permanently when
+      // the first listen happens without an explicit permission grant.
+      final micStatus = await Permission.microphone.request();
+      debugPrint('[SpeechService] microphone permission: $micStatus');
 
       _speechEnabled = await _speech.initialize(
         onStatus: _handleSpeechStatus,
@@ -71,8 +98,8 @@ class SpeechService {
           if (isLanguageError) {
             _bengaliLocaleAvailable = false;
             _lastError =
-                'বাংলা ভয়েস ইনপুট পাওয়া যায়নি। '
-                'ফোনের Google Speech Services বা ভয়েস ইনপুটে '
+                'বাংলা ভয়েস ইনপুট পাওয়া যায়নি। '
+                'ফোনের Google Speech Services বা ভয়েস ইনপুটে '
                 'বাংলা (বাংলাদেশ) চালু করুন।';
 
             _commandModeEnabled = false;
@@ -87,7 +114,7 @@ class SpeechService {
               _commandModeEnabled = false;
               _restartTimer?.cancel();
               _watchdogTimer?.cancel();
-            } else if (_commandModeEnabled && !_disposed) {
+            } else if (_commandModeEnabled && !_disposed && !_pausedForMedia) {
               _scheduleRestart(const Duration(milliseconds: 900));
             }
           }
@@ -105,23 +132,32 @@ class SpeechService {
       _lastError = e.toString();
       debugPrint('[SpeechService] initialization error: $e');
     } finally {
+      await _loadWakeWordMode();
       _onStateChanged();
     }
   }
 
-  Future<void> _configureBanglaTts() async {
+  Future<void> _loadWakeWordMode() async {
     try {
-      // Android language tags normally use a hyphen while speech recognizer
-      // locale ids are commonly returned with an underscore.
-      await _tts.setLanguage('bn-BD');
-    } catch (e) {
-      debugPrint('[SpeechService] bn-BD TTS locale unavailable: $e');
-      // Keep the platform default voice as a graceful fallback.
+      final prefs = await SharedPreferences.getInstance();
+      _wakeWordMode = prefs.getBool(wakeWordModeKey) ?? false;
+    } catch (_) {
+      _wakeWordMode = false;
     }
-    await _tts.setSpeechRate(0.46);
-    await _tts.setVolume(1.0);
-    await _tts.setPitch(1.0);
-    await _tts.awaitSpeakCompletion(true);
+  }
+
+  /// Switch between direct command mode and wake-word mode (Priority 4).
+  Future<void> setWakeWordMode(bool enabled) async {
+    _wakeWordMode = enabled;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(wakeWordModeKey, enabled);
+    } catch (_) {}
+    _onStateChanged();
+    // Restart the session so the new mode applies immediately.
+    if (_commandModeEnabled && !_disposed) {
+      await _startCommandSession();
+    }
   }
 
   @visibleForTesting
@@ -187,7 +223,7 @@ class SpeechService {
   }
 
   void configureCommandHandler({
-    required Future<void> Function(VoiceIntent intent) onCommand,
+    required Future<void> Function(VoiceIntent intent, String heardText) onCommand,
     required bool Function() canAcceptCommand,
   }) {
     _onCommand = onCommand;
@@ -196,6 +232,7 @@ class SpeechService {
 
   Future<void> startCommandListening() async {
     if (_disposed || !_speechEnabled) return;
+    if (_pausedForMedia) return; // e.g. video recording in progress
 
     // Re-check the Bengali locale if a previous session reported that the
     // language was unavailable. This lets the user enable Bengali in Android
@@ -220,6 +257,28 @@ class SpeechService {
     } catch (_) {}
   }
 
+  /// Temporarily suspends recognition while the camera records video or the
+  /// app needs the microphone for something else. Mode flag is preserved.
+  Future<void> pauseLoop() async {
+    _pausedForMedia = true;
+    _restartTimer?.cancel();
+    _watchdogTimer?.cancel();
+    _commandListening = false;
+    _onStateChanged();
+    try {
+      await _speech.stop();
+    } catch (_) {}
+  }
+
+  /// Resumes the command loop after pauseLoop() once the media is done.
+  Future<void> resumeLoop() async {
+    _pausedForMedia = false;
+    _onStateChanged();
+    if (_commandModeEnabled && !_disposed) {
+      await _startCommandSession();
+    }
+  }
+
   Future<void> toggleDictation() async {
     if (_commandModeEnabled) {
       await stopCommandListening();
@@ -228,10 +287,18 @@ class SpeechService {
     }
   }
 
+  /// Priority 3: public hook so the chat layer can bring the microphone
+  /// back as soon as a command finishes (generation + speech complete).
+  void scheduleRestartSoon([Duration delay = const Duration(milliseconds: 400)]) {
+    if (_disposed || !_commandModeEnabled || _pausedForMedia) return;
+    _scheduleRestart(delay);
+  }
+
   Future<void> _startCommandSession() async {
     if (_disposed ||
         !_commandModeEnabled ||
         !_speechEnabled ||
+        _pausedForMedia ||
         _startingSession ||
         _commandListening) {
       return;
@@ -250,7 +317,7 @@ class SpeechService {
 
       await _speech.listen(
         onResult: (result) {
-          if (_disposed || !_commandModeEnabled) return;
+          if (_disposed || !_commandModeEnabled || _pausedForMedia) return;
 
           final heard = result.recognizedWords.trim();
           if (heard.isNotEmpty) {
@@ -258,9 +325,9 @@ class SpeechService {
             _onStateChanged();
           }
 
-          final intent = BengaliVoiceCommands.match(heard);
+          final intent = _extractIntent(heard);
           if (intent == null) return;
-          _handleDetectedIntent(intent);
+          _handleDetectedIntent(intent, heard);
         },
         localeId: _bengaliLocaleId,
         listenFor: const Duration(minutes: 5),
@@ -284,8 +351,8 @@ class SpeechService {
         _restartTimer?.cancel();
         _watchdogTimer?.cancel();
         _lastError =
-            'বাংলা ভয়েস ইনপুট পাওয়া যায়নি। '
-            'ফোনের Google Speech Services বা ভয়েস ইনপুটে '
+            'বাংলা ভয়েস ইনপুট পাওয়া যায়নি। '
+            'ফোনের Google Speech Services বা ভয়েস ইনপুটে '
             'বাংলা (বাংলাদেশ) চালু করুন।';
       } else {
         _lastError = e.toString();
@@ -299,7 +366,36 @@ class SpeechService {
     }
   }
 
-  void _handleDetectedIntent(VoiceIntent intent) {
+  /// Maps a recognised utterance to an intent, honouring wake-word mode.
+  VoiceIntent? _extractIntent(String heard) {
+    if (!_wakeWordMode) {
+      return BengaliVoiceCommands.match(heard);
+    }
+
+    final now = DateTime.now();
+    final primed = now.isBefore(_wakePrimedUntil);
+    final stripped = BengaliVoiceCommands.stripWakeWord(heard);
+
+    if (stripped != null) {
+      if (stripped.isNotEmpty) {
+        // Wake word + command in one breath.
+        _wakePrimedUntil = now.add(const Duration(seconds: 12));
+        return BengaliVoiceCommands.match(stripped);
+      }
+      // Only the wake word: confirm with a sound and open the prime window.
+      _wakePrimedUntil = now.add(const Duration(seconds: 12));
+      unawaited(SoundManager.instance.playDictationStart());
+      _onStateChanged();
+      return null;
+    }
+
+    if (primed) {
+      return BengaliVoiceCommands.match(heard);
+    }
+    return null;
+  }
+
+  void _handleDetectedIntent(VoiceIntent intent, String heardText) {
     final now = DateTime.now();
     if (_lastIntent == intent &&
         now.difference(_lastIntentAt) < const Duration(seconds: 2)) {
@@ -321,7 +417,7 @@ class SpeechService {
 
     final handler = _onCommand;
     if (handler != null) {
-      unawaited(_runCommand(handler, intent));
+      unawaited(_runCommand(handler, intent, heardText));
     }
 
     // Speech recognizers frequently end a session after a confirmed phrase.
@@ -329,13 +425,13 @@ class SpeechService {
     _scheduleRestart(const Duration(milliseconds: 650));
   }
 
-
   Future<void> _runCommand(
-    Future<void> Function(VoiceIntent intent) handler,
+    Future<void> Function(VoiceIntent intent, String heardText) handler,
     VoiceIntent intent,
+    String heardText,
   ) async {
     try {
-      await handler(intent);
+      await handler(intent, heardText);
     } catch (e, st) {
       debugPrint('[SpeechService] command handler failed: $e');
       debugPrint('$st');
@@ -357,7 +453,7 @@ class SpeechService {
     if (status == 'notListening' || status == 'done') {
       _commandListening = false;
       _onStateChanged();
-      if (_commandModeEnabled) {
+      if (_commandModeEnabled && !_pausedForMedia) {
         _scheduleRestart(const Duration(milliseconds: 500));
       }
     }
@@ -366,7 +462,12 @@ class SpeechService {
   void _startWatchdog() {
     _watchdogTimer?.cancel();
     _watchdogTimer = Timer.periodic(const Duration(seconds: 8), (_) {
-      if (_disposed || !_commandModeEnabled || !_speechEnabled) return;
+      if (_disposed ||
+          !_commandModeEnabled ||
+          !_speechEnabled ||
+          _pausedForMedia) {
+        return;
+      }
       if (!_commandListening && !_startingSession && !_speech.isListening) {
         unawaited(_startCommandSession());
       }
@@ -374,10 +475,15 @@ class SpeechService {
   }
 
   void _scheduleRestart(Duration delay) {
-    if (_disposed || !_commandModeEnabled || !_speechEnabled) return;
+    if (_disposed ||
+        !_commandModeEnabled ||
+        !_speechEnabled ||
+        _pausedForMedia) {
+      return;
+    }
     _restartTimer?.cancel();
     _restartTimer = Timer(delay, () {
-      if (!_disposed && _commandModeEnabled) {
+      if (!_disposed && _commandModeEnabled && !_pausedForMedia) {
         unawaited(_startCommandSession());
       }
     });
@@ -404,14 +510,13 @@ class SpeechService {
       _onStateChanged();
     }
 
-    try {
-      await _tts.speak(clean, focus: false);
-    } catch (e) {
-      debugPrint('[SpeechService] TTS error: $e');
-    } finally {
-      if (resumeAfter && !_disposed) {
-        _scheduleRestart(const Duration(milliseconds: 350));
-      }
+    // TtsEngineService.speakWithTimeout guarantees this await returns even
+    // when the TTS engine is dead — previously a hang here permanently
+    // killed the microphone loop ("mic off after first command").
+    await TtsEngineService.speakWithTimeout(_tts, clean);
+
+    if (resumeAfter && !_disposed) {
+      _scheduleRestart(const Duration(milliseconds: 350));
     }
   }
 

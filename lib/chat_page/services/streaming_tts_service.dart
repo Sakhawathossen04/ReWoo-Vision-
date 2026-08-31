@@ -1,9 +1,12 @@
 // lib/chat_page/services/streaming_tts_service.dart
 import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:remove_markdown/remove_markdown.dart';
+
 import 'sound_manager.dart';
+import 'tts_engine_service.dart';
 
 /// Internal representation of a segment with its start index in the cleaned text.
 class _Segment {
@@ -13,6 +16,13 @@ class _Segment {
 }
 
 /// Streaming TTS Service for reading AI responses as they're generated.
+///
+/// Sound-reliability notes (the "no audio output" fix):
+///   * every utterance requests audio focus (focus: true),
+///   * every utterance is wrapped in a timeout so a dead engine cannot stall
+///     generation or the microphone loop,
+///   * the language/engine configuration is owned by TtsEngineService and is
+///     NOT overwritten here.
 class StreamingTtsService {
   final ValueNotifier<bool> isSpeaking = ValueNotifier<bool>(false);
   final FlutterTts _tts;
@@ -26,6 +36,7 @@ class StreamingTtsService {
   bool _isLoading = false;
   bool _isProcessing = false;
   bool _messageComplete = false;
+  bool _disposed = false;
   int _lastSpokenLength = 0; // position in the *cleaned* text
 
   int _lastProgressEnd = 0; // global position in cleaned text from progress
@@ -43,16 +54,9 @@ class StreamingTtsService {
   }
 
   void _configureTts() {
-    // SpeechService configures the shared FlutterTts instance for Bengali.
-    // Keep these values aligned here for safety when this service is created
-    // before SpeechService finishes initialization.
-    _tts.setLanguage('bn-BD');
-    _tts.setSpeechRate(0.46);
-    _tts.setVolume(1.0);
-    _tts.setPitch(1.0);
-    _tts.awaitSpeakCompletion(true);
-
-    // Callbacks -------------------------------------------------------
+    // Language, rate and volume are configured once by TtsEngineService
+    // (called from SpeechService.initialize). Only lifecycle callbacks are
+    // registered here so we never fight over the engine configuration.
     _tts.setStartHandler(() {
       _resumeScheduled = false;
     });
@@ -76,7 +80,12 @@ class StreamingTtsService {
   }
 
   void _scheduleResume() {
-    if (_resumeScheduled || _resumeAttempts >= _maxResumeAttempts) return;
+    if (_disposed ||
+        _resumeScheduled ||
+        _resumeAttempts >= _maxResumeAttempts ||
+        _buffer.isEmpty) {
+      return;
+    }
     _resumeAttempts++;
     _resumeScheduled = true;
 
@@ -88,12 +97,14 @@ class StreamingTtsService {
     resumeFrom = resumeFrom.clamp(0, cleanBuffer.length);
 
     Future.delayed(_resumeDelay, () {
+      if (_disposed) return;
       _resumeScheduled = false;
       _speak(from: resumeFrom);
     });
   }
 
   Future<void> _speak({int from = 0}) async {
+    if (_disposed) return;
     final cleanBuffer = _cleanTextForTts(_buffer);
     final String text = from < cleanBuffer.length
         ? cleanBuffer.substring(from)
@@ -111,14 +122,12 @@ class StreamingTtsService {
 
     if (text.isEmpty) return;
 
-    try {
-      await _tts.speak(text, focus: false);
-    } catch (_) {}
+    await TtsEngineService.speakWithTimeout(_tts, text);
   }
 
   // ───────────────────────────────────────────────────────────
   // PUBLIC API
-  // ───────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────
   Future<void> startLoading() async {
     if (_isLoading) return;
     _isLoading = true;
@@ -135,6 +144,7 @@ class StreamingTtsService {
   /// Consume one streaming token.
   /// Starts speaking once a complete sentence arrives.
   void addText(String newToken, String currentFullText) {
+    if (_disposed) return;
     _buffer = currentFullText;
 
     // Immediately process buffer on any new token
@@ -142,6 +152,7 @@ class StreamingTtsService {
   }
 
   Future<void> onMessageComplete() async {
+    if (_disposed) return;
     _messageComplete = true;
     await stopLoading();
     await _forceCompleteReading();
@@ -151,6 +162,7 @@ class StreamingTtsService {
   void reset() => _hardReset();
 
   void dispose() {
+    _disposed = true;
     _hardReset();
     isSpeaking.dispose();
   }
@@ -159,6 +171,7 @@ class StreamingTtsService {
   // BUFFER HANDLING ( now sentence-based )
   // ────────────────────────────────────────────────
   Future<void> _processBuffer() async {
+    if (_disposed) return;
     final cleanText = _cleanTextForTts(_buffer);
     if (cleanText.isEmpty || _isProcessing) return;
     if (cleanText.length <= _lastSpokenLength) return;
@@ -182,7 +195,7 @@ class StreamingTtsService {
   }
 
   Future<void> _processNextSegment() async {
-    if (_isProcessing) return;
+    if (_disposed || _isProcessing) return;
 
     while (_pendingSegments.isNotEmpty) {
       _isProcessing = true;
@@ -198,11 +211,13 @@ class StreamingTtsService {
 
       if (segment.isEmpty || segment == _previousSegment) continue;
       if (RegExp(r'^[.!?,;:]+$').hasMatch(segment) &&
-          _pendingSegments.isNotEmpty)
+          _pendingSegments.isNotEmpty) {
         continue;
+      }
 
       try {
-        await _tts.speak(segment, focus: false);
+        // speakWithTimeout requests audio focus and cannot hang forever.
+        await TtsEngineService.speakWithTimeout(_tts, segment);
         _previousSegment = segment;
       } catch (_) {
         break;
@@ -228,6 +243,7 @@ class StreamingTtsService {
   // FORCE COMPLETE
   // ───────────────────────────────────────────────
   Future<void> _forceCompleteReading() async {
+    if (_disposed) return;
     final cleanBuffer = _cleanTextForTts(_buffer);
 
     if (cleanBuffer.trim().isEmpty) {
@@ -331,8 +347,14 @@ class StreamingTtsService {
   }
 
   void _hardReset() {
-    _tts.stop();
+    // Suppress the cancel handler so an intentional stop can never be
+    // "resumed" a few seconds later.
+    _suppressResumeOnCancel = true;
+    try {
+      _tts.stop();
+    } catch (_) {}
     _resetState();
+    _suppressResumeOnCancel = false;
     stopLoading();
   }
 }

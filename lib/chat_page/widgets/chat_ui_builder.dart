@@ -181,6 +181,64 @@ class ChatUIBuilder {
     );
   }
 
+  /// Red live banner shown while a voice-triggered video recording is
+  /// running. Provides the manual stop button as a fallback for the voice
+  /// command "ভিডিও বন্ধ করো".
+  static Widget buildRecordingBanner({required VoidCallback onStop}) {
+    return Semantics(
+      liveRegion: true,
+      label: 'ভিডিও রেকর্ড হচ্ছে। বন্ধ করতে বোতাম চাপুন।',
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: Colors.red.shade50,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.red.shade300),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 12,
+              height: 12,
+              decoration: BoxDecoration(
+                color: Colors.red,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.red.withOpacity(0.6),
+                    blurRadius: 8,
+                    spreadRadius: 2,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                'ভিডিও রেকর্ড হচ্ছে… বন্ধ করতে বলুন: “ভিডিও বন্ধ করো”',
+                style: TextStyle(
+                  color: Colors.red.shade800,
+                  fontWeight: FontWeight.w600,
+                  fontSize: 15,
+                ),
+              ),
+            ),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.red.shade600,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+              ),
+              onPressed: onStop,
+              icon: const Icon(Icons.stop_rounded, size: 20),
+              label: const Text('বন্ধ'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   static Widget buildViewToggleButtons({
     required bool showMessages,
     required VoidCallback onToggleMessages,

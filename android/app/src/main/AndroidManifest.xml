@@ -43,19 +43,13 @@
             </intent-filter>
         </activity>
 
-        <!-- OAuth redirect handler -->
-        <activity
-            android:name="com.linusu.flutter_web_auth_2.CallbackActivity"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data
-                    android:scheme="com.tommasogiovannini.gemma"
-                    android:host="oauthredirect" />
-            </intent-filter>
-        </activity>
+        <!--
+            NOTE: the flutter_web_auth_2 OAuth callback activity was removed on
+            purpose. Hugging Face authentication is now automatic inside the
+            app (bundled developer token) — users never leave for a login.
+
+            The camera/video and microphone features need no extra activities.
+        -->
 
         <!-- Optional OpenCL stubs (keep or remove as you wish) -->
         <uses-native-library android:name="libOpenCL.so"       android:required="false" />
@@ -77,7 +71,19 @@
                 android:value="3" />
         </provider>
 
-        <!-- Foreground‑service declaration for WorkManager (Android 14 fix) -->
+        <!-- FileProvider used to open captured photos / recorded videos with
+             the system viewer (voice commands: ছবি তোলো / ভিডিও রেকর্ড করো). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- Foreground‑service declaration for WorkManager (Android 14 fix) -->
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:exported="false"
@@ -97,6 +103,15 @@
         <!-- Required on modern Android so speech_to_text can discover speech recognizers. -->
         <intent>
             <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <!-- Lets the app find a viewer/player for captured photos and videos. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="image/*" />
         </intent>
     </queries>
 </manifest>

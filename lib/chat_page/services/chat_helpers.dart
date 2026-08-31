@@ -1,17 +1,23 @@
+import 'dart:async';
 import 'dart:io';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../config/system_prompts.dart';
 import '../models/message_models.dart';
 import '../voice/bengali_voice_commands.dart';
 import '../voice/voice_intent.dart';
 import '../widgets/prompt_bar.dart';
+import 'chat_history_store.dart';
 import 'gemma_service.dart';
+import 'media_service.dart';
 import 'speech_service.dart';
 import 'streaming_tts_service.dart';
 import 'text_recognition_service.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 /// Core vision-assistant operations.
 ///
@@ -19,6 +25,17 @@ import 'text_recognition_service.dart';
 /// valid command, one image is captured, and the controller is disposed before
 /// Gemma inference starts. This preserves the performance advantage of the
 /// original project while removing the external controller dependency.
+///
+/// Priority 6: user messages now show the actual Bengali command the user
+/// spoke ([displayText]) while the model still receives the specialised
+/// English task prompt — previously the raw English prompt was displayed in
+/// the chat, which broke the conversation feel.
+///
+/// New voice-only operations:
+///   * [takePhoto]  — capture a photo, save it, show it in chat.
+///   * [startVideoRecording] / [stopVideoRecording] — full hands-free video.
+///     Recording is done without the audio track so the continuous command
+///     listener stays alive and "ভিডিও বন্ধ করো" can be heard.
 class ChatHelpers {
   final GemmaService _service;
   final StreamingTtsService _streamingTts;
@@ -31,6 +48,11 @@ class ChatHelpers {
   bool _resetting = false;
   bool _isGenerating = false;
   bool _muteCurrentResponse = false;
+
+  // Video recording state (voice controlled start/stop).
+  CameraController? _videoController;
+  bool _isRecording = false;
+  Timer? _recordingSafetyTimer;
 
   ChatHelpers({
     required GemmaService service,
@@ -52,11 +74,15 @@ class ChatHelpers {
 
   void dispose() {
     _streamingTts.isSpeaking.removeListener(_onStateChanged);
+    _recordingSafetyTimer?.cancel();
+    _videoController?.dispose();
+    _videoController = null;
   }
 
   bool get resetting => _resetting;
   bool get isGenerating => _isGenerating;
   bool get isSpeaking => _streamingTts.isSpeaking.value;
+  bool get isRecording => _isRecording;
   bool get isBusy => _resetting || _isGenerating;
   String get systemContext => _systemCtx;
 
@@ -68,7 +94,7 @@ class ChatHelpers {
         .replaceAll('Error:', '')
         .replaceAll('_', ' ')
         .trim();
-    await _speechService.speak('একটি সমস্যা হয়েছে। $cleanError');
+    await _speechService.speak('একটি সমস্যা হয়েছে। $cleanError');
   }
 
   Future<void> _announceStateChange(String message) =>
@@ -87,6 +113,7 @@ class ChatHelpers {
 
       messages.clear();
       promptBarKey?.currentState?.clear();
+      await ChatHistoryStore.clear();
       await _service.resetChatSession();
 
       _resetting = false;
@@ -95,7 +122,7 @@ class ChatHelpers {
     } catch (e) {
       _resetting = false;
       _onStateChanged();
-      final errorMsg = 'নতুন আলাপ শুরু করা যায়নি';
+      final errorMsg = 'নতুন আলাপ শুরু করা যায়নি';
       _showSnackBar(errorMsg);
       await _announceError(errorMsg);
     }
@@ -103,42 +130,72 @@ class ChatHelpers {
 
   Future<void> showMessages(List<ChatMessage> messages, bool show) async {
     await _announceStateChange(
-      show ? '${messages.length}টি বার্তা দেখানো হচ্ছে' : 'বার্তা লুকানো হয়েছে',
+      show ? '${messages.length}টি বার্তা দেখানো হচ্ছে' : 'বার্তা লুকানো হয়েছে',
     );
   }
 
-  Future<File> _captureWithEfficientCamera() async {
+  /// Resolves what the chat should display for a user command: prefer the
+  /// text the recognizer actually heard, fall back to the canonical label.
+  String displayCommandText(String? heardText, VoiceIntent? intent) {
+    final heard = (heardText ?? '').trim();
+    if (heard.isNotEmpty) return heard;
+    if (intent != null) return intent.banglaLabel;
+    return 'কমান্ড';
+  }
+
+  Future<CameraController> _openCamera({
+    bool forVideo = false,
+  }) async {
     if (kIsWeb) {
-      throw Exception('ওয়েবে ক্যামেরা সমর্থিত নয়');
+      throw Exception('ওয়েবে ক্যামেরা সমর্থিত নয়');
     }
 
-    CameraController? controller;
-    try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) {
-        throw Exception('কোনো ক্যামেরা পাওয়া যায়নি');
+    // Device-compatibility: some OEM ROMs fail the implicit permission flow
+    // of the camera plugin. An explicit request keeps every phone working.
+    final cameraStatus = await Permission.camera.request();
+    if (!cameraStatus.isGranted && await Permission.camera.isPermanentlyDenied) {
+      throw Exception('ক্যামেরার অনুমতি দেওয়া হয়নি');
+    }
+
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) {
+      throw Exception('কোনো ক্যামেরা পাওয়া যায়নি');
+    }
+
+    final description = cameras.firstWhere(
+      (cam) => cam.lensDirection == CameraLensDirection.back,
+      orElse: () => cameras.first,
+    );
+
+    // Device-compatibility: fall back through resolution presets. Some
+    // low-end phones reject 'high' outright — the assistant must still work.
+    final presets = forVideo
+        ? [ResolutionPreset.medium, ResolutionPreset.low, ResolutionPreset.high]
+        : [ResolutionPreset.high, ResolutionPreset.medium, ResolutionPreset.low];
+
+    Object? lastError;
+    for (final preset in presets) {
+      CameraController? controller;
+      try {
+        controller = CameraController(
+          description,
+          preset,
+          // enableAudio: false keeps the microphone free for the continuous
+          // voice loop, so recording can be stopped by voice hands-free.
+          enableAudio: false,
+          imageFormatGroup: ImageFormatGroup.jpeg,
+        );
+        await controller.initialize();
+        return controller;
+      } catch (e) {
+        lastError = e;
+        try {
+          await controller?.dispose();
+        } catch (_) {}
+        controller = null;
       }
-
-      final description = cameras.firstWhere(
-        (cam) => cam.lensDirection == CameraLensDirection.back,
-        orElse: () => cameras.first,
-      );
-
-      controller = CameraController(
-        description,
-        ResolutionPreset.high,
-        enableAudio: false,
-      );
-
-      await controller.initialize();
-      // Give auto-exposure/focus a brief moment after initialization. This is a
-      // small latency tradeoff for noticeably more reliable text/object images.
-      await Future.delayed(const Duration(milliseconds: 180));
-      final image = await controller.takePicture();
-      return File(image.path);
-    } finally {
-      await controller?.dispose();
     }
+    throw Exception('ক্যামেরা চালু করা যায়নি: $lastError');
   }
 
   Future<void> captureAndSend(
@@ -147,7 +204,14 @@ class ChatHelpers {
     bool isQuickAction = false,
     bool useOcr = false,
     String? spokenAcknowledgement,
+    String? displayText,
   }) async {
+    if (_isRecording) {
+      await _announceStateChange(
+        'ভিডিও রেকর্ড হচ্ছে। আগে বলুন: ভিডিও বন্ধ করো।',
+      );
+      return;
+    }
     if (_isGenerating || _resetting) return;
 
     _isGenerating = true;
@@ -163,12 +227,13 @@ class ChatHelpers {
       imageFile = await _captureWithEfficientCamera();
 
       final userMsg = ChatMessage.withImageFile(
-        prompt,
+        displayText ?? prompt,
         isUser: true,
         imageFile: imageFile,
       );
       messages.add(userMsg);
       _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
 
       final aiMsg = ChatMessage.text('', isUser: false, isStreaming: true);
       messages.add(aiMsg);
@@ -227,6 +292,7 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           } else {
             await _streamingTts.onMessageComplete();
           }
+          unawaited(ChatHistoryStore.save(messages));
         },
       );
     } catch (e) {
@@ -235,8 +301,8 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
       _onStateChanged();
 
       final errorMsg = e.toString().contains('Camera')
-          ? 'ক্যামেরা ব্যবহার করা যায়নি। ক্যামেরার অনুমতি পরীক্ষা করুন।'
-          : 'ছবিটি বিশ্লেষণ করা যায়নি। আবার চেষ্টা করুন।';
+          ? 'ক্যামেরা ব্যবহার করা যায়নি। ক্যামেরার অনুমতি পরীক্ষা করুন।'
+          : 'ছবিটি বিশ্লেষণ করা যায়নি। আবার চেষ্টা করুন।';
 
       if (messages.isEmpty || messages.last.isUser) {
         messages.add(ChatMessage.text(errorMsg, isUser: false));
@@ -246,22 +312,34 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           ..isStreaming = false;
       }
       _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
       _showSnackBar(errorMsg);
       await _announceError(errorMsg);
       debugPrint('[ChatHelpers] captureAndSend error: $e');
     }
   }
 
-  Future<void> sendTextOnly(String prompt, List<ChatMessage> messages) async {
+  Future<void> sendTextOnly(
+    String prompt,
+    List<ChatMessage> messages, {
+    String? displayText,
+  }) async {
+    if (_isRecording) {
+      await _announceStateChange(
+        'ভিডিও রেকর্ড হচ্ছে। আগে বলুন: ভিডিও বন্ধ করো।',
+      );
+      return;
+    }
     if (_isGenerating || _resetting) return;
     _isGenerating = true;
     _muteCurrentResponse = false;
     _onStateChanged();
     try {
-      messages.add(ChatMessage.text(prompt, isUser: true));
+      messages.add(ChatMessage.text(displayText ?? prompt, isUser: true));
       final aiMsg = ChatMessage.text('', isUser: false, isStreaming: true);
       messages.add(aiMsg);
       _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
 
       await _speechService.playWooshSound();
       await _streamingTts.startLoading();
@@ -295,25 +373,238 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           } else {
             await _streamingTts.onMessageComplete();
           }
+          unawaited(ChatHistoryStore.save(messages));
         },
       );
     } catch (e) {
       await _streamingTts.stopLoading();
       _isGenerating = false;
       _onStateChanged();
-      const errorMsg = 'প্রশ্নের উত্তর তৈরি করা যায়নি। আবার চেষ্টা করুন।';
+      const errorMsg = 'প্রশ্নের উত্তর তৈরি করা যায়নি। আবার চেষ্টা করুন।';
       messages.add(ChatMessage.text(errorMsg, isUser: false));
+      _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
       _showSnackBar(errorMsg);
       await _announceError(errorMsg);
       debugPrint('[ChatHelpers] sendTextOnly error: $e');
     }
   }
 
+  Future<File> _captureWithEfficientCamera() async {
+    final controller = await _openCamera();
+    try {
+      // Give auto-exposure/focus a brief moment after initialization. This is a
+      // small latency tradeoff for noticeably more reliable text/object images.
+      await Future.delayed(const Duration(milliseconds: 180));
+      final image = await controller.takePicture();
+      return File(image.path);
+    } finally {
+      try {
+        await controller.dispose();
+      } catch (_) {}
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Voice-controlled photo capture ("ছবি তোলো")
+  // ────────────────────────────────────────────────────────────
+
+  Future<void> takePhoto(
+    List<ChatMessage> messages, {
+    String? commandText,
+  }) async {
+    if (_isRecording) {
+      await _announceStateChange('ভিডিও রেকর্ড হচ্ছে। আগে ভিডিও বন্ধ করুন।');
+      return;
+    }
+    if (_isGenerating || _resetting) return;
+
+    _isGenerating = true;
+    _onStateChanged();
+    try {
+      await _announceStateChange('ছবি তুলছি।');
+      final raw = await _captureWithEfficientCamera();
+      final saved = await MediaService.savePhoto(raw);
+
+      messages.add(
+        ChatMessage.text(
+          displayCommandText(commandText, VoiceIntent.takePhoto),
+          isUser: true,
+        ),
+      );
+      messages.add(
+        ChatMessage.withImageFile(
+          'ছবি তোলা হয়েছে এবং সংরক্ষিত হয়েছে।',
+          isUser: false,
+          imageFile: saved,
+        ),
+      );
+      _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
+      await _speechService.playWooshSound();
+      await _announceStateChange(
+        'ছবি তোলা হয়েছে। বিশ্লেষণ চাইলে বলুন: সামনে কী আছে দেখো।',
+      );
+    } catch (e) {
+      _showSnackBar('ছবি তোলা যায়নি');
+      await _announceError('ছবি তোলা যায়নি। আবার চেষ্টা করুন।');
+      debugPrint('[ChatHelpers] takePhoto error: $e');
+    } finally {
+      _isGenerating = false;
+      _onStateChanged();
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Voice-controlled video recording ("ভিডিও রেকর্ড করো" / "বন্ধ করো")
+  // ────────────────────────────────────────────────────────────
+
+  Future<void> startVideoRecording(
+    List<ChatMessage> messages, {
+    String? commandText,
+  }) async {
+    if (_isRecording) {
+      await _announceStateChange(
+        'ভিডিও আগেই চালু আছে। বন্ধ করতে বলুন: ভিডিও বন্ধ করো।',
+      );
+      return;
+    }
+    if (_isGenerating || _resetting) {
+      await _announceStateChange('একটু পরে আবার বলুন।');
+      return;
+    }
+
+    _isGenerating = true;
+    _onStateChanged();
+    try {
+      await _announceStateChange(
+        'ভিডিও রেকর্ডিং শুরু করছি। বন্ধ করতে বলুন: ভিডিও বন্ধ করো।',
+      );
+
+      final controller = await _openCamera(forVideo: true);
+      _videoController = controller;
+      await controller.prepareForVideoRecording();
+      await controller.startVideoRecording();
+
+      _isRecording = true;
+      _onStateChanged();
+
+      // Keep the screen awake for the whole recording so the OS cannot
+      // interrupt the camera mid-take.
+      try {
+        await WakelockPlus.enable();
+      } catch (_) {}
+
+      messages.add(
+        ChatMessage.text(
+          displayCommandText(commandText, VoiceIntent.startVideo),
+          isUser: true,
+        ),
+      );
+      messages.add(
+        ChatMessage.text(
+          'ভিডিও রেকর্ড হচ্ছে… বন্ধ করতে বলুন: "ভিডিও বন্ধ করো"।',
+          isUser: false,
+        ),
+      );
+      _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
+
+      // Safety: hard-stop after 5 minutes so storage cannot fill up
+      // unnoticed on a phone left in a pocket.
+      _recordingSafetyTimer?.cancel();
+      _recordingSafetyTimer = Timer(const Duration(minutes: 5), () {
+        unawaited(_finishRecording(messages, autoStopped: true));
+      });
+    } catch (e) {
+      _isRecording = false;
+      try {
+        await _videoController?.dispose();
+      } catch (_) {}
+      _videoController = null;
+      _showSnackBar('ভিডিও রেকর্ডিং শুরু করা যায়নি');
+      await _announceError('ভিডিও রেকর্ডিং শুরু করা যায়নি। আবার চেষ্টা করুন।');
+      debugPrint('[ChatHelpers] startVideoRecording error: $e');
+    } finally {
+      _isGenerating = false;
+      _onStateChanged();
+    }
+  }
+
+  Future<void> stopVideoRecording(List<ChatMessage> messages) async {
+    if (!_isRecording) {
+      await _announceStateChange('কোনো ভিডিও রেকর্ড হচ্ছে না।');
+      return;
+    }
+    await _finishRecording(messages, autoStopped: false);
+  }
+
+  Future<void> _finishRecording(
+    List<ChatMessage> messages, {
+    required bool autoStopped,
+  }) async {
+    _recordingSafetyTimer?.cancel();
+    _recordingSafetyTimer = null;
+
+    final controller = _videoController;
+    if (controller == null) {
+      _isRecording = false;
+      _onStateChanged();
+      return;
+    }
+
+    XFile? file;
+    try {
+      file = await controller.stopVideoRecording();
+    } catch (e) {
+      debugPrint('[ChatHelpers] stopVideoRecording error: $e');
+    } finally {
+      _isRecording = false;
+      _onStateChanged();
+      try {
+        await WakelockPlus.disable();
+      } catch (_) {}
+      try {
+        await controller.dispose();
+      } catch (_) {}
+      _videoController = null;
+    }
+
+    if (file == null) {
+      await _announceError('ভিডিও সংরক্ষণ করা যায়নি।');
+      return;
+    }
+
+    try {
+      final saved = await MediaService.saveVideo(File(file.path));
+      messages.add(
+        ChatMessage.withVideoFile(
+          autoStopped
+              ? 'ভিডিও স্বয়ংক্রিয়ভাবে বন্ধ হয়ে সংরক্ষিত হয়েছে।'
+              : 'ভিডিও রেকর্ড সম্পন্ন হয়ে সংরক্ষিত হয়েছে।',
+          isUser: false,
+          videoFile: saved,
+        ),
+      );
+      _onStateChanged();
+      unawaited(ChatHistoryStore.save(messages));
+      await _announceStateChange('ভিডিও সংরক্ষিত হয়েছে।');
+    } catch (e) {
+      await _announceError('ভিডিও সংরক্ষণ করা যায়নি।');
+      debugPrint('[ChatHelpers] video save error: $e');
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Intent routing
+  // ────────────────────────────────────────────────────────────
+
   Future<void> handleVoiceIntent(
     VoiceIntent intent,
     List<ChatMessage> messages,
-    GlobalKey<PromptBarState>? promptBarKey,
-  ) async {
+    GlobalKey<PromptBarState>? promptBarKey, {
+    String? commandText,
+  }) async {
     switch (intent) {
       case VoiceIntent.describeFront:
         await captureAndSend(
@@ -321,6 +612,7 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           messages,
           isQuickAction: true,
           spokenAcknowledgement: 'সামনে দেখছি।',
+          displayText: displayCommandText(commandText, intent),
         );
         return;
       case VoiceIntent.describeCurrent:
@@ -329,6 +621,7 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           messages,
           isQuickAction: true,
           spokenAcknowledgement: 'দেখছি।',
+          displayText: displayCommandText(commandText, intent),
         );
         return;
       case VoiceIntent.describeRight:
@@ -337,6 +630,7 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           messages,
           isQuickAction: true,
           spokenAcknowledgement: 'ক্যামেরার ডান পাশ দেখছি।',
+          displayText: displayCommandText(commandText, intent),
         );
         return;
       case VoiceIntent.describeLeft:
@@ -345,6 +639,7 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           messages,
           isQuickAction: true,
           spokenAcknowledgement: 'ক্যামেরার বাম পাশ দেখছি।',
+          displayText: displayCommandText(commandText, intent),
         );
         return;
       case VoiceIntent.identifyObject:
@@ -353,6 +648,7 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           messages,
           isQuickAction: true,
           spokenAcknowledgement: 'জিনিসটি দেখছি।',
+          displayText: displayCommandText(commandText, intent),
         );
         return;
       case VoiceIntent.readText:
@@ -361,8 +657,18 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
           messages,
           isQuickAction: true,
           useOcr: true,
-          spokenAcknowledgement: 'লেখা পড়ার চেষ্টা করছি।',
+          spokenAcknowledgement: 'লেখা পড়ার চেষ্টা করছি।',
+          displayText: displayCommandText(commandText, intent),
         );
+        return;
+      case VoiceIntent.takePhoto:
+        await takePhoto(messages, commandText: commandText);
+        return;
+      case VoiceIntent.startVideo:
+        await startVideoRecording(messages, commandText: commandText);
+        return;
+      case VoiceIntent.stopVideo:
+        await stopVideoRecording(messages);
         return;
       case VoiceIntent.repeatLast:
         await repeatLastResponse(messages);
@@ -433,13 +739,14 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
     messages,
     isQuickAction: true,
     useOcr: true,
-    spokenAcknowledgement: 'লেখা পড়ার চেষ্টা করছি।',
+    spokenAcknowledgement: 'লেখা পড়ার চেষ্টা করছি।',
   );
 
   Future<void> clearMessages(List<ChatMessage> messages) async {
     final messageCount = messages.length;
     messages.clear();
     _onStateChanged();
-    await _announceStateChange('$messageCountটি বার্তা মুছে দেওয়া হয়েছে।');
+    unawaited(ChatHistoryStore.save(messages));
+    await _announceStateChange('$messageCountটি বার্তা মুছে দেওয়া হয়েছে।');
   }
 }

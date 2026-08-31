@@ -1,15 +1,25 @@
 // lib/chat_page/widgets/chat_bubble.dart
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
-import '../models/message_models.dart';
 
-/// Chat message bubble with support for text, images, markdown rendering, and performance stats
-/// Handles different message types: text-only, image-only, or combined image+text messages
+import '../models/message_models.dart';
+import '../services/media_service.dart';
+
+/// Chat message bubble with support for text, images, videos, markdown,
+/// timestamps and performance stats. Handles different message types:
+/// text-only, image-only, video-only, or combined image+text messages.
 class ChatBubble extends StatelessWidget {
   final ChatMessage msg;
 
   const ChatBubble({Key? key, required this.msg}) : super(key: key);
+
+  String get _timeLabel {
+    final t = msg.createdAt;
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${two(t.hour)}:${two(t.minute)}';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -27,6 +37,20 @@ class ChatBubble extends StatelessWidget {
       );
     }
 
+    // Video message
+    if (msg.videoFile != null) {
+      return Column(
+        crossAxisAlignment: msg.isUser
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
+        children: [
+          _buildVideoBubble(context),
+          const SizedBox(height: 2),
+          if (msg.text.isNotEmpty) _buildTextBubble(context),
+        ],
+      );
+    }
+
     // Image-only message
     if (msg.imageFile != null) {
       return _buildImageBubble(context);
@@ -34,6 +58,92 @@ class ChatBubble extends StatelessWidget {
 
     // Text-only message (most common case)
     return _buildTextBubble(context);
+  }
+
+  Widget _buildMetaRow(Color color) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 4.0),
+      child: Text(
+        _timeLabel,
+        style: TextStyle(color: color, fontSize: 10),
+      ),
+    );
+  }
+
+  /// Video bubble with a play affordance — tapping opens the system player
+  /// through the native channel.
+  Widget _buildVideoBubble(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        left: msg.isUser ? 60.0 : 8.0,
+        right: msg.isUser ? 8.0 : 60.0,
+        top: 2.0,
+        bottom: 2.0,
+      ),
+      child: Align(
+        alignment: msg.isUser ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          constraints: BoxConstraints(
+            maxWidth: MediaQuery.of(context).size.width * 0.7,
+          ),
+          decoration: BoxDecoration(
+            color: Colors.deepPurple.shade50,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: Colors.deepPurple.shade200),
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(18),
+            child: InkWell(
+              onTap: () => MediaService.openMedia(msg.videoFile!.path),
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 46,
+                      height: 46,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.deepPurple.shade600,
+                      ),
+                      child: const Icon(
+                        Icons.play_arrow_rounded,
+                        color: Colors.white,
+                        size: 30,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Flexible(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'ভিডিও',
+                            style: TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 15,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            'চালাতে ট্যাপ করুন • $_timeLabel',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   /// Image bubble with tap-to-expand and error handling
@@ -59,35 +169,60 @@ class ChatBubble extends StatelessWidget {
               onTap: () => _showFullScreenImage(context, msg.imageFile!),
               child: Hero(
                 tag: 'image_${msg.text}_${msg.imageFile!.path}',
-                child: Image.file(
-                  msg.imageFile!,
-                  fit: BoxFit.contain,
-                  // Graceful error handling for corrupted/missing images
-                  errorBuilder: (context, error, stackTrace) {
-                    return Container(
-                      height: 200,
-                      width: double.infinity,
-                      color: Colors.grey.shade200,
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            Icons.error_outline,
-                            size: 48,
-                            color: Colors.grey.shade600,
+                child: Stack(
+                  children: [
+                    Image.file(
+                      msg.imageFile!,
+                      fit: BoxFit.contain,
+                      // Graceful error handling for corrupted/missing images
+                      errorBuilder: (context, error, stackTrace) {
+                        return Container(
+                          height: 200,
+                          width: double.infinity,
+                          color: Colors.grey.shade200,
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.error_outline,
+                                size: 48,
+                                color: Colors.grey.shade600,
+                              ),
+                              const SizedBox(height: 8),
+                              Text(
+                                'ছবি দেখানো যায়নি',
+                                style: TextStyle(
+                                  color: Colors.grey.shade600,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'ছবি দেখানো যায়নি',
-                            style: TextStyle(
-                              color: Colors.grey.shade600,
-                              fontSize: 14,
-                            ),
+                        );
+                      },
+                    ),
+                    Positioned(
+                      right: 8,
+                      bottom: 8,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.55),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          _timeLabel,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
                           ),
-                        ],
+                        ),
                       ),
-                    );
-                  },
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -152,6 +287,10 @@ class ChatBubble extends StatelessWidget {
                       ),
                     ),
                   ),
+
+                _buildMetaRow(
+                  msg.isUser ? Colors.white70 : Colors.black45,
+                ),
               ],
             ),
           ),
@@ -206,7 +345,7 @@ class ChatBubble extends StatelessWidget {
                         ),
                         const SizedBox(height: 16),
                         const Text(
-                          'ছবি দেখানো যায়নি',
+                          'ছবি দেখানো যায়নি',
                           style: TextStyle(color: Colors.white, fontSize: 18),
                         ),
                       ],

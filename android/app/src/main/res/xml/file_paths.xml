@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths for media captured through voice commands.
+     getApplicationDocumentsDirectory() maps to the app's internal files dir,
+     so "files-path" with the media/ subtree covers photos and videos. -->
+<paths>
+    <files-path name="media" path="media/" />
+</paths>
