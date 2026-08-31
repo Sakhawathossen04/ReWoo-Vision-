@@ -1,0 +1,39 @@
+enum VoiceIntent {
+  describeFront,
+  describeCurrent,
+  describeRight,
+  describeLeft,
+  identifyObject,
+  readText,
+  repeatLast,
+  stopSpeaking,
+  help,
+  newChat,
+}
+
+extension VoiceIntentLabel on VoiceIntent {
+  String get banglaLabel {
+    switch (this) {
+      case VoiceIntent.describeFront:
+        return 'সামনে কী আছে';
+      case VoiceIntent.describeCurrent:
+        return 'এদিকে দেখো';
+      case VoiceIntent.describeRight:
+        return 'ডান পাশে কী আছে';
+      case VoiceIntent.describeLeft:
+        return 'বাম পাশে কী আছে';
+      case VoiceIntent.identifyObject:
+        return 'এটা কী';
+      case VoiceIntent.readText:
+        return 'লেখাটা পড়ে শোনাও';
+      case VoiceIntent.repeatLast:
+        return 'আবার বলো';
+      case VoiceIntent.stopSpeaking:
+        return 'চুপ করো';
+      case VoiceIntent.help:
+        return 'কী কী বলতে পারি';
+      case VoiceIntent.newChat:
+        return 'নতুন আলাপ';
+    }
+  }
+}

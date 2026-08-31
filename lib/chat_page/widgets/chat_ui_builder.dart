@@ -1,0 +1,405 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../models/message_models.dart';
+import 'chat_bubble.dart';
+import 'prompt_bar.dart';
+
+class ChatUIBuilder {
+  static PreferredSizeWidget buildCleanAppBar({
+    required VoidCallback onNewChat,
+    required VoidCallback onToggleSettings,
+    required bool isResetting,
+  }) {
+    return AppBar(
+      elevation: 0,
+      backgroundColor: Colors.white,
+      systemOverlayStyle: SystemUiOverlayStyle.dark,
+      title: const Text(
+        'ReWoo Vision',
+        style: TextStyle(
+          color: Colors.black87,
+          fontSize: 20,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      actions: [
+        Semantics(
+          button: true,
+          label: 'সেটিংস',
+          hint: 'সেটিংস খুলতে দুইবার ট্যাপ করুন',
+          child: IconButton(
+            tooltip: 'সেটিংস',
+            onPressed: onToggleSettings,
+            icon: const Icon(Icons.settings_outlined),
+          ),
+        ),
+        const SizedBox(width: 8),
+      ],
+    );
+  }
+
+  static Widget buildVoiceControlCard({
+    required bool speechEnabled,
+    required bool listening,
+    required bool bengaliLocaleAvailable,
+    required String lastHeard,
+    required VoidCallback onToggleListening,
+  }) {
+    final title = !speechEnabled
+        ? 'ভয়েস কন্ট্রোল পাওয়া যায়নি'
+        : listening
+        ? 'ভয়েস কন্ট্রোল সক্রিয়'
+        : 'ভয়েস কন্ট্রোল অপেক্ষায়';
+
+    final subtitle = !speechEnabled
+        ? 'মাইক্রোফোন অনুমতি ও Google Speech Services পরীক্ষা করুন।'
+        : !bengaliLocaleAvailable
+        ? 'বাংলা স্পিচ লোকেল পাওয়া যায়নি। ফোনের ভয়েস ইনপুটে বাংলা চালু করুন।'
+        : listening
+        ? 'কমান্ড বলুন: “সামনে কী আছে”, “এটা কী”, “লেখাটা পড়ে শোনাও”।'
+        : 'ভয়েস শোনা আবার চালু করতে নিচের বোতাম চাপুন।';
+
+    return Semantics(
+      liveRegion: true,
+      label: '$title। $subtitle',
+      child: Container(
+        width: double.infinity,
+        margin: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: listening ? Colors.green.shade200 : Colors.orange.shade200,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.04),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 54,
+              height: 54,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: listening ? Colors.green.shade50 : Colors.orange.shade50,
+              ),
+              child: Icon(
+                listening ? Icons.hearing_rounded : Icons.hearing_disabled_rounded,
+                color: listening ? Colors.green.shade700 : Colors.orange.shade700,
+                size: 30,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 5),
+                  Text(
+                    subtitle,
+                    style: TextStyle(
+                      color: Colors.grey.shade700,
+                      height: 1.35,
+                    ),
+                  ),
+                  if (lastHeard.trim().isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    Text(
+                      'শেষ শোনা: $lastHeard',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey.shade500,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            IconButton.filledTonal(
+              tooltip: listening ? 'ভয়েস বন্ধ করুন' : 'ভয়েস চালু করুন',
+              onPressed: speechEnabled ? onToggleListening : null,
+              icon: Icon(listening ? Icons.mic : Icons.mic_off),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static Widget buildQuickActions({
+    required bool disabled,
+    required VoidCallback onDescribeFront,
+    required VoidCallback onIdentifyObject,
+    required VoidCallback onReadText,
+  }) {
+    Widget button(String label, IconData icon, VoidCallback onPressed) {
+      return Expanded(
+        child: SizedBox(
+          height: 58,
+          child: FilledButton.tonalIcon(
+            onPressed: disabled ? null : onPressed,
+            icon: Icon(icon),
+            label: Text(
+              label,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Row(
+        children: [
+          button('সামনে দেখুন', Icons.visibility_outlined, onDescribeFront),
+          const SizedBox(width: 8),
+          button('এটা কী', Icons.center_focus_strong, onIdentifyObject),
+          const SizedBox(width: 8),
+          button('লেখা পড়ুন', Icons.text_snippet_outlined, onReadText),
+        ],
+      ),
+    );
+  }
+
+  static Widget buildViewToggleButtons({
+    required bool showMessages,
+    required VoidCallback onToggleMessages,
+    required VoidCallback onNewChat,
+    required bool isResetting,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: isResetting ? null : onNewChat,
+              icon: const Icon(Icons.refresh_rounded),
+              label: Text(isResetting ? 'অপেক্ষা করুন' : 'নতুন আলাপ'),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: onToggleMessages,
+              icon: Icon(
+                showMessages
+                    ? Icons.visibility_off_outlined
+                    : Icons.history_rounded,
+              ),
+              label: Text(showMessages ? 'বার্তা লুকান' : 'সব বার্তা'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static Widget buildMessagesContainer(
+    List<ChatMessage> messages,
+    ScrollController scrollController,
+  ) {
+    return Expanded(
+      child: Semantics(
+        label: 'আলাপের বার্তাসমূহ',
+        child: messages.isEmpty
+            ? _emptyState()
+            : ListView.builder(
+                controller: scrollController,
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                itemCount: messages.length,
+                itemBuilder: (_, i) => ChatBubble(msg: messages[i]),
+              ),
+      ),
+    );
+  }
+
+  static Widget buildLastAnswer(List<ChatMessage> messages) {
+    ChatMessage? lastAi;
+    for (final message in messages.reversed) {
+      if (!message.isUser && message.text.trim().isNotEmpty) {
+        lastAi = message;
+        break;
+      }
+    }
+
+    return Expanded(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
+        child: lastAi == null
+            ? _emptyState()
+            : Semantics(
+                liveRegion: true,
+                label: 'শেষ উত্তর। ${lastAi.text}',
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: Colors.grey.shade200),
+                  ),
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'শেষ উত্তর',
+                          style: TextStyle(
+                            color: Colors.grey.shade600,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          lastAi.text,
+                          style: const TextStyle(fontSize: 18, height: 1.45),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+      ),
+    );
+  }
+
+  static Widget _emptyState() {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(28),
+        child: Text(
+          'ভয়েস কমান্ড বলুন।\nযেমন: “সামনে কী আছে?”',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Colors.grey.shade600,
+            fontSize: 18,
+            height: 1.5,
+          ),
+        ),
+      ),
+    );
+  }
+
+  static Widget buildPromptBarContainer({
+    required GlobalKey<PromptBarState> promptBarKey,
+    required Future<void> Function(String) onPromptWithPhoto,
+    required Future<void> Function(String) onPromptTextOnly,
+    required bool disabled,
+    required bool speechEnabled,
+    required bool listening,
+    required VoidCallback onToggleListening,
+    required bool isGenerating,
+    required bool isSpeaking,
+    Future<void> Function()? onStopTts,
+  }) {
+    if (isGenerating || isSpeaking) {
+      return _buildStatusWidget(
+        isGenerating: isGenerating,
+        isSpeaking: isSpeaking,
+        onStopTts: onStopTts,
+      );
+    }
+
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      child: ExpansionTile(
+        tilePadding: const EdgeInsets.symmetric(horizontal: 8),
+        title: const Text('টাচ/টাইপ ব্যাকআপ'),
+        subtitle: const Text('ভয়েস কাজ না করলে এখানে টাইপ করে ব্যবহার করুন'),
+        children: [
+          PromptBar(
+            key: promptBarKey,
+            onPromptWithPhoto: onPromptWithPhoto,
+            onPromptTextOnly: onPromptTextOnly,
+            disabled: disabled,
+            speechEnabled: speechEnabled,
+            listening: listening,
+            onToggleListening: onToggleListening,
+            onStopTts: onStopTts,
+          ),
+        ],
+      ),
+    );
+  }
+
+  static Widget _buildStatusWidget({
+    required bool isGenerating,
+    required bool isSpeaking,
+    Future<void> Function()? onStopTts,
+  }) {
+    final text = isGenerating
+        ? (isSpeaking ? 'বিশ্লেষণ ও বলা হচ্ছে…' : 'ছবি বিশ্লেষণ হচ্ছে…')
+        : 'উত্তর বলা হচ্ছে…';
+
+    return Semantics(
+      liveRegion: true,
+      label: text,
+      child: Container(
+        color: Colors.white,
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          children: [
+            const SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                text,
+                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+              ),
+            ),
+            if (onStopTts != null)
+              TextButton.icon(
+                onPressed: onStopTts,
+                icon: const Icon(Icons.stop_circle_outlined),
+                label: const Text('চুপ করুন'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static Widget buildLoadingScreen() {
+    return const Scaffold(
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 22),
+            Text(
+              'Gemma প্রস্তুত হচ্ছে…',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,21 @@
+Gemma Vision Bangla - static validation performed in the delivery environment
+
+PASS - AndroidManifest.xml parsed as XML
+PASS - pubspec.yaml and analysis_options.yaml parsed as YAML
+PASS - all Dart files passed delimiter/string lexical scan
+PASS - all relative Dart imports resolve to existing files
+PASS - old keyboard/controller handler removed
+PASS - controller setup asset removed
+PASS - Android RECORD_AUDIO permission present
+PASS - Bengali TTS locale configuration present
+PASS - event-driven camera path disposes CameraController before inference
+PASS - Bengali danda sentence splitting present
+PASS - deterministic Bengali command matcher wired into SpeechService
+PASS - backend switching no longer deletes downloaded Gemma model
+PASS - final ZIP integrity test passed
+
+Not executable-verified in this environment:
+- Flutter SDK is not installed here, so `flutter analyze`, `flutter test`, and Android APK compilation could not be run.
+- Physical Android speech recognition, Bengali TTS, camera, Gemma inference, and 60-minute listener stability require device testing.
+
+Use BUILD_AND_TEST.md on the target Windows/Android environment.
