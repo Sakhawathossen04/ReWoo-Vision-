@@ -1,6 +1,27 @@
 # Gemma Vision বাংলা — Build and Test Guide
 
-Follow the steps in order. Do not rename the Android package or OAuth redirect before the first successful end-to-end run.
+Follow the steps in order. Do not rename the Android package before the first successful end-to-end run.
+
+> NOTE (v1.2): The old browser-based Hugging Face OAuth flow has been REPLACED by an automatic, developer-token based download. Users only create a simple in-app account (email + password + consent). See section 1.1 below.
+
+### 1.1 REQUIRED one-time setup: Hugging Face token (automatic downloads)
+
+End users never log into Hugging Face. The app authenticates downloads with
+YOUR developer access token:
+
+1. Sign in to the Hugging Face account you use for this app release.
+2. Open https://huggingface.co/google/gemma-3n-E2B-it-litert-preview and accept
+   the model license with that account (one time).
+3. Go to https://huggingface.co/settings/tokens → Create new token → type "Read".
+4. Paste the token (starts with `hf_`) into
+   `lib/download_page/config/constants.dart` → `hfAppToken`
+   (replace `PASTE_YOUR_HF_TOKEN_HERE`), **or** build with
+   `flutter build apk --release --dart-define=HF_APP_TOKEN=hf_your_token`.
+5. Rebuild. From now on the whole pipeline is automatic:
+   Sign Up → consent → automatic authentication → automatic download.
+
+Without this token the download page shows a clear setup message and the
+automatic download will not start.
 
 ## 1. Install tools
 
@@ -75,7 +96,7 @@ The Gemma model is not stored in the Git repository. The existing app flow downl
 gemma-3n-E2B-it-int4.task
 ```
 
-from the configured Hugging Face model repository. Follow the app's license/authentication instructions. Keep the phone on stable Wi-Fi and ensure several GB of free storage.
+from the configured Hugging Face model repository. Authentication is automatic (developer token) and the download keeps running in the background on Wi-Fi or mobile data. Ensure several GB of free storage.
 
 ## 6. Enable Bengali speech services
 
@@ -199,6 +220,6 @@ The inherited release config uses debug signing. Before publishing to Google Pla
 - create your own upload/release keystore;
 - configure release signing;
 - choose your own application ID;
-- create your own Hugging Face OAuth app/redirect URI;
-- update all package/OAuth references together;
+- set your own Hugging Face read token (see section 1.1) or inject it with --dart-define=HF_APP_TOKEN=hf_xxx;
+- update all package references together;
 - conduct accessibility and safety testing on multiple devices.
