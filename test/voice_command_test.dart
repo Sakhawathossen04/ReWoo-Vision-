@@ -3,254 +3,359 @@ import 'package:gemma_chat/chat_page/voice/bengali_voice_commands.dart';
 import 'package:gemma_chat/chat_page/voice/voice_intent.dart';
 
 void main() {
-  group('BengaliVoiceCommands — core fixed commands', () {
-    test('matches the primary product phrase exactly', () {
-      // This exact phrase was broken before the matcher rewrite.
-      expect(
-        BengaliVoiceCommands.match('সামনে কী আছে দেখো'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('সামনে কী আছে?'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('সামনে কি আছে দেখুন'),
-        VoiceIntent.describeFront,
-      );
-      expect(BengaliVoiceCommands.match('এটা কী'), VoiceIntent.identifyObject);
-      expect(
-        BengaliVoiceCommands.match('এটা পড়ে শোনাও'),
-        VoiceIntent.readText,
-      );
-      expect(
-        BengaliVoiceCommands.match('লেখাটা পড়ে শোনাও'),
-        VoiceIntent.readText,
-      );
-      expect(
-        BengaliVoiceCommands.match('সামনে কী লেখা আছে'),
-        VoiceIntent.readText,
-      );
-      expect(BengaliVoiceCommands.match('আবার বলো'), VoiceIntent.repeatLast);
-      expect(BengaliVoiceCommands.match('চুপ করো'), VoiceIntent.stopSpeaking);
-    });
+  group(
+    'BengaliVoiceCommands.matchTriggerCommand — valid triggers',
+    () {
+      test('matches the five primary trigger commands', () {
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'সামনে কী আছে দেখো',
+          ),
+          VoiceIntent.describeFront,
+        );
 
-    test('matches directional commands', () {
-      expect(
-        BengaliVoiceCommands.match('ডান পাশে কি আছে'),
-        VoiceIntent.describeRight,
-      );
-      expect(
-        BengaliVoiceCommands.match('বামে কী আছে'),
-        VoiceIntent.describeLeft,
-      );
-      expect(
-        BengaliVoiceCommands.match('এদিকে দেখো'),
-        VoiceIntent.describeCurrent,
-      );
-    });
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'এটা কী',
+          ),
+          VoiceIntent.identifyObject,
+        );
 
-    test('allows polite prefixes and punctuation noise', () {
-      expect(
-        BengaliVoiceCommands.match('একটু সামনে কী আছে'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('দয়া করে এটা কী'),
-        VoiceIntent.identifyObject,
-      );
-      expect(
-        BengaliVoiceCommands.match('সহায়ক, সামনে কী আছে দেখো?'),
-        VoiceIntent.describeFront,
-      );
-    });
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'লেখাটা পড়ে শোনাও',
+          ),
+          VoiceIntent.readText,
+        );
 
-    test('fuzzy recovery for recogniser noise', () {
-      expect(
-        BengaliVoiceCommands.match('সামনে কি আসে দেখো'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('এটা কি দেখাও'),
-        VoiceIntent.identifyObject,
-      );
-    });
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'ডান পাশে কী আছে',
+          ),
+          VoiceIntent.describeRight,
+        );
 
-    test('media commands', () {
-      expect(BengaliVoiceCommands.match('ছবি তোলো'), VoiceIntent.takePhoto);
-      expect(
-        BengaliVoiceCommands.match('ছবি তুলে দাও'),
-        VoiceIntent.takePhoto,
-      );
-      expect(
-        BengaliVoiceCommands.match('ভিডিও রেকর্ড করো'),
-        VoiceIntent.startVideo,
-      );
-      expect(
-        BengaliVoiceCommands.match('ভিডিও রেকর্ড শুরু করো'),
-        VoiceIntent.startVideo,
-      );
-      expect(
-        BengaliVoiceCommands.match('ভিডিও বন্ধ করো'),
-        VoiceIntent.stopVideo,
-      );
-      expect(
-        BengaliVoiceCommands.match('ভিডিও রেকর্ড বন্ধ করো'),
-        VoiceIntent.stopVideo,
-      );
-      expect(
-        BengaliVoiceCommands.match('রেকর্ডিং বন্ধ করো'),
-        VoiceIntent.stopVideo,
-      );
-    });
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'বাম পাশে কী আছে',
+          ),
+          VoiceIntent.describeLeft,
+        );
+      });
 
-    test('does not activate on unrelated conversation', () {
-      expect(BengaliVoiceCommands.match('আজকে বাজারে যাব'), isNull);
-      expect(BengaliVoiceCommands.match('ভাত খেয়েছ'), isNull);
-      expect(BengaliVoiceCommands.match('দরজাটা বন্ধ করো'), isNull);
-      expect(BengaliVoiceCommands.match('আজ আবহাওয়া খারাপ'), isNull);
-    });
+      test('accepts configured কি / কী recognition variants', () {
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'সামনে কি আছে দেখো',
+          ),
+          VoiceIntent.describeFront,
+        );
 
-    test('wake word helpers', () {
-      expect(BengaliVoiceCommands.containsWakeWord('রিউ সামনে কী আছে'), isTrue);
-      expect(BengaliVoiceCommands.containsWakeWord('সামনে কী আছে'), isFalse);
-      expect(
-        BengaliVoiceCommands.stripWakeWord('রিউ সামনে কী আছে'),
-        'সামনে কী আছে',
-      );
-      expect(BengaliVoiceCommands.stripWakeWord('রিউ'), '');
-      expect(
-        BengaliVoiceCommands.stripWakeWord('সামনে কী আছে'),
-        isNull,
-      );
-    });
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'এটা কি',
+          ),
+          VoiceIntent.identifyObject,
+        );
 
-    test('wake-word gating', () {
-      // Without a wake word and not primed → nothing matches.
-      expect(
-        BengaliVoiceCommands.match(
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'লেখা পড়ে শোনাও',
+          ),
+          VoiceIntent.readText,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'ডান পাশে কি আছে',
+          ),
+          VoiceIntent.describeRight,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'বাম পাশে কি আছে',
+          ),
+          VoiceIntent.describeLeft,
+        );
+      });
+
+      test('normalizes harmless punctuation and whitespace', () {
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            '  সামনে কী আছে দেখো?  ',
+          ),
+          VoiceIntent.describeFront,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'এটা কী!',
+          ),
+          VoiceIntent.identifyObject,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'ডান পাশে   কী আছে।',
+          ),
+          VoiceIntent.describeRight,
+        );
+      });
+
+      test('isTriggerCommand agrees with strict matcher', () {
+        expect(
+          BengaliVoiceCommands.isTriggerCommand(
+            'সামনে কী আছে দেখো',
+          ),
+          isTrue,
+        );
+
+        expect(
+          BengaliVoiceCommands.isTriggerCommand(
+            'ছবি তোলো',
+          ),
+          isFalse,
+        );
+      });
+    },
+  );
+
+  group(
+    'BengaliVoiceCommands.matchTriggerCommand — rejects old commands',
+    () {
+      test('old broad commands do not wake the assistant', () {
+        final oldCommands = <String>[
           'সামনে কী আছে',
-          requireWakeWord: true,
-          wakePrimed: false,
-        ),
-        isNull,
-      );
-      // With wake word → matches.
-      expect(
-        BengaliVoiceCommands.match(
-          'রিউ সামনে কী আছে',
-          requireWakeWord: true,
-          wakePrimed: false,
-        ),
-        VoiceIntent.describeFront,
-      );
-      // Primed window → direct commands accepted.
-      expect(
-        BengaliVoiceCommands.match(
-          'সামনে কী আছে',
-          requireWakeWord: true,
-          wakePrimed: true,
-        ),
-        VoiceIntent.describeFront,
-      );
-      // Wake word alone → no command (priming event).
-      expect(
-        BengaliVoiceCommands.match(
+          'সামনে কি আছে',
+          'এটা পড়ে শোনাও',
+          'এইটা পড়ে শোনাও',
+          'সামনে কী লেখা আছে',
+          'সামনে কি লেখা আছে',
+          'এদিকে দেখো',
+          'ডানে কী আছে',
+          'বামে কী আছে',
+          'ছবি তোলো',
+          'ছবি তুলে দাও',
+          'ভিডিও রেকর্ড করো',
+          'ভিডিও বন্ধ করো',
+          'আবার বলো',
+          'চুপ করো',
+          'থামো',
+          'কমান্ড বলো',
+          'নতুন আলাপ',
+        ];
+
+        for (final phrase in oldCommands) {
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              phrase,
+            ),
+            isNull,
+            reason:
+                '"$phrase" must not activate strict trigger mode',
+          );
+        }
+      });
+    },
+  );
+
+  group(
+    'BengaliVoiceCommands.matchTriggerCommand — rejects wake words',
+    () {
+      test('wake word alone is not a trigger', () {
+        final wakeWords = <String>[
+          'রিউ',
+          'রিউ ভিশন',
           'সহায়ক',
-          requireWakeWord: true,
-          wakePrimed: false,
-        ),
-        isNull,
-      );
-    });
-  });
+          'হে সহায়ক',
+          'অ্যাসিস্ট্যান্ট',
+          'hey assistant',
+        ];
 
-  group('BengaliVoiceCommands — real-world recognition variants', () {
-    test('the six product commands with speech noise', () {
-      // 1. "সামনে কী আছে দেখো" (scene description) — reported broken.
-      expect(
-        BengaliVoiceCommands.match('সামনে কী আছে দেখো'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('সামনে কি আছে দেখো'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('সামনে কী আছে দেখো।'),
-        VoiceIntent.describeFront,
-      );
-      // 2. "এটা পড়ে শোনাও" (OCR read aloud).
-      expect(
-        BengaliVoiceCommands.match('এটা পড়ে শোনাও'),
-        VoiceIntent.readText,
-      );
-      expect(
-        BengaliVoiceCommands.match('এইটা পড়ে শোনাও'),
-        VoiceIntent.readText,
-      );
-      expect(
-        BengaliVoiceCommands.match('এটা পড়ে শোনাও দয়া করে'.replaceAll('দয়া করে ', '')),
-        VoiceIntent.readText,
-      );
-      // 3. "সামনে কী লেখা আছে" (front text).
-      expect(
-        BengaliVoiceCommands.match('সামনে কি লেখা আছে'),
-        VoiceIntent.readText,
-      );
-      // 4. "ছবি তোলো" (take photo) + common mis-hearings.
-      expect(BengaliVoiceCommands.match('ছবি তোলো'), VoiceIntent.takePhoto);
-      expect(BengaliVoiceCommands.match('ছবি তোলে'), VoiceIntent.takePhoto);
-      expect(BengaliVoiceCommands.match('ছবি তুলো'), VoiceIntent.takePhoto);
-      expect(
-        BengaliVoiceCommands.match('একটা ছবি তোলো'),
-        VoiceIntent.takePhoto,
-      );
-      // 5. Video start/stop in one breath with wake word.
-      expect(
-        BengaliVoiceCommands.match('রিউ ভিডিও রেকর্ড করো'),
-        VoiceIntent.startVideo,
-      );
-      expect(
-        BengaliVoiceCommands.match('ভিডিও শেষ করো'),
-        VoiceIntent.stopVideo,
-      );
-      // 6. Repeat / silence / help / new chat.
-      expect(BengaliVoiceCommands.match('আরেকবার বলো'), VoiceIntent.repeatLast);
-      expect(BengaliVoiceCommands.match('থামো'), VoiceIntent.stopSpeaking);
-      expect(BengaliVoiceCommands.match('কমান্ড বলো'), VoiceIntent.help);
-      expect(BengaliVoiceCommands.match('নতুন আলাপ'), VoiceIntent.newChat);
-    });
+        for (final phrase in wakeWords) {
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              phrase,
+            ),
+            isNull,
+          );
+        }
+      });
 
-    test('trailing verbs and politeness do not break matching', () {
-      expect(
-        BengaliVoiceCommands.match('এটা কী দেখো'),
-        VoiceIntent.identifyObject,
-      );
-      expect(
-        BengaliVoiceCommands.match('সামনে কী আছে বলো'),
-        VoiceIntent.describeFront,
-      );
-      expect(
-        BengaliVoiceCommands.match('লেখাটা পড়ো'),
-        VoiceIntent.readText,
-      );
-      expect(
-        BengaliVoiceCommands.match('লেখা দেখাও'),
-        VoiceIntent.readText,
-      );
-    });
+      test('wake word plus valid command is still rejected', () {
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'রিউ সামনে কী আছে দেখো',
+          ),
+          isNull,
+        );
 
-    test('near-miss commands stay distinct', () {
-      // "ভিডিও রেকর্ড" alone still starts; "বন্ধ" variants stop.
-      expect(
-        BengaliVoiceCommands.match('ভিডিও রেকর্ড'),
-        VoiceIntent.startVideo,
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'সহায়ক এটা কী',
+          ),
+          isNull,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'রিউ ভিশন লেখাটা পড়ে শোনাও',
+          ),
+          isNull,
+        );
+      });
+    },
+  );
+
+  group(
+    'BengaliVoiceCommands.matchTriggerCommand — rejects normal conversation',
+    () {
+      test('unrelated speech returns null', () {
+        final conversation = <String>[
+          'আজকে বাজারে যাব',
+          'ভাত খেয়েছ',
+          'দরজাটা বন্ধ করো',
+          'আজ আবহাওয়া খুব সুন্দর',
+          'আমার সামনে অনেক মানুষ দাঁড়িয়ে আছে',
+          'এটা খুব সুন্দর',
+          'ডান পাশে আমার বন্ধু আছে',
+          'বাম পাশে একটা দোকান আছে',
+        ];
+
+        for (final phrase in conversation) {
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              phrase,
+            ),
+            isNull,
+          );
+        }
+      });
+    },
+  );
+
+  group(
+    'BengaliVoiceCommands.matchTriggerCommand — rejects fuzzy phrases',
+    () {
+      test('recognizer near-misses are not accepted', () {
+        final fuzzyPhrases = <String>[
+          'সামনে কি আসে দেখো',
+          'সামনে কী আছে বলো',
+          'সামনে কি আছে দেখাও',
+          'এটা কি দেখাও',
+          'এটা কী দেখো',
+          'লেখাটা পড়ে দাও',
+          'ডান দিকে কী আছে',
+          'বাম দিকে কী আছে',
+        ];
+
+        for (final phrase in fuzzyPhrases) {
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              phrase,
+            ),
+            isNull,
+            reason:
+                '"$phrase" must not fuzzy-match a direct trigger',
+          );
+        }
+      });
+    },
+  );
+
+  group(
+    'BengaliVoiceCommands.matchTriggerCommand — partial sentence safety',
+    () {
+      test('valid trigger embedded in a longer sentence returns null', () {
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'সামনে কী আছে দেখো তারপর আমাকে বলো',
+          ),
+          isNull,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'লেখাটা পড়ে শোনাও তারপর বন্ধ করো',
+          ),
+          isNull,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'ডান পাশে কী আছে আমি জানতে চাই',
+          ),
+          isNull,
+        );
+
+        expect(
+          BengaliVoiceCommands.matchTriggerCommand(
+            'বাম পাশে কী আছে সেটা বলো',
+          ),
+          isNull,
+        );
+      });
+
+      test(
+        '"এটা কী সুন্দর জিনিস" must NOT trigger identifyObject',
+        () {
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              'এটা কী সুন্দর জিনিস',
+            ),
+            isNull,
+          );
+        },
       );
-      // Plain "বন্ধ করো" (e.g. fan off) must NOT stop the video.
-      expect(BengaliVoiceCommands.match('ফ্যান বন্ধ করো'), isNull);
-      // "কী লেখা" fragment must not fire on its own conversation.
-      expect(BengaliVoiceCommands.match('তোমার নামে কী লেখা'), isNull);
-    });
-  });
+
+      test(
+        '"এটা কি সুন্দর জিনিস" must also remain null',
+        () {
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              'এটা কি সুন্দর জিনিস',
+            ),
+            isNull,
+          );
+        },
+      );
+    },
+  );
+
+  group(
+    'BengaliVoiceCommands trigger configuration',
+    () {
+      test('contains exactly five trigger intents', () {
+        expect(
+          BengaliVoiceCommands.triggerCommands.length,
+          5,
+        );
+
+        expect(
+          BengaliVoiceCommands.triggerCommands.keys.toSet(),
+          equals({
+            VoiceIntent.describeFront,
+            VoiceIntent.identifyObject,
+            VoiceIntent.readText,
+            VoiceIntent.describeRight,
+            VoiceIntent.describeLeft,
+          }),
+        );
+      });
+
+      test('help list exposes exactly five primary phrases', () {
+        expect(
+          BengaliVoiceCommands.triggerHelpCommands,
+          equals([
+            'সামনে কী আছে দেখো',
+            'এটা কী',
+            'লেখাটা পড়ে শোনাও',
+            'ডান পাশে কী আছে',
+            'বাম পাশে কী আছে',
+          ]),
+        );
+      });
+    },
+  );
 }
