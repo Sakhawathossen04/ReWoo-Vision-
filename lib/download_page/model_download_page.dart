@@ -3,14 +3,11 @@
 // ReWoo Vision model download screen.
 //
 // Responsibilities:
-//
 // 1. Restore/resume an existing model download.
-// 2. Use the same robust TTS engine configuration as the main assistant.
-// 3. Before a NEW ~3.1 GB download, verify device capability and free storage.
-// 4. Block unsupported/weak devices gracefully instead of downloading a model
-//    that cannot realistically run.
-// 5. Preserve existing partial downloads.
-// 6. Show + speak clear Bengali compatibility/storage errors.
+// 2. Use TtsEngineService for Bengali accessibility speech.
+// 3. Check device capability and free storage before a NEW model download.
+// 4. Preserve existing recoverable partial downloads.
+// 5. Show and speak clear Bengali storage/device errors.
 
 import 'dart:async';
 
@@ -31,60 +28,46 @@ import 'ui/modern_ui_widgets.dart';
 import 'ui/ui_helpers.dart';
 
 class ModelDownloadPage extends StatefulWidget {
-  const ModelDownloadPage({
-    super.key,
-  });
+  const ModelDownloadPage({super.key});
 
   @override
-  State<ModelDownloadPage> createState() =>
-      _ModelDownloadPageState();
+  State<ModelDownloadPage> createState() => _ModelDownloadPageState();
 }
 
-class _ModelDownloadPageState
-    extends State<ModelDownloadPage> {
+class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // ===========================================================================
   // TTS
   // ===========================================================================
 
   final FlutterTts _tts = FlutterTts();
-
   bool _ttsConfigured = false;
 
   // ===========================================================================
   // DOWNLOAD STATE
   // ===========================================================================
 
-  DownloadStatus _downloadStatus =
-      DownloadStatus.notStarted;
-
+  DownloadStatus _downloadStatus = DownloadStatus.notStarted;
   DownloadProgress? _progress;
-
   List<String> _errorMessages = [];
-
   bool _showAgreementSheet = false;
 
   // ===========================================================================
   // CAPABILITY STATE
   // ===========================================================================
 
-  DeviceCapabilityResult? _deviceCapability;
-
   bool _checkingCapability = false;
-
   bool _startingDownload = false;
-
   String? _capabilityMessage;
 
   // ===========================================================================
   // OTHER STATE
   // ===========================================================================
 
-  late DownloadPageLogic _logic;
+  late final DownloadPageLogic _logic;
 
   StreamSubscription? _logSubscription;
 
   bool _autoStartAttempted = false;
-
   bool _disposed = false;
 
   // ===========================================================================
@@ -96,83 +79,44 @@ class _ModelDownloadPageState
     super.initState();
 
     _initializeLogic();
-
     _setupLogListener();
 
-    unawaited(
-      _initializePage(),
-    );
+    unawaited(_initializePage());
   }
 
   Future<void> _initializePage() async {
     try {
-      // -----------------------------------------------------------------------
-      // 1. Robust TTS
-      // -----------------------------------------------------------------------
-
       await _configureTts();
 
-      if (!mounted || _disposed) {
-        return;
-      }
-
-      // -----------------------------------------------------------------------
-      // 2. Accessibility startup message
-      // -----------------------------------------------------------------------
+      if (!mounted || _disposed) return;
 
       await _announceInitialSetup();
 
-      if (!mounted || _disposed) {
-        return;
-      }
-
-      // -----------------------------------------------------------------------
-      // 3. Downloader
-      // -----------------------------------------------------------------------
+      if (!mounted || _disposed) return;
 
       await DownloadManager.initialize();
 
-      Logger.info(
-        'Download manager initialized',
-      );
+      Logger.info('Download manager initialized');
 
-      if (!mounted || _disposed) {
-        return;
-      }
-
-      // -----------------------------------------------------------------------
-      // 4. Existing-task recovery / auto-start
-      // -----------------------------------------------------------------------
+      if (!mounted || _disposed) return;
 
       await _checkDownloadState();
     } catch (e, st) {
       Logger.error(
         'ModelDownloadPage initialization failed: $e',
       );
-
       debugPrint('$st');
 
-      if (!mounted || _disposed) {
-        return;
-      }
+      if (!mounted || _disposed) return;
 
-      final message =
-          _friendlyInitializationError(
-        e,
-      );
+      final message = _friendlyInitializationError(e);
 
       setState(() {
-        _downloadStatus =
-            DownloadStatus.failed;
-
-        _errorMessages = [
-          message,
-        ];
+        _downloadStatus = DownloadStatus.failed;
+        _errorMessages = [message];
       });
 
-      await _speak(
-        message,
-      );
+      await _speak(message);
     }
   }
 
@@ -182,47 +126,29 @@ class _ModelDownloadPageState
 
   void _initializeLogic() {
     _logic = DownloadPageLogic(
-      setDownloadStatus:
-          (status) {
-        if (!mounted || _disposed) {
-          return;
-        }
+      setDownloadStatus: (status) {
+        if (!mounted || _disposed) return;
 
         setState(() {
           _downloadStatus = status;
         });
       },
-
-      setProgress:
-          (progress) {
-        if (!mounted || _disposed) {
-          return;
-        }
+      setProgress: (progress) {
+        if (!mounted || _disposed) return;
 
         setState(() {
           _progress = progress;
         });
       },
-
-      setErrorMessages:
-          (messages) {
-        if (!mounted || _disposed) {
-          return;
-        }
+      setErrorMessages: (messages) {
+        if (!mounted || _disposed) return;
 
         setState(() {
-          _errorMessages =
-              List<String>.from(
-            messages,
-          );
+          _errorMessages = List<String>.from(messages);
         });
       },
-
-      setShowAgreementSheet:
-          (show) {
-        if (!mounted || _disposed) {
-          return;
-        }
+      setShowAgreementSheet: (show) {
+        if (!mounted || _disposed) return;
 
         setState(() {
           _showAgreementSheet = show;
@@ -236,15 +162,10 @@ class _ModelDownloadPageState
   // ===========================================================================
 
   Future<void> _configureTts() async {
-    if (_ttsConfigured ||
-        _disposed) {
-      return;
-    }
+    if (_ttsConfigured || _disposed) return;
 
     try {
-      await TtsEngineService.configure(
-        _tts,
-      );
+      await TtsEngineService.configure(_tts);
 
       _ttsConfigured = true;
 
@@ -252,36 +173,25 @@ class _ModelDownloadPageState
         'Download-page TTS configured through TtsEngineService',
       );
     } catch (e) {
-      // TTS is an accessibility enhancement here.
-      // Failure must not crash/block the download page.
       Logger.warning(
         'Download-page TTS configuration failed: $e',
       );
     }
   }
 
-  Future<void> _speak(
-    String message,
-  ) async {
-    final text =
-        message.trim();
+  Future<void> _speak(String message) async {
+    final text = message.trim();
 
-    if (text.isEmpty ||
-        _disposed) {
-      return;
-    }
+    if (text.isEmpty || _disposed) return;
 
     try {
       if (!_ttsConfigured) {
         await _configureTts();
       }
 
-      if (_disposed) {
-        return;
-      }
+      if (_disposed) return;
 
-      await TtsEngineService
-          .speakWithTimeout(
+      await TtsEngineService.speakWithTimeout(
         _tts,
         text,
       );
@@ -292,17 +202,12 @@ class _ModelDownloadPageState
     }
   }
 
-  Future<void>
-      _announceInitialSetup() async {
+  Future<void> _announceInitialSetup() async {
     await Future.delayed(
-      const Duration(
-        milliseconds: 650,
-      ),
+      const Duration(milliseconds: 650),
     );
 
-    if (!mounted || _disposed) {
-      return;
-    }
+    if (!mounted || _disposed) return;
 
     await _speak(
       'ReWoo Vision প্রস্তুত হচ্ছে। '
@@ -318,16 +223,11 @@ class _ModelDownloadPageState
   // ===========================================================================
 
   void _setupLogListener() {
-    _logSubscription =
-        Logger.logStream.listen(
+    _logSubscription = Logger.logStream.listen(
       (_) {
-        if (!mounted || _disposed) {
-          return;
-        }
+        if (!mounted || _disposed) return;
 
-        setState(
-          () {},
-        );
+        setState(() {});
       },
     );
   }
@@ -336,54 +236,28 @@ class _ModelDownloadPageState
   // DOWNLOAD RECOVERY / AUTO START
   // ===========================================================================
 
-  Future<void>
-      _checkDownloadState() async {
-    // -------------------------------------------------------------------------
-    // Existing task recovery ALWAYS happens first.
-    //
-    // If a previous download is at 23%, 50%, 95%, etc., DownloadLogic should
-    // attach/resume it instead of creating another download.
-    // -------------------------------------------------------------------------
+  Future<void> _checkDownloadState() async {
+    // Recover existing task first.
+    await _logic.checkForOngoingDownloads(context);
 
-    await _logic
-        .checkForOngoingDownloads(
-      context,
-    );
+    if (!mounted || _disposed) return;
 
-    if (!mounted || _disposed) {
-      return;
-    }
-
-    if (_autoStartAttempted) {
-      return;
-    }
+    if (_autoStartAttempted) return;
 
     _autoStartAttempted = true;
 
-    final canAutoStart =
-        await _logic
-            .canAutoStartDownload();
+    final canAutoStart = await _logic.canAutoStartDownload();
 
-    if (!mounted ||
-        _disposed ||
-        !canAutoStart) {
-      return;
-    }
+    if (!mounted || _disposed || !canAutoStart) return;
 
     await Future.delayed(
-      const Duration(
-        milliseconds: 1200,
-      ),
+      const Duration(milliseconds: 1200),
     );
 
-    if (!mounted || _disposed) {
-      return;
-    }
+    if (!mounted || _disposed) return;
 
-    if (_downloadStatus ==
-            DownloadStatus.notStarted ||
-        _downloadStatus ==
-            DownloadStatus.failed) {
+    if (_downloadStatus == DownloadStatus.notStarted ||
+        _downloadStatus == DownloadStatus.failed) {
       await _startDownloadSafely(
         autoStart: true,
       );
@@ -397,26 +271,17 @@ class _ModelDownloadPageState
   Future<void> _startDownloadSafely({
     bool autoStart = false,
   }) async {
-    if (_disposed ||
-        _startingDownload) {
-      return;
-    }
+    if (_disposed || _startingDownload) return;
 
     _startingDownload = true;
 
     try {
+      final recovery =
+          await DownloadStateManager.getRecoveryState();
+
       // -----------------------------------------------------------------------
       // EXISTING RECOVERABLE DOWNLOAD
-      //
-      // Do not demand 6 GB of NEW storage again merely to retry/resume an
-      // already existing transfer.
-      //
-      // DownloadManager itself still enforces remaining-space protection.
       // -----------------------------------------------------------------------
-
-      final recovery =
-          await DownloadStateManager
-              .getRecoveryState();
 
       if (recovery.isRecoverable) {
         Logger.info(
@@ -426,8 +291,7 @@ class _ModelDownloadPageState
         );
 
         await _logic.startDownload(
-          autoStart:
-              autoStart,
+          autoStart: autoStart,
         );
 
         return;
@@ -437,44 +301,31 @@ class _ModelDownloadPageState
       // INTERRUPTED VERIFICATION
       // -----------------------------------------------------------------------
 
-      if (recovery.status ==
-          DownloadStateManager
-              .verifying) {
+      if (recovery.status == DownloadStateManager.verifying) {
         const message =
-            'মডেল ডাউনলোড শেষ হয়েছে এবং verification সম্পন্ন হওয়ার অপেক্ষায় আছে। '
-            'নতুন download শুরু করা হবে না।';
+            'মডেল ডাউনলোড শেষ হয়েছে এবং verification সম্পন্ন হওয়ার '
+            'অপেক্ষায় আছে। নতুন download শুরু করা হবে না।';
 
-        _setCapabilityError(
-          message,
-        );
+        _setCapabilityError(message);
 
-        await _speak(
-          message,
-        );
+        await _speak(message);
 
         return;
       }
 
       // -----------------------------------------------------------------------
       // NEW DOWNLOAD
-      //
-      // Before downloading 3+ GB, validate this device.
       // -----------------------------------------------------------------------
 
       final allowed =
           await _checkCapabilityForNewDownload();
 
-      if (!allowed) {
-        return;
-      }
+      if (!allowed) return;
 
-      if (!mounted || _disposed) {
-        return;
-      }
+      if (!mounted || _disposed) return;
 
       await _logic.startDownload(
-        autoStart:
-            autoStart,
+        autoStart: autoStart,
       );
     } finally {
       _startingDownload = false;
@@ -485,10 +336,8 @@ class _ModelDownloadPageState
   // DEVICE CAPABILITY GATE
   // ===========================================================================
 
-  Future<bool>
-      _checkCapabilityForNewDownload() async {
-    if (_checkingCapability ||
-        _disposed) {
+  Future<bool> _checkCapabilityForNewDownload() async {
+    if (_checkingCapability || _disposed) {
       return false;
     }
 
@@ -496,8 +345,7 @@ class _ModelDownloadPageState
 
     if (mounted) {
       setState(() {
-        _capabilityMessage =
-            null;
+        _capabilityMessage = null;
       });
     }
 
@@ -507,43 +355,30 @@ class _ModelDownloadPageState
       );
 
       final capability =
-          await DeviceCapabilityService
-              .check();
-
-      _deviceCapability =
-          capability;
+          await DeviceCapabilityService.check();
 
       if (!mounted || _disposed) {
         return false;
       }
 
       final reason =
-          _getDownloadBlockReason(
-        capability,
-      );
+          _getDownloadBlockReason(capability);
 
       if (reason != null) {
         Logger.warning(
           'Model download blocked: $reason',
         );
 
-        _setCapabilityError(
-          reason,
-        );
+        _setCapabilityError(reason);
 
-        await _speak(
-          reason,
-        );
+        await _speak(reason);
 
         return false;
       }
 
       setState(() {
-        _capabilityMessage =
-            null;
-
-        _errorMessages =
-            [];
+        _capabilityMessage = null;
+        _errorMessages = [];
       });
 
       Logger.info(
@@ -558,10 +393,7 @@ class _ModelDownloadPageState
       Logger.error(
         'Device capability check failed: $e',
       );
-
-      debugPrint(
-        '$st',
-      );
+      debugPrint('$st');
 
       if (!mounted || _disposed) {
         return false;
@@ -569,26 +401,19 @@ class _ModelDownloadPageState
 
       const message =
           'ফোনের storage এবং hardware capability নির্ভরযোগ্যভাবে '
-          'পরীক্ষা করা যায়নি। '
-          'নিরাপত্তার জন্য বড় AI model download শুরু করা হয়নি।';
+          'পরীক্ষা করা যায়নি। নিরাপত্তার জন্য বড় AI model '
+          'download শুরু করা হয়নি।';
 
-      _setCapabilityError(
-        message,
-      );
+      _setCapabilityError(message);
 
-      await _speak(
-        message,
-      );
+      await _speak(message);
 
       return false;
     } finally {
       _checkingCapability = false;
 
-      if (mounted &&
-          !_disposed) {
-        setState(
-          () {},
-        );
+      if (mounted && !_disposed) {
+        setState(() {});
       }
     }
   }
@@ -604,8 +429,7 @@ class _ModelDownloadPageState
     // 1. FREE STORAGE
     // -------------------------------------------------------------------------
 
-    if (!capability
-        .hasEnoughStorageForDownload) {
+    if (!capability.hasEnoughStorageForDownload) {
       return 'মডেল ডাউনলোড করতে অন্তত ৬ জিবি খালি জায়গা প্রয়োজন। '
           'এই ফোনে বর্তমানে প্রায় '
           '${capability.freeStorageGb.toStringAsFixed(1)} জিবি খালি আছে। '
@@ -613,11 +437,10 @@ class _ModelDownloadPageState
     }
 
     // -------------------------------------------------------------------------
-    // 2. ANDROID VERSION
+    // 2. ANDROID
     // -------------------------------------------------------------------------
 
-    if (!capability
-        .android9OrLater) {
+    if (!capability.android9OrLater) {
       return 'ReWoo Vision ব্যবহার করতে Android 9 '
           'বা তার পরের version প্রয়োজন।';
     }
@@ -626,8 +449,7 @@ class _ModelDownloadPageState
     // 3. 64-BIT
     // -------------------------------------------------------------------------
 
-    if (!capability
-        .is64BitCapable) {
+    if (!capability.is64BitCapable) {
       return 'এই ফোনে 64-bit AI runtime support নেই। '
           'এই device-এ local Gemma model চালানো যাবে না।';
     }
@@ -636,8 +458,7 @@ class _ModelDownloadPageState
     // 4. ARM64
     // -------------------------------------------------------------------------
 
-    if (!capability
-        .hasArm64) {
+    if (!capability.hasArm64) {
       return 'এই ফোনে ARM64 architecture পাওয়া যায়নি। '
           'বর্তমান local Gemma runtime এই device-এর সাথে compatible নয়।';
     }
@@ -646,25 +467,20 @@ class _ModelDownloadPageState
     // 5. RAM
     // -------------------------------------------------------------------------
 
-    if (capability
-            .physicalRamMb <=
-        0) {
+    if (capability.physicalRamMb <= 0) {
       return 'এই ফোনের RAM capacity নির্ভরযোগ্যভাবে যাচাই করা যায়নি। '
           'নিরাপত্তার জন্য বড় local AI model download শুরু করা হয়নি।';
     }
 
-    if (capability
-            .physicalRamMb <
-        DeviceCapabilityService
-            .minimumLocalGemmaRamMb) {
+    if (capability.physicalRamMb <
+        DeviceCapabilityService.minimumLocalGemmaRamMb) {
       return 'এই ফোনে প্রায় '
           '${capability.physicalRamGb.toStringAsFixed(1)} জিবি RAM আছে। '
           'Local Gemma model চালাতে অন্তত ৬ জিবি RAM প্রয়োজন। '
           'তাই model download শুরু করা হচ্ছে না।';
     }
 
-    if (capability
-        .isLowRamDevice) {
+    if (capability.isLowRamDevice) {
       return 'Android এই ফোনটিকে low-RAM device হিসেবে চিহ্নিত করেছে। '
           'এই device-এ বড় local AI model নিরাপদভাবে চালানো যাবে না।';
     }
@@ -673,50 +489,34 @@ class _ModelDownloadPageState
     // 6. CAMERA
     // -------------------------------------------------------------------------
 
-    if (!capability
-        .cameraAvailable) {
+    if (!capability.cameraAvailable) {
       return 'এই ফোনে ব্যবহারযোগ্য camera পাওয়া যায়নি। '
           'ReWoo Vision-এর visual assistant feature চালানো যাবে না।';
     }
 
     // -------------------------------------------------------------------------
-    // ADDITIONAL HARD BLOCKER
+    // OTHER HARD BLOCKER
     // -------------------------------------------------------------------------
 
-    if (!capability
-            .localGemmaSupported &&
-        capability
-            .blockers
-            .isNotEmpty) {
-      return capability
-          .blockers
-          .first;
+    if (!capability.localGemmaSupported &&
+        capability.blockers.isNotEmpty) {
+      return capability.blockers.first;
     }
 
     return null;
   }
 
   // ===========================================================================
-  // CAPABILITY ERROR UI
+  // CAPABILITY ERROR
   // ===========================================================================
 
-  void _setCapabilityError(
-    String message,
-  ) {
-    if (!mounted || _disposed) {
-      return;
-    }
+  void _setCapabilityError(String message) {
+    if (!mounted || _disposed) return;
 
     setState(() {
-      _downloadStatus =
-          DownloadStatus.failed;
-
-      _capabilityMessage =
-          message;
-
-      _errorMessages = [
-        message,
-      ];
+      _downloadStatus = DownloadStatus.failed;
+      _capabilityMessage = message;
+      _errorMessages = [message];
     });
   }
 
@@ -724,67 +524,42 @@ class _ModelDownloadPageState
   // RESUME
   // ===========================================================================
 
-  Future<void>
-      _resumeDownload() async {
-    if (_disposed) {
-      return;
-    }
+  Future<void> _resumeDownload() async {
+    if (_disposed) return;
 
-    // Resume is not a NEW download.
-    //
-    // Therefore do not block an existing 95% transfer simply because there is
-    // currently less than 6 GB of completely unused storage.
-    //
-    // DownloadManager still applies its own low-storage safety constraint.
+    // Resume is not a fresh download, therefore we do not require another
+    // completely unused 6GB before attempting recovery.
 
     if (mounted) {
       setState(() {
-        _capabilityMessage =
-            null;
+        _capabilityMessage = null;
       });
     }
 
-    await _logic
-        .resumeDownload();
+    await _logic.resumeDownload();
   }
 
   // ===========================================================================
-  // INITIALIZATION ERROR CLASSIFICATION
+  // INITIALIZATION ERROR
   // ===========================================================================
 
   String _friendlyInitializationError(
     Object error,
   ) {
     final text =
-        error
-            .toString()
-            .toLowerCase();
+        error.toString().toLowerCase();
 
-    if (text.contains(
-          'no space',
-        ) ||
-        text.contains(
-          'not enough space',
-        ) ||
-        text.contains(
-          'insufficient space',
-        ) ||
-        text.contains(
-          'enospc',
-        )) {
+    if (text.contains('no space') ||
+        text.contains('not enough space') ||
+        text.contains('insufficient space') ||
+        text.contains('enospc')) {
       return 'ফোনে পর্যাপ্ত খালি storage নেই। '
           'Model download-এর জন্য অন্তত ৬ জিবি খালি জায়গা রাখুন।';
     }
 
-    if (text.contains(
-          'network',
-        ) ||
-        text.contains(
-          'connection',
-        ) ||
-        text.contains(
-          'socket',
-        )) {
+    if (text.contains('network') ||
+        text.contains('connection') ||
+        text.contains('socket')) {
       return 'ইন্টারনেট সংযোগে সমস্যা হয়েছে। '
           'আগের partial download থাকলে সেটি মুছে ফেলা হয়নি।';
     }
@@ -801,8 +576,7 @@ class _ModelDownloadPageState
   void dispose() {
     _disposed = true;
 
-    _logSubscription
-        ?.cancel();
+    _logSubscription?.cancel();
 
     _logic.dispose();
 
@@ -818,128 +592,80 @@ class _ModelDownloadPageState
   // ===========================================================================
 
   @override
-  Widget build(
-    BuildContext context,
-  ) {
+  Widget build(BuildContext context) {
     final controlsDisabled =
         _checkingCapability ||
-            _startingDownload;
+        _startingDownload;
 
     return Scaffold(
-      backgroundColor:
-          Colors.grey[50],
-
+      backgroundColor: Colors.grey[50],
       body: SafeArea(
         child: Stack(
           children: [
             Padding(
-              padding:
-                  const EdgeInsets
-                      .all(
-                24,
-              ),
-
+              padding: const EdgeInsets.all(24),
               child: Column(
                 children: [
-                  const Spacer(
-                    flex: 1,
-                  ),
+                  const Spacer(),
 
                   Column(
                     mainAxisAlignment:
-                        MainAxisAlignment
-                            .center,
-
+                        MainAxisAlignment.center,
                     children: [
                       // =======================================================
                       // LOGO
                       // =======================================================
 
                       Center(
-                        child:
-                            Container(
+                        child: Container(
                           width: 104,
                           height: 104,
-
-                          decoration:
-                              BoxDecoration(
+                          decoration: BoxDecoration(
                             borderRadius:
-                                BorderRadius
-                                    .circular(
-                              26,
+                                BorderRadius.circular(26),
+                            border: Border.all(
+                              color: Colors.grey.shade200,
                             ),
-
-                            border:
-                                Border.all(
-                              color:
-                                  Colors
-                                      .grey
-                                      .shade200,
-                            ),
-
                             boxShadow: [
                               BoxShadow(
-                                color:
-                                    Colors
-                                        .black
-                                        .withOpacity(
+                                color: Colors.black.withOpacity(
                                   0.06,
                                 ),
-                                blurRadius:
-                                    14,
-                                offset:
-                                    const Offset(
-                                  0,
-                                  5,
-                                ),
+                                blurRadius: 14,
+                                offset: const Offset(0, 5),
                               ),
                             ],
                           ),
-
-                          child:
-                              ClipRRect(
+                          child: ClipRRect(
                             borderRadius:
-                                BorderRadius
-                                    .circular(
-                              25,
-                            ),
-
-                            child:
-                                Image.asset(
+                                BorderRadius.circular(25),
+                            child: Image.asset(
                               'assets/logo.png',
-                              fit:
-                                  BoxFit.cover,
-                              excludeFromSemantics:
-                                  true,
+                              fit: BoxFit.cover,
+                              excludeFromSemantics: true,
                             ),
                           ),
                         ),
                       ),
 
-                      const SizedBox(
-                        height: 28,
-                      ),
+                      const SizedBox(height: 28),
 
                       // =======================================================
                       // DOWNLOAD ICON
                       // =======================================================
 
-                      ModernUIWidgets
-                          .buildDownloadIcon(
+                      ModernUIWidgets.buildDownloadIcon(
                         _downloadStatus,
                         _progress,
                       ),
 
-                      const SizedBox(
-                        height: 32,
-                      ),
+                      const SizedBox(height: 32),
 
                       // =======================================================
                       // STATUS
                       // =======================================================
 
-                      ModernUIWidgets
-                          .buildStatusMessage(
+                      ModernUIWidgets.buildStatusMessage(
                         _downloadStatus,
                         _progress,
                         _errorMessages,
@@ -949,93 +675,43 @@ class _ModelDownloadPageState
                       // DEVICE / STORAGE WARNING
                       // =======================================================
 
-                      if (_capabilityMessage !=
-                          null) ...[
-                        const SizedBox(
-                          height: 20,
-                        ),
+                      if (_capabilityMessage != null) ...[
+                        const SizedBox(height: 20),
 
                         Semantics(
-                          liveRegion:
-                              true,
-
-                          label:
-                              _capabilityMessage,
-
-                          child:
-                              Container(
-                            width:
-                                double.infinity,
-
+                          liveRegion: true,
+                          label: _capabilityMessage,
+                          child: Container(
+                            width: double.infinity,
                             padding:
-                                const EdgeInsets
-                                    .all(
-                              16,
-                            ),
-
-                            decoration:
-                                BoxDecoration(
-                              color:
-                                  Colors
-                                      .orange[
-                                50,
-                              ],
-
+                                const EdgeInsets.all(16),
+                            decoration: BoxDecoration(
+                              color: Colors.orange[50],
                               borderRadius:
-                                  BorderRadius
-                                      .circular(
-                                14,
-                              ),
-
-                              border:
-                                  Border.all(
-                                color:
-                                    Colors
-                                        .orange[
-                                  300,
-                                ]!,
+                                  BorderRadius.circular(14),
+                              border: Border.all(
+                                color: Colors.orange[300]!,
                               ),
                             ),
-
-                            child:
-                                Row(
+                            child: Row(
                               crossAxisAlignment:
-                                  CrossAxisAlignment
-                                      .start,
-
+                                  CrossAxisAlignment.start,
                               children: [
                                 Icon(
-                                  Icons
-                                      .warning_amber_rounded,
-                                  color:
-                                      Colors
-                                          .orange[
-                                    800,
-                                  ],
+                                  Icons.warning_amber_rounded,
+                                  color: Colors.orange[800],
                                 ),
-
-                                const SizedBox(
-                                  width: 12,
-                                ),
-
+                                const SizedBox(width: 12),
                                 Expanded(
-                                  child:
-                                      Text(
+                                  child: Text(
                                     _capabilityMessage!,
-                                    style:
-                                        TextStyle(
-                                      fontSize:
-                                          15,
-                                      height:
-                                          1.4,
+                                    style: TextStyle(
+                                      fontSize: 15,
+                                      height: 1.4,
                                       fontWeight:
-                                          FontWeight
-                                              .w600,
+                                          FontWeight.w600,
                                       color:
-                                          Colors
-                                              .orange[
-                                        900,
-                                      ],
+                                          Colors.orange[900],
                                     ),
                                   ),
                                 ),
@@ -1045,91 +721,63 @@ class _ModelDownloadPageState
                         ),
                       ],
 
-                      const SizedBox(
-                        height: 24,
-                      ),
+                      const SizedBox(height: 24),
 
                       // =======================================================
-                      // PROGRESS BAR
+                      // PROGRESS
                       // =======================================================
 
-                      ModernUIWidgets
-                          .buildProgressBar(
+                      ModernUIWidgets.buildProgressBar(
                         _progress,
                         _downloadStatus,
                       ),
 
-                      const SizedBox(
-                        height: 32,
-                      ),
+                      const SizedBox(height: 32),
 
                       // =======================================================
-                      // CAPABILITY CHECKING
+                      // CAPABILITY CHECK
                       // =======================================================
 
                       if (_checkingCapability) ...[
-                        const Semantics(
-                          liveRegion:
-                              true,
-
+                        Semantics(
+                          liveRegion: true,
                           label:
                               'ফোনের storage এবং AI capability পরীক্ষা করা হচ্ছে',
-
-                          child:
-                              Row(
+                          child: const Row(
                             mainAxisAlignment:
-                                MainAxisAlignment
-                                    .center,
-
+                                MainAxisAlignment.center,
                             children: [
                               SizedBox(
                                 width: 20,
                                 height: 20,
-
                                 child:
                                     CircularProgressIndicator(
-                                  strokeWidth:
-                                      2.5,
+                                  strokeWidth: 2.5,
                                 ),
                               ),
-
-                              SizedBox(
-                                width: 12,
-                              ),
-
+                              SizedBox(width: 12),
                               Flexible(
-                                child:
-                                    Text(
+                                child: Text(
                                   'ফোনের storage ও AI capability পরীক্ষা করা হচ্ছে...',
                                 ),
                               ),
                             ],
                           ),
                         ),
-
-                        const SizedBox(
-                          height: 20,
-                        ),
+                        const SizedBox(height: 20),
                       ],
 
                       // =======================================================
-                      // ACTION BUTTONS
+                      // ACTIONS
                       // =======================================================
 
                       IgnorePointer(
-                        ignoring:
-                            controlsDisabled,
-
-                        child:
-                            Opacity(
+                        ignoring: controlsDisabled,
+                        child: Opacity(
                           opacity:
-                              controlsDisabled
-                                  ? 0.55
-                                  : 1.0,
-
+                              controlsDisabled ? 0.55 : 1.0,
                           child:
-                              ModernUIWidgets
-                                  .buildActionButtons(
+                              ModernUIWidgets.buildActionButtons(
                             _downloadStatus,
 
                             // START
@@ -1142,8 +790,7 @@ class _ModelDownloadPageState
                             // PAUSE
                             () {
                               unawaited(
-                                _logic
-                                    .pauseDownload(),
+                                _logic.pauseDownload(),
                               );
                             },
 
@@ -1157,25 +804,19 @@ class _ModelDownloadPageState
                             // CANCEL
                             () {
                               unawaited(
-                                _logic
-                                    .showCancelConfirmation(
+                                _logic.showCancelConfirmation(
                                   context,
                                 ),
                               );
                             },
 
                             // CONTINUE
-                            //
-                            // DownloadLogic only sets completed after final
-                            // model verification succeeds.
                             () {
-                              Navigator.of(
-                                context,
-                              ).pushReplacement(
+                              Navigator.of(context)
+                                  .pushReplacement(
                                 MaterialPageRoute(
-                                  builder:
-                                      (_) =>
-                                          const ChatPage(),
+                                  builder: (_) =>
+                                      const ChatPage(),
                                 ),
                               );
                             },
@@ -1185,88 +826,45 @@ class _ModelDownloadPageState
                     ],
                   ),
 
-                  const Spacer(
-                    flex: 1,
-                  ),
+                  const Spacer(),
 
-                  // =========================================================
+                  // ===========================================================
                   // ERROR DETAILS
-                  // =========================================================
+                  // ===========================================================
 
-                  if (_errorMessages
-                          .isNotEmpty &&
+                  if (_errorMessages.isNotEmpty &&
                       _downloadStatus ==
-                          DownloadStatus
-                              .failed) ...[
+                          DownloadStatus.failed) ...[
                     Container(
-                      width:
-                          double.infinity,
-
-                      decoration:
-                          BoxDecoration(
-                        color:
-                            Colors
-                                .red[
-                          50,
-                        ],
-
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        color: Colors.red[50],
                         borderRadius:
-                            BorderRadius
-                                .circular(
-                          12,
-                        ),
-
-                        border:
-                            Border.all(
-                          color:
-                              Colors
-                                  .red[
-                            200,
-                          ]!,
+                            BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.red[200]!,
                         ),
                       ),
-
-                      child:
-                          TextButton
-                              .icon(
-                        onPressed:
-                            () {
-                          UIHelpers
-                              .showErrorDialog(
+                      child: TextButton.icon(
+                        onPressed: () {
+                          UIHelpers.showErrorDialog(
                             context,
                             _errorMessages,
                           );
                         },
-
-                        icon:
-                            Icon(
-                          Icons
-                              .error_outline,
-                          color:
-                              Colors
-                                  .red[
-                            600,
-                          ],
+                        icon: Icon(
+                          Icons.error_outline,
+                          color: Colors.red[600],
                         ),
-
-                        label:
-                            Text(
+                        label: Text(
                           'সমস্যার বিস্তারিত দেখুন',
-                          style:
-                              TextStyle(
-                            color:
-                                Colors
-                                    .red[
-                              600,
-                            ],
+                          style: TextStyle(
+                            color: Colors.red[600],
                           ),
                         ),
                       ),
                     ),
-
-                    const SizedBox(
-                      height: 16,
-                    ),
+                    const SizedBox(height: 16),
                   ],
                 ],
               ),
@@ -1276,14 +874,10 @@ class _ModelDownloadPageState
             // LOGS
             // ===============================================================
 
-            ModernUIWidgets
-                .buildLogsButton(
+            ModernUIWidgets.buildLogsButton(
               context,
               () {
-                UIHelpers
-                    .showLogsDialog(
-                  context,
-                );
+                UIHelpers.showLogsDialog(context);
               },
             ),
           ],
@@ -1291,28 +885,22 @@ class _ModelDownloadPageState
       ),
 
       // =========================================================================
-      // LICENSE AGREEMENT
+      // LICENSE
       // =========================================================================
 
-      bottomSheet:
-          _showAgreementSheet
-              ? ModernUIWidgets
-                  .buildLicenseBottomSheet(
-                  context,
-
-                  () {
-                    _logic
-                        .cancelLicenseAgreement();
-                  },
-
-                  () {
-                    unawaited(
-                      _logic
-                          .openLicenseAgreement(),
-                    );
-                  },
-                )
-              : null,
+      bottomSheet: _showAgreementSheet
+          ? ModernUIWidgets.buildLicenseBottomSheet(
+              context,
+              () {
+                _logic.cancelLicenseAgreement();
+              },
+              () {
+                unawaited(
+                  _logic.openLicenseAgreement(),
+                );
+              },
+            )
+          : null,
     );
   }
 }
