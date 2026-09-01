@@ -51,9 +51,23 @@ class _ChatPageState extends State<ChatPage>
   bool _redirectedOnError = false;
   bool _disposed = false;
 
-  /// Whether trigger listening should resume when the app returns
-  /// to the foreground.
+  /// True when voice listening should return after the application comes
+  /// back to the foreground.
   bool _resumeVoiceOnForeground = true;
+
+  /// True when app lifecycle used SpeechService.pauseLoop().
+  ///
+  /// This distinction matters because:
+  ///
+  /// pauseLoop()
+  ///   -> preserves commandModeEnabled
+  ///   -> sets pausedForMedia = true
+  ///   -> must be resumed using resumeLoop()
+  ///
+  /// stopCommandListening()
+  ///   -> disables commandModeEnabled
+  ///   -> must be resumed using startCommandListening()
+  bool _voicePausedByLifecycle = false;
 
   final ScrollController _scrollController =
       ScrollController();
@@ -62,6 +76,10 @@ class _ChatPageState extends State<ChatPage>
 
   late AnimationController _fadeController;
   late Animation<double> _fadeAnimation;
+
+  // ===========================================================================
+  // INIT
+  // ===========================================================================
 
   @override
   void initState() {
@@ -112,7 +130,7 @@ class _ChatPageState extends State<ChatPage>
       }
 
       // -----------------------------------------------------------------------
-      // Bootstrap app services
+      // Bootstrap application services
       // -----------------------------------------------------------------------
 
       final result =
@@ -134,7 +152,7 @@ class _ChatPageState extends State<ChatPage>
       );
 
       // -----------------------------------------------------------------------
-      // Release old/dummy TTS wrapper before switching runtime
+      // Release previous/dummy TTS wrapper
       // -----------------------------------------------------------------------
 
       _streamingTts.dispose();
@@ -153,11 +171,13 @@ class _ChatPageState extends State<ChatPage>
       _speechService = result.speechService;
       _textRecognition = result.textRecognition;
 
+      final speech = _speechService!;
+
       // -----------------------------------------------------------------------
-      // Configure voice command handler
+      // Configure command handler
       // -----------------------------------------------------------------------
 
-      _speechService!.configureCommandHandler(
+      speech.configureCommandHandler(
         onCommand: _handleVoiceIntent,
         canAcceptCommand: () {
           final helpers = _chatHelpers;
@@ -166,13 +186,8 @@ class _ChatPageState extends State<ChatPage>
             return false;
           }
 
-          // Video recording is silent (enableAudio: false), therefore
-          // recognition can remain available when necessary.
-          if (helpers.isRecording) {
-            return true;
-          }
-
-          // Do not accept another task while AI/camera/TTS is active.
+          // A second camera/model task must never begin while another task
+          // or TTS response is still active.
           return !helpers.isBusy &&
               !helpers.isSpeaking;
         },
@@ -191,33 +206,44 @@ class _ChatPageState extends State<ChatPage>
       }
 
       // -----------------------------------------------------------------------
-      // Bengali speech locale warning
+      // Voice compatibility warning
       // -----------------------------------------------------------------------
 
-      if (!_speechService!
-              .hasBengaliSpeechLocale &&
-          mounted &&
-          !_disposed) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(
-          const SnackBar(
-            content: Text(
-              'এই ফোনে বাংলা স্পিচ-রিকগনিশন লোকেল পাওয়া যায়নি। '
-              'Google Speech Services-এ বাংলা ভাষা চালু করুন।',
+      if (mounted && !_disposed) {
+        String? warning;
+
+        if (!speech.microphonePermissionGranted) {
+          warning = speech.lastError.isNotEmpty
+              ? speech.lastError
+              : 'মাইক্রোফোন অনুমতি চালু করুন।';
+        } else if (!speech.speechRecognizerAvailable) {
+          warning = speech.lastError.isNotEmpty
+              ? speech.lastError
+              : 'এই ফোনে Speech Recognition service পাওয়া যাচ্ছে না।';
+        } else if (!speech.hasBengaliSpeechLocale ||
+            speech.bengaliLanguageUnsupported) {
+          warning =
+              'এই ফোনে বাংলা স্পিচ-রিকগনিশন পাওয়া যাচ্ছে না। '
+              'Google Speech Services-এ বাংলা ভাষা চালু করুন।';
+        }
+
+        if (warning != null) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(warning),
             ),
-          ),
-        );
+          );
+        }
       }
 
       // -----------------------------------------------------------------------
-      // Startup announcement
+      // STARTUP VOICE MESSAGE
       //
       // IMPORTANT:
-      // These are the SAME five direct trigger commands configured inside
-      // BengaliVoiceCommands.triggerCommands.
+      // This exactly describes the five direct trigger commands.
       // -----------------------------------------------------------------------
 
-      await _speechService!.speak(
+      await speech.speak(
         'সহায়ক প্রস্তুত। '
         'আপনি বলতে পারেন, '
         'সামনে কী আছে দেখো, '
@@ -228,23 +254,34 @@ class _ChatPageState extends State<ChatPage>
       );
 
       // -----------------------------------------------------------------------
-      // Start waiting for the five trigger commands.
+      // START FIVE-COMMAND TRIGGER LISTENER
+      // -----------------------------------------------------------------------
       //
-      // SpeechService owns the trigger lifecycle from this point:
+      // From this point SpeechService owns the lifecycle:
       //
-      // wait
-      // -> trigger detected
-      // -> stop recognizer
-      // -> run task
-      // -> AI processing
-      // -> TTS
-      // -> task completes
-      // -> restart trigger listener
+      // waiting
+      //      ↓
+      // final STT result
+      //      ↓
+      // exact five-command match
+      //      ↓
+      // commandInProgress = true
+      //      ↓
+      // recognizer stop
+      //      ↓
+      // camera / OCR / Gemma
+      //      ↓
+      // TTS
+      //      ↓
+      // command complete
+      //      ↓
+      // trigger listener re-arm
+      //
+      // ChatPage MUST NOT manually restart recognition after a command.
       // -----------------------------------------------------------------------
 
       if (!_disposed) {
-        await _speechService!
-            .startCommandListening();
+        await speech.startCommandListening();
       }
     } catch (e, st) {
       debugPrint(
@@ -258,8 +295,7 @@ class _ChatPageState extends State<ChatPage>
           !_redirectedOnError) {
         _redirectedOnError = true;
 
-        Navigator.of(context)
-            .pushReplacement(
+        Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder: (_) =>
                 const ErrorRecoveryPage(),
@@ -276,33 +312,27 @@ class _ChatPageState extends State<ChatPage>
   Future<void> _disposeCurrentVoiceRuntime({
     bool disposeOcr = false,
   }) async {
-    // Stop command recognition first.
     try {
       await _speechService
           ?.stopCommandListening();
     } catch (_) {}
 
-    // Dispose speech service.
     try {
       _speechService?.dispose();
     } catch (_) {}
 
-    // Dispose chat helper runtime.
     try {
       _chatHelpers?.dispose();
     } catch (_) {}
 
-    // Stop streaming TTS.
     try {
       _streamingTts.stop();
     } catch (_) {}
 
-    // Stop Flutter TTS.
     try {
       await _tts.stop();
     } catch (_) {}
 
-    // OCR can optionally survive a runtime/backend restart.
     if (disposeOcr) {
       try {
         await _textRecognition?.dispose();
@@ -317,30 +347,37 @@ class _ChatPageState extends State<ChatPage>
   // VOICE COMMAND HANDLER
   // ===========================================================================
 
-  /// Executes a voice intent.
+  /// Executes one voice intent.
   ///
   /// IMPORTANT:
   ///
-  /// ChatPage does NOT restart the microphone here.
+  /// There is deliberately NO:
   ///
-  /// SpeechService is the single owner of the complete voice lifecycle:
+  /// scheduleRestartSoon()
   ///
+  /// here.
+  ///
+  /// SpeechService is the single owner of microphone restart.
+  ///
+  /// Correct flow:
+  ///
+  /// SpeechService
+  ///    ↓
   /// trigger detected
-  ///     ↓
+  ///    ↓
   /// recognizer stopped
-  ///     ↓
-  /// command handler called
-  ///     ↓
-  /// camera / OCR / AI task
-  ///     ↓
-  /// TTS response
-  ///     ↓
-  /// handler Future completes
-  ///     ↓
-  /// SpeechService re-arms trigger listening
-  ///
-  /// Keeping restart logic in one place prevents duplicate recognizer
-  /// sessions and prevents the mic from reopening while TTS is speaking.
+  ///    ↓
+  /// this method awaited
+  ///    ↓
+  /// camera / OCR / AI
+  ///    ↓
+  /// TTS finishes
+  ///    ↓
+  /// this Future returns
+  ///    ↓
+  /// SpeechService unlocks
+  ///    ↓
+  /// trigger listener restarts
   Future<void> _handleVoiceIntent(
     VoiceIntent intent,
     String heardText,
@@ -362,12 +399,13 @@ class _ChatPageState extends State<ChatPage>
       commandText: heardText,
     );
 
-    // DO NOT call:
+    // =======================================================================
+    // DO NOT ADD THIS:
     //
     // _speechService?.scheduleRestartSoon();
     //
-    // SpeechService will restart the trigger listener only after this
-    // complete Future returns.
+    // SpeechService exclusively owns restart.
+    // =======================================================================
   }
 
   // ===========================================================================
@@ -377,8 +415,7 @@ class _ChatPageState extends State<ChatPage>
   void _scheduleAutoScroll() {
     _autoScrollTimer?.cancel();
 
-    _autoScrollTimer =
-        Timer(
+    _autoScrollTimer = Timer(
       const Duration(milliseconds: 100),
       () {
         if (_disposed) {
@@ -408,7 +445,8 @@ class _ChatPageState extends State<ChatPage>
   Future<void> _newChat() async {
     final helpers = _chatHelpers;
 
-    if (helpers == null || _disposed) {
+    if (helpers == null ||
+        _disposed) {
       return;
     }
 
@@ -423,7 +461,8 @@ class _ChatPageState extends State<ChatPage>
   ) async {
     final helpers = _chatHelpers;
 
-    if (helpers == null || _disposed) {
+    if (helpers == null ||
+        _disposed) {
       return;
     }
 
@@ -438,7 +477,8 @@ class _ChatPageState extends State<ChatPage>
   ) async {
     final helpers = _chatHelpers;
 
-    if (helpers == null || _disposed) {
+    if (helpers == null ||
+        _disposed) {
       return;
     }
 
@@ -456,9 +496,7 @@ class _ChatPageState extends State<ChatPage>
   void didChangeAppLifecycleState(
     AppLifecycleState state,
   ) {
-    super.didChangeAppLifecycleState(
-      state,
-    );
+    super.didChangeAppLifecycleState(state);
 
     if (_disposed ||
         _speechService == null) {
@@ -478,7 +516,26 @@ class _ChatPageState extends State<ChatPage>
 
     if (state ==
         AppLifecycleState.resumed) {
-      if (_resumeVoiceOnForeground) {
+      if (!_resumeVoiceOnForeground) {
+        return;
+      }
+
+      // ---------------------------------------------------------------------
+      // IMPORTANT FIX
+      //
+      // If background handling used pauseLoop(), we MUST call resumeLoop().
+      //
+      // startCommandListening() alone is not enough because pauseLoop()
+      // leaves SpeechService.pausedForMedia = true.
+      // ---------------------------------------------------------------------
+
+      if (_voicePausedByLifecycle) {
+        _voicePausedByLifecycle = false;
+
+        unawaited(
+          speech.resumeLoop(),
+        );
+      } else {
         unawaited(
           speech.startCommandListening(),
         );
@@ -488,7 +545,7 @@ class _ChatPageState extends State<ChatPage>
     }
 
     // -------------------------------------------------------------------------
-    // APP MOVED AWAY FROM FOREGROUND
+    // APP LEAVING FOREGROUND
     // -------------------------------------------------------------------------
 
     if (state ==
@@ -497,19 +554,36 @@ class _ChatPageState extends State<ChatPage>
             AppLifecycleState.inactive ||
         state ==
             AppLifecycleState.detached) {
-      // Remember whether voice listening must come back when the app resumes.
+      // Remember whether voice should come back.
       _resumeVoiceOnForeground =
           speech.commandModeEnabled ||
               helpers.isRecording;
 
-      // Keep video recording alive when necessary.
+      // ---------------------------------------------------------------------
+      // Normal command-listening mode
       //
-      // Otherwise pause recognition while the app is not active.
+      // Preserve commandModeEnabled and temporarily pause recognition.
+      // ---------------------------------------------------------------------
+
       if (!helpers.isRecording) {
+        _voicePausedByLifecycle =
+            speech.commandModeEnabled;
+
         unawaited(
           speech.pauseLoop(),
         );
-      } else {
+      }
+
+      // ---------------------------------------------------------------------
+      // Recording case
+      //
+      // Existing behavior intentionally stops command listening completely.
+      // startCommandListening() will recreate it after foreground resume.
+      // ---------------------------------------------------------------------
+
+      else {
+        _voicePausedByLifecycle = false;
+
         unawaited(
           speech.stopCommandListening(),
         );
@@ -534,14 +608,10 @@ class _ChatPageState extends State<ChatPage>
 
     _fadeController.dispose();
 
-    // Persist conversation before runtime goes away.
     unawaited(
       ChatHistoryStore.save(_msgs),
     );
 
-    // dispose() cannot await.
-    //
-    // Detach and dispose services synchronously where possible.
     try {
       _chatHelpers?.dispose();
     } catch (_) {}
@@ -570,19 +640,20 @@ class _ChatPageState extends State<ChatPage>
   // ===========================================================================
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(
+    BuildContext context,
+  ) {
     if (_initialising) {
       return ChatUIBuilder
           .buildLoadingScreen();
     }
 
-    final helpers = _chatHelpers;
-    final speech = _speechService;
+    final helpers =
+        _chatHelpers;
 
-    // Runtime should normally always exist after initialization.
-    //
-    // This guard prevents a crash during runtime replacement/backend
-    // transitions.
+    final speech =
+        _speechService;
+
     if (helpers == null ||
         speech == null) {
       return ChatUIBuilder
@@ -598,7 +669,8 @@ class _ChatPageState extends State<ChatPage>
         onNewChat: _newChat,
         onToggleSettings:
             _navigateToSettings,
-        isResetting: helpers.resetting,
+        isResetting:
+            helpers.resetting,
       ),
 
       body: FadeTransition(
@@ -607,28 +679,30 @@ class _ChatPageState extends State<ChatPage>
         child: Column(
           children: [
             // ---------------------------------------------------------------
-            // Voice status/control
+            // Voice status
             // ---------------------------------------------------------------
 
             ChatUIBuilder
                 .buildVoiceControlCard(
               speechEnabled:
                   speech.speechEnabled,
+
               listening:
                   speech.commandListening,
+
               bengaliLocaleAvailable:
                   speech
                       .hasBengaliSpeechLocale,
+
               lastHeard:
                   speech.lastHeard,
+
               onToggleListening:
                   speech.toggleDictation,
             ),
 
             // ---------------------------------------------------------------
             // Quick actions
-            //
-            // These are manual UI alternatives to voice triggers.
             // ---------------------------------------------------------------
 
             ChatUIBuilder
@@ -639,8 +713,7 @@ class _ChatPageState extends State<ChatPage>
 
               onDescribeFront: () =>
                   _handleVoiceIntent(
-                VoiceIntent
-                    .describeFront,
+                VoiceIntent.describeFront,
                 VoiceIntent
                     .describeFront
                     .banglaLabel,
@@ -648,8 +721,7 @@ class _ChatPageState extends State<ChatPage>
 
               onIdentifyObject: () =>
                   _handleVoiceIntent(
-                VoiceIntent
-                    .identifyObject,
+                VoiceIntent.identifyObject,
                 VoiceIntent
                     .identifyObject
                     .banglaLabel,
@@ -665,7 +737,7 @@ class _ChatPageState extends State<ChatPage>
             ),
 
             // ---------------------------------------------------------------
-            // Chat view controls
+            // Chat controls
             // ---------------------------------------------------------------
 
             ChatUIBuilder
@@ -688,7 +760,8 @@ class _ChatPageState extends State<ChatPage>
                 }
               },
 
-              onNewChat: _newChat,
+              onNewChat:
+                  _newChat,
 
               isResetting:
                   helpers.resetting,
@@ -711,7 +784,7 @@ class _ChatPageState extends State<ChatPage>
               ),
 
             // ---------------------------------------------------------------
-            // Messages / last response
+            // Messages / last answer
             // ---------------------------------------------------------------
 
             if (_showMessages)
@@ -745,9 +818,7 @@ class _ChatPageState extends State<ChatPage>
                   helpers.resetting ||
                       helpers.isGenerating,
 
-              // Voice trigger listening is managed globally by SpeechService.
-              //
-              // PromptBar therefore does not create another speech recognizer.
+              // PromptBar MUST NOT create a second recognizer.
               speechEnabled: false,
 
               listening:
@@ -775,31 +846,38 @@ class _ChatPageState extends State<ChatPage>
   // SETTINGS
   // ===========================================================================
 
-  Future<void>
-      _navigateToSettings() async {
-    if (_disposed || !mounted) {
+  Future<void> _navigateToSettings() async {
+    if (_disposed ||
+        !mounted) {
       return;
     }
 
-    final speech = _speechService;
+    final speech =
+        _speechService;
 
     final wasListening =
         speech?.commandModeEnabled ??
             false;
 
-    // Stop trigger recognition while Settings is open.
+    // -------------------------------------------------------------------------
+    // Stop trigger listener while Settings is open
+    // -------------------------------------------------------------------------
+
     await speech?.stopCommandListening();
 
     final result =
         await Navigator.of(context)
-            .push<
-                Map<String, dynamic>>(
+            .push<Map<String, dynamic>>(
       MaterialPageRoute(
-        builder: (_) => SettingsPage(
-          systemContext: _systemCtx,
-          backend: _backend,
+        builder: (_) =>
+            SettingsPage(
+          systemContext:
+              _systemCtx,
 
-          // Legacy setting retained for compatibility.
+          backend:
+              _backend,
+
+          // Legacy compatibility.
           wakeWordMode:
               speech?.wakeWordMode ??
                   false,
@@ -823,7 +901,7 @@ class _ChatPageState extends State<ChatPage>
               as bool?;
 
       // ---------------------------------------------------------------------
-      // Legacy wake-word setting
+      // Legacy wake-word preference
       // ---------------------------------------------------------------------
 
       if (wakeWordMode != null) {
@@ -834,13 +912,14 @@ class _ChatPageState extends State<ChatPage>
       }
 
       // ---------------------------------------------------------------------
-      // System context / backend
+      // System prompt / backend
       // ---------------------------------------------------------------------
 
       if (newSystemContext != null &&
           newBackend != null) {
         final backendChanged =
-            _backend != newBackend;
+            _backend !=
+                newBackend;
 
         setState(() {
           _systemCtx =
@@ -855,19 +934,24 @@ class _ChatPageState extends State<ChatPage>
               newBackend;
         });
 
-        // Backend change requires complete runtime rebuild.
+        // -------------------------------------------------------------------
+        // Backend changed -> completely rebuild runtime
+        // -------------------------------------------------------------------
+
         if (backendChanged) {
           _msgs.clear();
 
           setState(() {
-            _initialising = true;
+            _initialising =
+                true;
           });
 
           await _disposeCurrentVoiceRuntime();
 
           BootstrapManager.reset();
 
-          _redirectedOnError = false;
+          _redirectedOnError =
+              false;
 
           await _bootstrap();
 
@@ -876,9 +960,9 @@ class _ChatPageState extends State<ChatPage>
       }
     }
 
-    // -----------------------------------------------------------------------
-    // Resume trigger listener after Settings closes.
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Restore trigger listener after Settings closes
+    // -------------------------------------------------------------------------
 
     if (wasListening &&
         mounted &&
