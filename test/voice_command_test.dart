@@ -164,4 +164,93 @@ void main() {
       );
     });
   });
+
+  group('BengaliVoiceCommands — real-world recognition variants', () {
+    test('the six product commands with speech noise', () {
+      // 1. "সামনে কী আছে দেখো" (scene description) — reported broken.
+      expect(
+        BengaliVoiceCommands.match('সামনে কী আছে দেখো'),
+        VoiceIntent.describeFront,
+      );
+      expect(
+        BengaliVoiceCommands.match('সামনে কি আছে দেখো'),
+        VoiceIntent.describeFront,
+      );
+      expect(
+        BengaliVoiceCommands.match('সামনে কী আছে দেখো।'),
+        VoiceIntent.describeFront,
+      );
+      // 2. "এটা পড়ে শোনাও" (OCR read aloud).
+      expect(
+        BengaliVoiceCommands.match('এটা পড়ে শোনাও'),
+        VoiceIntent.readText,
+      );
+      expect(
+        BengaliVoiceCommands.match('এইটা পড়ে শোনাও'),
+        VoiceIntent.readText,
+      );
+      expect(
+        BengaliVoiceCommands.match('এটা পড়ে শোনাও দয়া করে'.replaceAll('দয়া করে ', '')),
+        VoiceIntent.readText,
+      );
+      // 3. "সামনে কী লেখা আছে" (front text).
+      expect(
+        BengaliVoiceCommands.match('সামনে কি লেখা আছে'),
+        VoiceIntent.readText,
+      );
+      // 4. "ছবি তোলো" (take photo) + common mis-hearings.
+      expect(BengaliVoiceCommands.match('ছবি তোলো'), VoiceIntent.takePhoto);
+      expect(BengaliVoiceCommands.match('ছবি তোলে'), VoiceIntent.takePhoto);
+      expect(BengaliVoiceCommands.match('ছবি তুলো'), VoiceIntent.takePhoto);
+      expect(
+        BengaliVoiceCommands.match('একটা ছবি তোলো'),
+        VoiceIntent.takePhoto,
+      );
+      // 5. Video start/stop in one breath with wake word.
+      expect(
+        BengaliVoiceCommands.match('রিউ ভিডিও রেকর্ড করো'),
+        VoiceIntent.startVideo,
+      );
+      expect(
+        BengaliVoiceCommands.match('ভিডিও শেষ করো'),
+        VoiceIntent.stopVideo,
+      );
+      // 6. Repeat / silence / help / new chat.
+      expect(BengaliVoiceCommands.match('আরেকবার বলো'), VoiceIntent.repeatLast);
+      expect(BengaliVoiceCommands.match('থামো'), VoiceIntent.stopSpeaking);
+      expect(BengaliVoiceCommands.match('কমান্ড বলো'), VoiceIntent.help);
+      expect(BengaliVoiceCommands.match('নতুন আলাপ'), VoiceIntent.newChat);
+    });
+
+    test('trailing verbs and politeness do not break matching', () {
+      expect(
+        BengaliVoiceCommands.match('এটা কী দেখো'),
+        VoiceIntent.identifyObject,
+      );
+      expect(
+        BengaliVoiceCommands.match('সামনে কী আছে বলো'),
+        VoiceIntent.describeFront,
+      );
+      expect(
+        BengaliVoiceCommands.match('লেখাটা পড়ো'),
+        VoiceIntent.readText,
+      );
+      expect(
+        BengaliVoiceCommands.match('লেখা দেখাও'),
+        VoiceIntent.readText,
+      );
+    });
+
+    test('near-miss commands stay distinct', () {
+      // "ভিডিও রেকর্ড" alone still starts; "বন্ধ" variants stop.
+      expect(
+        BengaliVoiceCommands.match('ভিডিও রেকর্ড'),
+        VoiceIntent.startVideo,
+      );
+      // Plain "বন্ধ করো" (e.g. fan off) must NOT stop the video.
+      expect(BengaliVoiceCommands.match('ফ্যান বন্ধ করো'), isNull);
+      // "কী লেখা" fragment must not fire on its own conversation.
+      expect(BengaliVoiceCommands.match('তোমার নামে কী লেখা'), isNull);
+    });
+  });
 }

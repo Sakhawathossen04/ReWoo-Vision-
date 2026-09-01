@@ -43,13 +43,21 @@
             </intent-filter>
         </activity>
 
-        <!--
-            NOTE: the flutter_web_auth_2 OAuth callback activity was removed on
-            purpose. Hugging Face authentication is now automatic inside the
-            app (bundled developer token) — users never leave for a login.
-
-            The camera/video and microphone features need no extra activities.
-        -->
+        <!-- OAuth redirect handler (Hugging Face login — restored old flow).
+             After the one-time login the browser returns to the app through
+             this deep link: com.tommasogiovannini.gemma://oauthredirect -->
+        <activity
+            android:name="com.linusu.flutter_web_auth_2.CallbackActivity"
+            android:exported="true">
+            <intent-filter android:label="flutter_web_auth_2">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="com.tommasogiovannini.gemma"
+                    android:host="oauthredirect" />
+            </intent-filter>
+        </activity>
 
         <!-- Optional OpenCL stubs (keep or remove as you wish) -->
         <uses-native-library android:name="libOpenCL.so"       android:required="false" />
@@ -103,6 +111,12 @@
         <!-- Required on modern Android so speech_to_text can discover speech recognizers. -->
         <intent>
             <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <!-- Required so url_launcher can open the Hugging Face license page
+             and the one-time OAuth login in an external browser. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
         </intent>
         <!-- Lets the app find a viewer/player for captured photos and videos. -->
         <intent>
