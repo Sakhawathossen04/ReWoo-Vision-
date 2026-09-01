@@ -15,13 +15,29 @@ class ChatUIBuilder {
       elevation: 0,
       backgroundColor: Colors.white,
       systemOverlayStyle: SystemUiOverlayStyle.dark,
-      title: const Text(
-        'ReWoo Vision',
-        style: TextStyle(
-          color: Colors.black87,
-          fontSize: 20,
-          fontWeight: FontWeight.w700,
-        ),
+      // Image.asset is not const-constructible, so the Row itself cannot be const.
+      title: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.all(Radius.circular(8)),
+            child: Image.asset(
+              'assets/logo.png',
+              width: 34,
+              height: 34,
+              fit: BoxFit.cover,
+              excludeFromSemantics: true,
+            ),
+          ),
+          const SizedBox(width: 10),
+          const Text(
+            'ReWoo Vision',
+            style: TextStyle(
+              color: Colors.black87,
+              fontSize: 20,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
       ),
       actions: [
         Semantics(
@@ -452,7 +468,7 @@ class ChatUIBuilder {
             CircularProgressIndicator(),
             SizedBox(height: 22),
             Text(
-              'Gemma প্রস্তুত হচ্ছে…',
+              'ReWoo Vision প্রস্তুত হচ্ছে…',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
             ),
           ],

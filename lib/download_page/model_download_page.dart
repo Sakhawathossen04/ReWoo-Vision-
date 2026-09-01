@@ -168,6 +168,35 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                   Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
+                      // ReWoo Vision brand logo
+                      Center(
+                        child: Container(
+                          width: 104,
+                          height: 104,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(26),
+                            border: Border.all(color: Colors.grey.shade200),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.06),
+                                blurRadius: 14,
+                                offset: const Offset(0, 5),
+                              ),
+                            ],
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(25),
+                            child: Image.asset(
+                              'assets/logo.png',
+                              fit: BoxFit.cover,
+                              excludeFromSemantics: true,
+                            ),
+                          ),
+                        ),
+                      ),
+
+                      const SizedBox(height: 28),
+
                       // Animated download icon that changes based on status
                       ModernUIWidgets.buildDownloadIcon(
                         _downloadStatus,

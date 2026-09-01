@@ -8,8 +8,8 @@ plugins {
 android {
     namespace = "com.tommasogiovannini.gemma"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = "27.0.12077973"
-    //ndkVersion = flutter.ndkVersion
+    // No explicit ndkVersion: no plugin ships native sources to compile,
+    // so the NDK is not needed (keeps CI/local builds light).
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
