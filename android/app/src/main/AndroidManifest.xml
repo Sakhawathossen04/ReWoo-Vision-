@@ -1,18 +1,110 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Basic permissions -->
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.CAMERA" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
-    <!-- Remove this if you never write to external storage on API 28‑ -->
-    <!-- <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-                      android:maxSdkVersion="28" /> -->
+    <!-- =============================================================== -->
+    <!-- NETWORK -->
+    <!-- =============================================================== -->
+
+    <!-- Required for:
+         - model download
+         - OAuth
+         - remote/system speech recognition
+    -->
+    <uses-permission
+        android:name="android.permission.INTERNET" />
+
+    <!-- Useful for checking current network state before large downloads. -->
+    <uses-permission
+        android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+
+    <!-- =============================================================== -->
+    <!-- CAMERA -->
+    <!-- =============================================================== -->
+
+    <uses-permission
+        android:name="android.permission.CAMERA" />
+
+
+    <!-- =============================================================== -->
+    <!-- MICROPHONE / SPEECH RECOGNITION -->
+    <!-- =============================================================== -->
+
+    <!-- Main microphone permission. -->
+    <uses-permission
+        android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Allows Android audio routing / volume handling used by speech/TTS. -->
+    <uses-permission
+        android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+
+    <!-- =============================================================== -->
+    <!-- BLUETOOTH HEADSET / MICROPHONE -->
+    <!-- =============================================================== -->
+
+    <!--
+        Android 9, 10 and 11.
+
+        Android recommends limiting the old Bluetooth permissions to
+        Android 11 / API 30 and below.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+    <!--
+        Android 12 / API 31+.
+
+        Required when the application / speech recognizer communicates
+        with an already-paired Bluetooth headset.
+    -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT" />
+
+
+    <!-- =============================================================== -->
+    <!-- FOREGROUND / BACKGROUND DOWNLOAD -->
+    <!-- =============================================================== -->
+
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!-- Android 14+ data-sync foreground service permission. -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Android 13+ notification permission. -->
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS" />
+
+
+    <!-- =============================================================== -->
+    <!-- LEGACY STORAGE -->
+    <!-- =============================================================== -->
+
+    <!--
+        Keep disabled unless the application actually writes directly
+        to shared external storage on Android 9.
+
+        Your model should preferably stay in application-specific storage.
+
+        <uses-permission
+            android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+            android:maxSdkVersion="28" />
+    -->
+
+
+    <!-- =============================================================== -->
+    <!-- APPLICATION -->
+    <!-- =============================================================== -->
 
     <application
         android:name="${applicationName}"
@@ -22,7 +114,11 @@
         android:fullBackupContent="false"
         android:networkSecurityConfig="@xml/network_security_config">
 
-        <!-- Flutter entry activity -->
+
+        <!-- =========================================================== -->
+        <!-- MAIN FLUTTER ACTIVITY -->
+        <!-- =========================================================== -->
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -37,94 +133,227 @@
                 android:resource="@style/NormalTheme" />
 
             <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
+                <action
+                    android:name="android.intent.action.MAIN" />
+
+                <category
+                    android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
         </activity>
 
-        <!-- OAuth redirect handler (Hugging Face login — restored old flow).
-             After the one-time login the browser returns to the app through
-             this deep link: com.tommasogiovannini.gemma://oauthredirect -->
+
+        <!-- =========================================================== -->
+        <!-- HUGGING FACE OAUTH CALLBACK -->
+        <!-- =========================================================== -->
+
+        <!--
+            Browser returns to:
+
+            com.tommasogiovannini.gemma://oauthredirect
+        -->
+
         <activity
             android:name="com.linusu.flutter_web_auth_2.CallbackActivity"
             android:exported="true">
-            <intent-filter android:label="flutter_web_auth_2">
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
+
+            <intent-filter
+                android:label="flutter_web_auth_2">
+
+                <action
+                    android:name="android.intent.action.VIEW" />
+
+                <category
+                    android:name="android.intent.category.DEFAULT" />
+
+                <category
+                    android:name="android.intent.category.BROWSABLE" />
+
                 <data
                     android:scheme="com.tommasogiovannini.gemma"
                     android:host="oauthredirect" />
+
             </intent-filter>
+
         </activity>
 
-        <!-- Optional OpenCL stubs (keep or remove as you wish) -->
-        <uses-native-library android:name="libOpenCL.so"       android:required="false" />
-        <uses-native-library android:name="libOpenCL-car.so"   android:required="false" />
-        <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />
 
-        <!-- flutter_downloader provider -->
+        <!-- =========================================================== -->
+        <!-- OPTIONAL GPU / OPENCL LIBRARIES -->
+        <!-- =========================================================== -->
+
+        <!--
+            required=false is important.
+
+            This means phones without these optional OpenCL libraries can
+            still install/open the application and CPU fallback can be used.
+        -->
+
+        <uses-native-library
+            android:name="libOpenCL.so"
+            android:required="false" />
+
+        <uses-native-library
+            android:name="libOpenCL-car.so"
+            android:required="false" />
+
+        <uses-native-library
+            android:name="libOpenCL-pixel.so"
+            android:required="false" />
+
+
+        <!-- =========================================================== -->
+        <!-- FLUTTER DOWNLOADER FILE PROVIDER -->
+        <!-- =========================================================== -->
+
         <provider
             android:name="vn.hunghd.flutterdownloader.DownloadedFileProvider"
             android:authorities="${applicationId}.flutter_downloader.provider"
             android:exported="false"
             android:grantUriPermissions="true">
+
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/provider_paths" />
-            <!-- Default max concurrent tasks is 3; edit if you want a different limit -->
+
             <meta-data
                 android:name="vn.hunghd.flutterdownloader.MAX_CONCURRENT_TASKS"
                 android:value="3" />
+
         </provider>
 
-        <!-- FileProvider used to open captured photos / recorded videos with
-             the system viewer (voice commands: ছবি তোলো / ভিডিও রেকর্ড করো). -->
+
+        <!-- =========================================================== -->
+        <!-- CAMERA PHOTO / VIDEO FILE PROVIDER -->
+        <!-- =========================================================== -->
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
+
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
+
         </provider>
 
-        <!-- Foreground‑service declaration for WorkManager (Android 14 fix) -->
+
+        <!-- =========================================================== -->
+        <!-- WORKMANAGER FOREGROUND SERVICE -->
+        <!-- =========================================================== -->
+
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
 
-        <!-- Flutter embedding metadata -->
-        <meta-data android:name="flutterEmbedding" android:value="2" />
+
+        <!-- =========================================================== -->
+        <!-- FLUTTER EMBEDDING -->
+        <!-- =========================================================== -->
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
     </application>
 
-    <!-- Allow plugins to query for PROCESS_TEXT handlers -->
+
+    <!-- =============================================================== -->
+    <!-- PACKAGE VISIBILITY / SERVICE DISCOVERY -->
+    <!-- =============================================================== -->
+
     <queries>
+
+        <!-- ----------------------------------------------------------- -->
+        <!-- PROCESS TEXT -->
+        <!-- ----------------------------------------------------------- -->
+
         <intent>
-            <action android:name="android.intent.action.PROCESS_TEXT" />
-            <data android:mimeType="text/plain" />
+            <action
+                android:name="android.intent.action.PROCESS_TEXT" />
+
+            <data
+                android:mimeType="text/plain" />
         </intent>
-        <!-- Required on modern Android so speech_to_text can discover speech recognizers. -->
+
+
+        <!-- ----------------------------------------------------------- -->
+        <!-- SPEECH RECOGNIZER -->
+        <!-- ----------------------------------------------------------- -->
+
+        <!--
+            Required when targeting modern Android versions so
+            speech_to_text can discover installed recognition services.
+        -->
+
         <intent>
-            <action android:name="android.speech.RecognitionService" />
+            <action
+                android:name="android.speech.RecognitionService" />
         </intent>
-        <!-- Required so url_launcher can open the Hugging Face license page
-             and the one-time OAuth login in an external browser. -->
+
+
+        <!-- ----------------------------------------------------------- -->
+        <!-- TEXT-TO-SPEECH ENGINE -->
+        <!-- ----------------------------------------------------------- -->
+
+        <!--
+            CRITICAL FIX.
+
+            Required for TTS engine discovery on Android 11+.
+
+            Without this, flutter_tts / TtsEngineService may fail to
+            discover Google TTS, Samsung TTS or another installed engine
+            on some devices.
+        -->
+
         <intent>
-            <action android:name="android.intent.action.VIEW" />
-            <data android:scheme="https" />
+            <action
+                android:name="android.intent.action.TTS_SERVICE" />
         </intent>
-        <!-- Lets the app find a viewer/player for captured photos and videos. -->
+
+
+        <!-- ----------------------------------------------------------- -->
+        <!-- EXTERNAL BROWSER -->
+        <!-- ----------------------------------------------------------- -->
+
         <intent>
-            <action android:name="android.intent.action.VIEW" />
-            <data android:mimeType="video/*" />
+            <action
+                android:name="android.intent.action.VIEW" />
+
+            <data
+                android:scheme="https" />
         </intent>
+
+
+        <!-- ----------------------------------------------------------- -->
+        <!-- VIDEO VIEWER -->
+        <!-- ----------------------------------------------------------- -->
+
         <intent>
-            <action android:name="android.intent.action.VIEW" />
-            <data android:mimeType="image/*" />
+            <action
+                android:name="android.intent.action.VIEW" />
+
+            <data
+                android:mimeType="video/*" />
         </intent>
+
+
+        <!-- ----------------------------------------------------------- -->
+        <!-- IMAGE VIEWER -->
+        <!-- ----------------------------------------------------------- -->
+
+        <intent>
+            <action
+                android:name="android.intent.action.VIEW" />
+
+            <data
+                android:mimeType="image/*" />
+        </intent>
+
     </queries>
+
 </manifest>
