@@ -8,15 +8,9 @@
     <!-- NETWORK -->
     <!-- =============================================================== -->
 
-    <!-- Required for:
-         - model download
-         - OAuth
-         - remote/system speech recognition
-    -->
     <uses-permission
         android:name="android.permission.INTERNET" />
 
-    <!-- Useful for checking current network state before large downloads. -->
     <uses-permission
         android:name="android.permission.ACCESS_NETWORK_STATE" />
 
@@ -30,14 +24,12 @@
 
 
     <!-- =============================================================== -->
-    <!-- MICROPHONE / SPEECH RECOGNITION -->
+    <!-- MICROPHONE / AUDIO -->
     <!-- =============================================================== -->
 
-    <!-- Main microphone permission. -->
     <uses-permission
         android:name="android.permission.RECORD_AUDIO" />
 
-    <!-- Allows Android audio routing / volume handling used by speech/TTS. -->
     <uses-permission
         android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
@@ -46,12 +38,7 @@
     <!-- BLUETOOTH HEADSET / MICROPHONE -->
     <!-- =============================================================== -->
 
-    <!--
-        Android 9, 10 and 11.
-
-        Android recommends limiting the old Bluetooth permissions to
-        Android 11 / API 30 and below.
-    -->
+    <!-- Android 11 / API 30 and below -->
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
@@ -60,45 +47,55 @@
         android:name="android.permission.BLUETOOTH_ADMIN"
         android:maxSdkVersion="30" />
 
-    <!--
-        Android 12 / API 31+.
-
-        Required when the application / speech recognizer communicates
-        with an already-paired Bluetooth headset.
-    -->
+    <!-- Android 12 / API 31+ -->
     <uses-permission
         android:name="android.permission.BLUETOOTH_CONNECT" />
 
 
     <!-- =============================================================== -->
-    <!-- FOREGROUND / BACKGROUND DOWNLOAD -->
+    <!-- BACKGROUND LARGE DOWNLOAD -->
     <!-- =============================================================== -->
 
+    <!-- Base foreground-service permission. -->
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE" />
 
-    <!-- Android 14+ data-sync foreground service permission. -->
+    <!--
+        Required when targeting Android 14 / API 34+ and using
+        background_downloader foreground data-sync mode.
+    -->
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <!-- Android 13+ notification permission. -->
+    <!--
+        Android 13 / API 33+ notification runtime permission.
+
+        background_downloader uses a running notification for foreground
+        large downloads.
+    -->
     <uses-permission
         android:name="android.permission.POST_NOTIFICATIONS" />
 
-
-    <!-- =============================================================== -->
-    <!-- LEGACY STORAGE -->
-    <!-- =============================================================== -->
-
     <!--
-        Keep disabled unless the application actually writes directly
-        to shared external storage on Android 9.
+        DO NOT add RUN_USER_INITIATED_JOBS yet.
 
-        Your model should preferably stay in application-specific storage.
+        Current DownloadManager uses:
+
+            priority: 5
+
+        Therefore background_downloader uses normal/foreground WorkManager,
+        not Android 14+ User Initiated Data Transfer (UIDT).
+
+        If DownloadManager is later changed to:
+
+            priority: 0
+
+        then add:
 
         <uses-permission
-            android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-            android:maxSdkVersion="28" />
+            android:name="android.permission.RUN_USER_INITIATED_JOBS" />
+
+        and UIDTJobService inside <application>.
     -->
 
 
@@ -133,11 +130,13 @@
                 android:resource="@style/NormalTheme" />
 
             <intent-filter>
+
                 <action
                     android:name="android.intent.action.MAIN" />
 
                 <category
                     android:name="android.intent.category.LAUNCHER" />
+
             </intent-filter>
 
         </activity>
@@ -146,12 +145,6 @@
         <!-- =========================================================== -->
         <!-- HUGGING FACE OAUTH CALLBACK -->
         <!-- =========================================================== -->
-
-        <!--
-            Browser returns to:
-
-            com.tommasogiovannini.gemma://oauthredirect
-        -->
 
         <activity
             android:name="com.linusu.flutter_web_auth_2.CallbackActivity"
@@ -179,14 +172,12 @@
 
 
         <!-- =========================================================== -->
-        <!-- OPTIONAL GPU / OPENCL LIBRARIES -->
+        <!-- OPTIONAL GPU / OPENCL -->
         <!-- =========================================================== -->
 
         <!--
-            required=false is important.
-
-            This means phones without these optional OpenCL libraries can
-            still install/open the application and CPU fallback can be used.
+            required=false keeps installation possible on devices without
+            these GPU libraries so GemmaService can use CPU fallback.
         -->
 
         <uses-native-library
@@ -203,8 +194,21 @@
 
 
         <!-- =========================================================== -->
-        <!-- FLUTTER DOWNLOADER FILE PROVIDER -->
+        <!-- TEMPORARY FLUTTER_DOWNLOADER COMPATIBILITY -->
         <!-- =========================================================== -->
+
+        <!--
+            TEMPORARY.
+
+            Current DownloadManager still contains legacy flutter_downloader
+            compatibility code for old tasks.
+
+            Remove this provider ONLY after:
+
+            1. flutter_downloader is removed from pubspec.yaml
+            2. all FlutterDownloader references are removed from Dart
+            3. old task migration support is no longer needed
+        -->
 
         <provider
             android:name="vn.hunghd.flutterdownloader.DownloadedFileProvider"
@@ -216,15 +220,11 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/provider_paths" />
 
-            <meta-data
-                android:name="vn.hunghd.flutterdownloader.MAX_CONCURRENT_TASKS"
-                android:value="3" />
-
         </provider>
 
 
         <!-- =========================================================== -->
-        <!-- CAMERA PHOTO / VIDEO FILE PROVIDER -->
+        <!-- CAMERA / APP FILE PROVIDER -->
         <!-- =========================================================== -->
 
         <provider
@@ -241,14 +241,44 @@
 
 
         <!-- =========================================================== -->
-        <!-- WORKMANAGER FOREGROUND SERVICE -->
+        <!-- BACKGROUND_DOWNLOADER FOREGROUND SERVICE -->
         <!-- =========================================================== -->
+
+        <!--
+            Required by background_downloader when foreground execution is
+            enabled for large files and targetSdk >= 34.
+
+            Our DownloadManager configures large model downloads to run in
+            foreground mode.
+        -->
 
         <service
             android:name="androidx.work.impl.foreground.SystemForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
+
+
+        <!-- =========================================================== -->
+        <!-- OPTIONAL FUTURE UIDT SERVICE -->
+        <!-- =========================================================== -->
+
+        <!--
+            DO NOT enable yet.
+
+            Enable this only if DownloadManager changes Android 14+ model
+            downloads to:
+
+                priority: 0
+
+            together with RUN_USER_INITIATED_JOBS permission.
+
+            <service
+                android:name="com.bbflight.background_downloader.UIDTJobService"
+                android:permission="android.permission.BIND_JOB_SERVICE"
+                android:exported="true"
+                android:foregroundServiceType="dataSync" />
+        -->
 
 
         <!-- =========================================================== -->
@@ -263,95 +293,74 @@
 
 
     <!-- =============================================================== -->
-    <!-- PACKAGE VISIBILITY / SERVICE DISCOVERY -->
+    <!-- PACKAGE VISIBILITY -->
     <!-- =============================================================== -->
 
     <queries>
 
-        <!-- ----------------------------------------------------------- -->
         <!-- PROCESS TEXT -->
-        <!-- ----------------------------------------------------------- -->
-
         <intent>
+
             <action
                 android:name="android.intent.action.PROCESS_TEXT" />
 
             <data
                 android:mimeType="text/plain" />
+
         </intent>
 
 
-        <!-- ----------------------------------------------------------- -->
         <!-- SPEECH RECOGNIZER -->
-        <!-- ----------------------------------------------------------- -->
-
-        <!--
-            Required when targeting modern Android versions so
-            speech_to_text can discover installed recognition services.
-        -->
-
         <intent>
+
             <action
                 android:name="android.speech.RecognitionService" />
+
         </intent>
 
 
-        <!-- ----------------------------------------------------------- -->
-        <!-- TEXT-TO-SPEECH ENGINE -->
-        <!-- ----------------------------------------------------------- -->
-
-        <!--
-            CRITICAL FIX.
-
-            Required for TTS engine discovery on Android 11+.
-
-            Without this, flutter_tts / TtsEngineService may fail to
-            discover Google TTS, Samsung TTS or another installed engine
-            on some devices.
-        -->
-
+        <!-- TEXT TO SPEECH -->
         <intent>
+
             <action
                 android:name="android.intent.action.TTS_SERVICE" />
+
         </intent>
 
 
-        <!-- ----------------------------------------------------------- -->
-        <!-- EXTERNAL BROWSER -->
-        <!-- ----------------------------------------------------------- -->
-
+        <!-- EXTERNAL HTTPS BROWSER -->
         <intent>
+
             <action
                 android:name="android.intent.action.VIEW" />
 
             <data
                 android:scheme="https" />
+
         </intent>
 
 
-        <!-- ----------------------------------------------------------- -->
         <!-- VIDEO VIEWER -->
-        <!-- ----------------------------------------------------------- -->
-
         <intent>
+
             <action
                 android:name="android.intent.action.VIEW" />
 
             <data
                 android:mimeType="video/*" />
+
         </intent>
 
 
-        <!-- ----------------------------------------------------------- -->
         <!-- IMAGE VIEWER -->
-        <!-- ----------------------------------------------------------- -->
-
         <intent>
+
             <action
                 android:name="android.intent.action.VIEW" />
 
             <data
                 android:mimeType="image/*" />
+
         </intent>
 
     </queries>
