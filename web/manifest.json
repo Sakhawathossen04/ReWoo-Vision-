@@ -1,11 +1,11 @@
 {
-    "name": "ReWoo Vision",
-    "short_name": "ReWoo Vision",
+    "name": "gemma_chat",
+    "short_name": "gemma_chat",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#FAF9F4",
-    "theme_color": "#0D141E",
-    "description": "Bangla-first, controller-free on-device visual assistant for blind users.",
+    "background_color": "#0175C2",
+    "theme_color": "#0175C2",
+    "description": "A new Flutter project.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
