@@ -37,12 +37,21 @@ if (keystorePropertiesFile.exists()) {
 android {
     namespace = "com.tommasogiovannini.gemma"
 
-    // Keep compile SDK controlled by the installed Flutter version.
+    // =========================================================================
+    // COMPILE SDK
+    // =========================================================================
+    //
+    // background_downloader requires Android SDK 36.
     //
     // IMPORTANT:
-    // compileSdk can remain modern even though Android 9 is the minimum
-    // supported Android version.
-    compileSdk = flutter.compileSdkVersion
+    // compileSdk controls which Android APIs the project can compile against.
+    // It does NOT change the minimum Android version that can install the app.
+    //
+    // Android 9 support remains controlled by:
+    //
+    //     minSdk = 28
+    //
+    compileSdk = 36
 
     // ------------------------------------------------------------------------
     // NDK
@@ -91,8 +100,6 @@ android {
         //
         // Android 9 = API level 28.
         //
-        // This means:
-        //
         // Android 8 / 8.1 and lower
         // -> APK will NOT install.
         //
@@ -102,13 +109,18 @@ android {
         minSdk = 28
 
         // ====================================================================
-        // KEEP TARGET SDK MODERN
+        // TARGET SDK
         // ====================================================================
         //
-        // DO NOT set targetSdk = 28.
+        // Keep targetSdk controlled by Flutter.
         //
-        // A modern targetSdk is still compatible with Android 9 as long as
-        // minSdk is 28 or lower.
+        // targetSdk and minSdk are separate:
+        //
+        // compileSdk = 36
+        // -> build against Android SDK 36
+        //
+        // minSdk = 28
+        // -> Android 9 minimum installation support
         //
         targetSdk =
             flutter.targetSdkVersion
