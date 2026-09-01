@@ -73,6 +73,9 @@ dependencies:
   #
   disk_space_plus: 0.2.6
 
+  device_info_plus: 11.5.0
+  flutter pub get
+
   # --------------------------------------------------------------------------
   # NEW LARGE-FILE BACKGROUND DOWNLOADER
   # --------------------------------------------------------------------------
