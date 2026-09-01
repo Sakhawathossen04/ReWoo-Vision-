@@ -1,9 +1,11 @@
 // download_page/model_download_page.dart
 //
-// Shows the model download progress. Thanks to the automatic Hugging Face
-// authentication (Priority 1) this page needs no login: the download starts
-// by itself shortly after the page opens and continues in the background
-// (Priority 2) even if the user leaves the app.
+// Shows the model download progress. Authentication is resolved
+// automatically (developer token or stored Hugging Face login). On the very
+// first download the proven old-version Hugging Face login runs once when
+// the user presses Download; afterwards every download is fully automatic.
+// The download continues in the background (Priority 2) even if the user
+// leaves the app.
 
 import 'dart:async';
 
@@ -37,6 +39,9 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
 
   // List of error messages to display to the user when downloads fail
   List<String> _errorMessages = [];
+
+  // Controls visibility of the license agreement bottom sheet
+  bool _showAgreementSheet = false;
 
   // Subscription to listen for log updates and refresh UI accordingly
   late StreamSubscription _logSubscription;
@@ -78,6 +83,8 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       setProgress: (progress) => setState(() => _progress = progress),
       // Callback to update error messages (shows error dialogs/messages)
       setErrorMessages: (messages) => setState(() => _errorMessages = messages),
+      // Callback to show/hide license agreement sheet
+      setShowAgreementSheet: (show) => setState(() => _showAgreementSheet = show),
     );
   }
 
@@ -94,8 +101,9 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       await Future.delayed(const Duration(milliseconds: 650));
       if (!mounted) return;
       await _tts.speak(
-        'ReWoo Vision প্রস্তুত হচ্ছে। প্রয়োজনীয় AI মডেল স্বয়ংক্রিয়ভাবে ডাউনলোড হবে। '
-        'ইন্টারনেট সংযোগ চালু রাখুন। ডাউনলোড চলাকালীন আপনি অন্য কাজ করতে পারেন।',
+        'ReWoo Vision প্রস্তুত হচ্ছে। প্রয়োজনীয় AI মডেল ডাউনলোড হবে। '
+        'প্রথমবার প্রয়োজন হলে ডাউনলোড বোতাম চেপে Hugging Face লগইন করুন — '
+        'এটি একবারই লাগবে। ইন্টারনেট সংযোগ চালু রাখুন।',
         focus: true,
       );
     } catch (e) {
@@ -118,7 +126,7 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
 
   /// Checks for previous download sessions and, when everything is ready,
   /// automatically starts the download — the user does not have to tap
-  /// anything (Priority 1: automatic model download).
+  /// anything when a zero-touch authentication path is available.
   Future<void> _checkDownloadState() async {
     await _logic.checkForOngoingDownloads(context);
 
@@ -134,8 +142,9 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // are all settled before the network work begins.
     Future.delayed(const Duration(milliseconds: 1600), () {
       if (!mounted) return;
-      if (_downloadStatus == DownloadStatus.notStarted) {
-        _logic.startDownload();
+      if (_downloadStatus == DownloadStatus.notStarted ||
+          _downloadStatus == DownloadStatus.failed) {
+        _logic.startDownload(autoStart: true);
       }
     });
   }
@@ -188,7 +197,9 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                       // Different buttons appear based on current download status
                       ModernUIWidgets.buildActionButtons(
                         _downloadStatus,
-                        () => _logic.startDownload(), // Start new download
+                        // User-initiated start — may open the one-time
+                        // Hugging Face login when no token is available.
+                        () => _logic.startDownload(),
                         () => _logic.pauseDownload(), // Pause active download
                         () => _logic.resumeDownload(), // Resume paused download
                         () => _logic.showCancelConfirmation(
@@ -239,6 +250,14 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
           ],
         ),
       ),
+      // License agreement bottom sheet - shown when model requires acceptance
+      bottomSheet: _showAgreementSheet
+          ? ModernUIWidgets.buildLicenseBottomSheet(
+              context,
+              () => _logic.cancelLicenseAgreement(), // Cancel agreement
+              () => _logic.openLicenseAgreement(), // Open license in browser
+            )
+          : null,
     );
   }
 }

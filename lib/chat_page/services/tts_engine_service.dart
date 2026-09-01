@@ -14,6 +14,11 @@
 //     broken, which used to freeze the voice loop. Every speak call in the
 //     app goes through `speakWithTimeout` so a dead engine can never stall
 //     the assistant.
+//  5. RETRY with reconfiguration: when the first speak attempt produces no
+//     audio (engine glitch, language rejected mid-flight, OEM battery
+//     manager), we stop the engine, reset the language to the device
+//     default and speak one more time. A wrong-language utterance is far
+//     better for a blind user than silence.
 
 import 'dart:async';
 
@@ -41,7 +46,14 @@ class TtsEngineService {
   TtsEngineService._();
 
   /// Bengali language candidates in preference order.
-  static const List<String> bengaliCandidates = ['bn-BD', 'bn_IN', 'bn-IN', 'bn_BD', 'bn-IN-x-locale', 'bn'];
+  static const List<String> bengaliCandidates = [
+    'bn-BD',
+    'bn_IN',
+    'bn-IN',
+    'bn_BD',
+    'bn-IN-x-locale',
+    'bn',
+  ];
 
   /// Engines known to ship Bengali voices, in preference order.
   static const List<String> preferredEngines = [
@@ -56,6 +68,11 @@ class TtsEngineService {
   /// Remembers the result of the last configuration so the settings page can
   /// display what the device is actually using.
   static TtsConfigResult? lastResult;
+
+  static String? lastSetLanguage;
+
+  /// True while a retry is in progress — prevents recursive retries.
+  static bool _retrying = false;
 
   /// Full setup: engine → language → rate/volume/pitch.
   ///
@@ -120,8 +137,6 @@ class TtsEngineService {
     return lastResult!;
   }
 
-  static String? lastSetLanguage;
-
   /// Tries every Bengali candidate until the engine accepts one.
   static Future<bool> _trySetBengali(FlutterTts tts) async {
     for (final candidate in bengaliCandidates) {
@@ -145,12 +160,45 @@ class TtsEngineService {
 
   /// Speaks with a hard timeout so a broken engine can never freeze the
   /// voice loop. Returns true when the utterance completed normally.
+  ///
+  /// If the first attempt fails or times out, the engine is stopped and
+  /// reconfigured (falling back to the device default voice when Bengali
+  /// is rejected) and the utterance is spoken once more.
   static Future<bool> speakWithTimeout(
     FlutterTts tts,
     String text, {
     Duration timeout = const Duration(seconds: 40),
   }) async {
     if (text.trim().isEmpty) return true;
+
+    final firstOk = await _speakOnce(tts, text, timeout);
+    if (firstOk) return true;
+
+    // One automatic recovery attempt — this is what rescues phones where
+    // the first utterance after startup is silently dropped.
+    if (_retrying) return false;
+    _retrying = true;
+    try {
+      debugPrint('[TtsEngine] speak failed — reconfiguring engine and retrying');
+      try {
+        await tts.stop();
+      } catch (_) {}
+      await configure(tts);
+      // If Bengali could not be re-applied, configure() already left the
+      // engine on the platform default voice, which maximises the chance
+      // the user hears SOMETHING.
+      return await _speakOnce(tts, text, timeout);
+    } finally {
+      _retrying = false;
+    }
+  }
+
+  /// A single speak attempt wrapped in a timeout.
+  static Future<bool> _speakOnce(
+    FlutterTts tts,
+    String text,
+    Duration timeout,
+  ) async {
     try {
       // focus: true requests audio focus — REQUIRED for reliable playback
       // on phones that otherwise keep the media session muted.

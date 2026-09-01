@@ -161,7 +161,7 @@ class ModernUIWidgets {
       case DownloadStatus.notStarted:
         title = "AI মডেল ডাউনলোড প্রস্তুত";
         subtitle =
-            "প্রয়োজনীয় অনুমতি স্বয়ংক্রিয়ভাবে যাচাই হবে — Hugging Face লগইন লাগবে না। প্রায় ৪ GB খালি জায়গা রাখুন।";
+            "ডাউনলোড বোতাম চাপুন। প্রথমবার প্রয়োজন হলে একবার Hugging Face লগইন করতে হবে — পরবর্তীতে সব স্বয়ংক্রিয়। প্রায় ৪ GB খালি জায়গা রাখুন।";
         break;
       case DownloadStatus.checkingAccess:
         title = "অ্যাক্সেস পরীক্ষা হচ্ছে";
@@ -201,7 +201,7 @@ class ModernUIWidgets {
       case DownloadStatus.cancelled:
         title = "AI মডেল ডাউনলোড প্রস্তুত";
         subtitle =
-            "প্রয়োজনীয় অনুমতি স্বয়ংক্রিয়ভাবে যাচাই হবে — Hugging Face লগইন লাগবে না। প্রায় ৪ GB খালি জায়গা রাখুন।";
+            "ডাউনলোড বোতাম চাপুন। প্রথমবার প্রয়োজন হলে একবার Hugging Face লগইন করতে হবে — পরবর্তীতে সব স্বয়ংক্রিয়। প্রায় ৪ GB খালি জায়গা রাখুন।";
         break;
     }
 
@@ -370,6 +370,103 @@ class ModernUIWidgets {
             tooltip: 'লগ দেখুন',
           ),
         ),
+      ),
+    );
+  }
+
+  /// Modal bottom sheet for license agreement with proper styling.
+  /// Shown when the logged-in Hugging Face account has not accepted the
+  /// Gemma model license yet — restored from the proven old version.
+  static Widget buildLicenseBottomSheet(
+    BuildContext context,
+    VoidCallback onCancel,
+    VoidCallback onViewLicense,
+  ) {
+    return Container(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black12,
+            blurRadius: 10,
+            offset: Offset(0, -5),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Handle bar for bottom sheet
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.grey[300],
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(height: 24),
+          Container(
+            width: 64,
+            height: 64,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              gradient: LinearGradient(
+                colors: [Colors.orange[400]!, Colors.orange[600]!],
+              ),
+            ),
+            child: const Icon(
+              Icons.assignment_rounded,
+              size: 32,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Text(
+            'মডেল লাইসেন্স গ্রহণ প্রয়োজন',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              color: Colors.grey[800],
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'এই মডেল ডাউনলোড করতে Hugging Face-এর লাইসেন্স শর্ত গ্রহণ করতে হবে। লাইসেন্সটি খুলে পড়ে গ্রহণ করার পর ডাউনলোড চালিয়ে যান।',
+            style: TextStyle(
+              fontSize: 16,
+              color: Colors.grey[600],
+              height: 1.4,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 32),
+          Row(
+            children: [
+              Expanded(
+                child: _buildGradientButton(
+                  onPressed: onCancel,
+                  text: 'বাতিল',
+                  icon: Icons.close_rounded,
+                  gradientColors: [Colors.grey[400]!, Colors.grey[500]!],
+                ),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: _buildGradientButton(
+                  onPressed: onViewLicense,
+                  text: 'লাইসেন্স খুলুন',
+                  icon: Icons.open_in_new_rounded,
+                  gradientColors: [Colors.orange[400]!, Colors.orange[600]!],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+        ],
       ),
     );
   }

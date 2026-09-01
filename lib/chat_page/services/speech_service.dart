@@ -332,10 +332,12 @@ class SpeechService {
         localeId: _bengaliLocaleId,
         listenFor: const Duration(minutes: 5),
         pauseFor: const Duration(seconds: 5),
-        partialResults: true,
-        cancelOnError: false,
-        onDevice: false,
-        listenMode: ListenMode.confirmation,
+        listenOptions: SpeechListenOptions(
+          partialResults: true,
+          cancelOnError: false,
+          onDevice: false,
+          listenMode: ListenMode.confirmation,
+        ),
       );
     } catch (e) {
       _commandListening = false;

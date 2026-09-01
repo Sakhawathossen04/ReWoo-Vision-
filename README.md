@@ -4,20 +4,21 @@ Controller-free, Bangla-first visual assistance app for blind and low-vision use
 
 The original app used an 8BitDo controller as a fast hardware shortcut layer. This version removes the controller from the primary workflow and makes Bengali voice commands the main interaction method while preserving the original on-device Gemma 3n vision pipeline.
 
-## What's new in this release (v1.2)
+## What's new in this release (v1.3 — download fixed)
 
 | # | Problem | Fix |
 |---|---|---|
-| 1 | Users had to log into Hugging Face in a browser to download the model | **Automatic Hugging Face authentication** — the app ships with a developer read token. Users only create a simple in-app account (email + password + consent checkbox) and the model downloads itself |
-| 2 | Model download stopped when the app went to the background | `allowCellular: true` (mobile-data downloads), foreground-service notification, storage-low guard removed, **auto-retry/auto-resume** (up to 5 attempts) and full recovery after app restarts |
-| 3 | Microphone died after the first command | The command loop restarts after **every** command, after every TTS announcement, on `notListening`/`done`, and via an 8-second watchdog. A dead TTS engine can no longer freeze the loop (all `speak()` calls are timeout-protected) |
-| 4 | No wake-word activation | Optional **Wake Word mode**: say "রিউ" / "রিউ ভিশন" / "সহায়ক" / "hey assistant" → the assistant primes for 12 seconds and accepts the next command. Toggle in Settings |
-| 5 | The primary command "সামনে কী আছে দেখো" was not detected | The matcher was rebuilt: word-boundary containment, trailing-verb tolerance (দেখো/বলো/শোনাও…), polite prefixes, and a conservative fuzzy pass (Levenshtein ≥ 0.85) for recogniser noise. Covered by unit tests |
-| 6 | No sound in the output on some phones | New `TtsEngineService`: picks Google TTS when present, probes bn-BD → bn-IN → bn voices with graceful fallback, requests audio focus on every utterance (`focus: true`), and every speak call is hang-proof. A one-tap **কণ্ঠস্বর পরীক্ষা** in Settings reports the engine/language actually used |
-| 7 | Chat did not show the user's real command | The chat now shows the **Bengali text actually spoken** (or the canonical command label) as the user message, followed by the captured image and the AI answer |
-| 8 | Conversation lost on restart | Full **conversation history persistence** (last 200 messages incl. images/videos) restored automatically on the chat screen |
-| 9 | No photo/video control by voice | New commands: **"ছবি তোলো"** (capture + save + show in chat) and **"ভিডিও রেকর্ড করো" / "ভিডিও বন্ধ করো"** (silent recording so the voice loop stays live, live red banner + stop button, auto-stop after 5 minutes, tap the video bubble to play) |
-| 10 | Device compatibility | Explicit microphone + camera permission requests, camera resolution fallback chain (high → medium → low), CPU-first backend, GPU optional |
+| 1 | **The model never downloaded** — the app stopped with "ডেভেলপার Hugging Face টোকেন যোগ করা হয়নি" because the previous build required a compiled-in developer token that was never set | **Bulletproof 3-path authentication chain**: bundled developer token (optional) → stored Hugging Face login → **restored proven old-version in-app Hugging Face login** (one tap, one time). The download now works on every build |
+| 2 | The in-app email Sign Up / Sign In screen is gone | Removed completely — the app opens straight to the model download page, like the old version |
+| 3 | Model download stopped when the app went to the background | `allowCellular: true` (mobile-data downloads), foreground-service notification, storage-low guard removed, **auto-retry/auto-resume** (up to 5 attempts) and full recovery after app restarts |
+| 4 | Microphone died after the first command | The command loop restarts after **every** command, after every TTS announcement, on `notListening`/`done`, and via an 8-second watchdog. A dead TTS engine can no longer freeze the loop (all `speak()` calls are timeout-protected) |
+| 5 | No wake-word activation | Optional **Wake Word mode**: say "রিউ" / "রিউ ভিশন" / "সহায়ক" / "hey assistant" → the assistant primes for 12 seconds and accepts the next command. Toggle in Settings |
+| 6 | The primary command "সামনে কী আছে দেখো" was not detected | The matcher was rebuilt: word-boundary containment, trailing-verb tolerance (দেখো/বলো/শোনাও…), polite prefixes, and a conservative fuzzy pass (Levenshtein ≥ 0.85) for recogniser noise. Covered by unit tests |
+| 7 | No sound in the output on some phones | New `TtsEngineService`: picks Google TTS when present, probes bn-BD → bn-IN → bn voices with graceful fallback, requests audio focus on every utterance (`focus: true`), and **auto-retries with engine re-configuration** when an utterance produces no sound. A one-tap **কণ্ঠস্বর পরীক্ষা** in Settings reports the engine/language actually used |
+| 8 | Chat did not show the user's real command | The chat now shows the **Bengali text actually spoken** (or the canonical command label) as the user message, followed by the captured image and the AI answer |
+| 9 | Conversation lost on restart | Full **conversation history persistence** (last 200 messages incl. images/videos) restored automatically on the chat screen |
+| 10 | No photo/video control by voice | New commands: **"ছবি তোলো"** (capture + save + show in chat) and **"ভিডিও রেকর্ড করো" / "ভিডিও বন্ধ করো"** (silent recording so the voice loop stays live, live red banner + stop button, auto-stop after 5 minutes, tap the video bubble to play) |
+| 11 | Device compatibility | Explicit microphone + camera permission requests, camera resolution fallback chain (high → medium → low), **automatic GPU → CPU fallback** when a phone's GPU cannot load the model, CPU-first backend |
 
 ## What this version does
 
@@ -39,13 +40,15 @@ The original app used an 8BitDo controller as a fast hardware shortcut layer. Th
 ```text
 App opens
    ↓
-Sign Up / Sign In (email + password)
+Model download page (no sign-up / sign-in screen)
    ↓
-Consent checkbox (অ্যাকাউন্ট তথ্য নিরাপদে ব্যবহৃত হবে)
+Access resolved automatically:
+   • developer token compiled in → 100% automatic, no login ever
+   • previous Hugging Face login stored → automatic
+   • otherwise → user presses ডাউনলোড once →
+       one-time Hugging Face login (in-app browser) → token saved
    ↓
-Automatic Hugging Face authentication (developer token, invisible to the user)
-   ↓
-Automatic model download (background-safe, notification progress)
+Model download (background-safe, notification progress, resumable)
    ↓
 Download complete → Voice assistant ready
 ```
@@ -103,15 +106,29 @@ Chat shows: user command + captured image + AI answer
 Microphone returns to listening automatically
 ```
 
-## Developer setup (one time, REQUIRED for automatic downloads)
+## Deployment (GitHub Actions APK build — recommended)
 
-The end user never sees Hugging Face. Downloads authenticate with your own read token:
+The APK is built automatically by `.github/workflows/build-apk.yml` on every push to `main`.
+Download it from **Actions → Build Android APK → artifacts → gemma-vision-bangla-apk**.
 
-1. Open https://huggingface.co/google/gemma-3n-E2B-it-litert-preview with the release account and accept the model license.
-2. Create a **Read** token at https://huggingface.co/settings/tokens.
-3. Paste it into `lib/download_page/config/constants.dart` (`hfAppToken`), or build with
-   `flutter build apk --release --dart-define=HF_APP_TOKEN=hf_your_token`.
-4. Rebuild — done.
+**How authentication behaves in the APK:**
+
+- **Without any secret (default):** the app works out of the box. Each user does a ONE-TIME
+  Hugging Face login from the download page (one tap, in-app browser). The login is stored
+  and every later download is fully automatic. If the model license was not accepted yet,
+  the app opens the license page and lets the user continue right after accepting.
+
+- **Optional — fully automatic for everyone:** add the repository secret
+  `HF_APP_TOKEN` (GitHub → Settings → Secrets and variables → Actions → New repository secret):
+
+  1. Open https://huggingface.co/google/gemma-3n-E2B-it-litert-preview with your release
+     account and accept the model license (one time).
+  2. Create a **Read** token at https://huggingface.co/settings/tokens (starts with `hf_`).
+  3. Add it as the secret `HF_APP_TOKEN` and re-run the workflow.
+
+  The workflow compiles it in with `--dart-define=HF_APP_TOKEN=…`. End users then never
+  see any login at all. Keep the token secret — anyone who extracts it could download
+  gated models under your account.
 
 ## Chat history & media
 
@@ -121,7 +138,7 @@ The end user never sees Hugging Face. Downloads authenticate with your own read 
 
 ## Privacy & battery notes
 
-- Accounts live only on the device (salted SHA-256 password hash in local storage).
+- No account system — nothing to sign up for; the optional Hugging Face login token stays on the device.
 - The microphone is only active while the app is on screen — never in the background.
 - The global wakelock was removed; downloads rely on the WorkManager foreground service, and recording uses a short-lived wakelock.
 

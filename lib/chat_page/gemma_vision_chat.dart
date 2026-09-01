@@ -3,7 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_gemma/pigeon.g.dart';
 
-import '../auth/auth_page.dart';
 import '../error_recovery_page.dart';
 import '../settings_page.dart';
 import 'config/system_prompts.dart';
@@ -350,16 +349,6 @@ class _ChatPageState extends State<ChatPage>
       final newSystemContext = result['systemContext'] as String?;
       final newBackend = result['backend'] as PreferredBackend?;
       final wakeWordMode = result['wakeWordMode'] as bool?;
-      final signedOut = result['signedOut'] as bool? ?? false;
-
-      if (signedOut) {
-        // Session cleared — back to the auth screen.
-        if (!mounted) return;
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (_) => const AuthPage()),
-        );
-        return;
-      }
 
       if (wakeWordMode != null) {
         await _speechService?.setWakeWordMode(wakeWordMode);

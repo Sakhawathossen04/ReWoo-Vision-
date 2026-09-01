@@ -6,8 +6,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_downloader/flutter_downloader.dart';
 
-import 'package:gemma_chat/auth/auth_page.dart';
-import 'package:gemma_chat/auth/auth_service.dart';
 import 'package:gemma_chat/download_page/model_download_page.dart';
 
 /// Top-level callback function for handling download progress updates.
@@ -51,17 +49,14 @@ Future<void> main() async {
   // the app. Background downloads rely on the WorkManager foreground service
   // instead, and the voice assistant manages the screen normally.
 
-  // Priority 1: skip straight to the assistant when the user already
-  // signed in; otherwise show the simple email + password + consent screen.
-  final bool signedIn = await AuthService.hasSession();
-
-  runApp(MyApp(startSignedIn: signedIn));
+  // No sign-up / sign-in step: the app goes straight to the model download
+  // page, exactly like the old version. Authentication (developer token or a
+  // one-time Hugging Face login) is resolved on that page automatically.
+  runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key, required this.startSignedIn});
-
-  final bool startSignedIn;
+  const MyApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -69,9 +64,8 @@ class MyApp extends StatelessWidget {
       title: 'ReWoo Vision',
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
 
-      // First run: Sign Up / Sign In → consent → automatic model download.
-      // Returning users: straight to the download/chat pipeline.
-      home: startSignedIn ? const ModelDownloadPage() : const AuthPage(),
+      // App open → model download (auto when possible) → voice assistant.
+      home: const ModelDownloadPage(),
     );
   }
 }

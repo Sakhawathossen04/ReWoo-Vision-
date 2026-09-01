@@ -1,6 +1,34 @@
 // download_page/models/models.dart
 import 'package:flutter_downloader/flutter_downloader.dart';
 
+// OAuth token data with expiry validation (Hugging Face login)
+class AuthTokenData {
+  final String accessToken;
+  final String? refreshToken;
+  final DateTime expiryTime;
+
+  AuthTokenData({
+    required this.accessToken,
+    this.refreshToken,
+    required this.expiryTime,
+  });
+
+  // Check if token has expired (compares with current time)
+  bool get isExpired => DateTime.now().isAfter(expiryTime);
+
+  Map<String, dynamic> toJson() => {
+    'accessToken': accessToken,
+    'refreshToken': refreshToken,
+    'expiryTime': expiryTime.toIso8601String(),
+  };
+
+  factory AuthTokenData.fromJson(Map<String, dynamic> json) => AuthTokenData(
+    accessToken: json['accessToken'],
+    refreshToken: json['refreshToken'],
+    expiryTime: DateTime.parse(json['expiryTime']),
+  );
+}
+
 // Download progress data with percentage calculation
 class DownloadProgress {
   final int totalBytes;

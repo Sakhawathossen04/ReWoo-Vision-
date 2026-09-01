@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_gemma/pigeon.g.dart';
 
-import 'auth/auth_service.dart';
 import 'chat_page/services/tts_engine_service.dart';
 import 'chat_page/voice/bengali_voice_commands.dart';
 
@@ -54,7 +53,6 @@ class _SettingsPageState extends State<SettingsPage> {
       'systemContext': _systemContextController.text.trim(),
       'backend': _selectedBackend,
       'wakeWordMode': _wakeWordMode,
-      'signedOut': false,
     });
   }
 
@@ -88,41 +86,6 @@ class _SettingsPageState extends State<SettingsPage> {
       }
     } finally {
       if (mounted) setState(() => _testingTts = false);
-    }
-  }
-
-  Future<void> _signOut() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('লগআউট করবেন?'),
-        content: const Text(
-          'অ্যাকাউন্ট থেকে লগআউট করলে আবার সাইন ইন করতে হবে। '
-          'ডাউনলোড করা মডেল ও ছবি-ভিডিও ফোনেই থাকবে।',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('বাতিল'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('লগআউট'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed == true) {
-      await AuthService.signOut();
-      if (mounted) {
-        Navigator.of(context).pop({
-          'systemContext': _systemContextController.text.trim(),
-          'backend': _selectedBackend,
-          'wakeWordMode': _wakeWordMode,
-          'signedOut': true,
-        });
-      }
     }
   }
 
@@ -253,16 +216,6 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
               ],
-            ),
-          ),
-          const SizedBox(height: 14),
-          _section(
-            title: 'অ্যাকাউন্ট',
-            child: ListTile(
-              leading: const Icon(Icons.logout_rounded),
-              title: const Text('লগআউট'),
-              subtitle: const Text('অ্যাকাউন্ট থেকে বেরিয়ে যান'),
-              onTap: _signOut,
             ),
           ),
           const SizedBox(height: 14),

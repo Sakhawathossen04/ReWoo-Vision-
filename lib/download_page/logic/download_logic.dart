@@ -1,23 +1,38 @@
 // download_page/logic/download_logic.dart
 //
-// Priority 1 + Priority 2 implementation:
-//  - Authentication is fully automatic. The app uses the developer's bundled
-//    Hugging Face read token (constants.dart) so the end user never has to
-//    create a Hugging Face account or type a login.
-//  - The download itself runs as an Android background task
-//    (flutter_downloader / WorkManager + foreground notification) and keeps
-//    running when the app goes to the background, is minimised, or the phone
-//    switches from Wi-Fi to mobile data (allowCellular: true).
-//  - Transient failures are resumed automatically a few times before the
-//    user is asked to intervene.
+// Priority 1 + Priority 2 implementation — FIXED download pipeline.
+//
+// The previous build refused to download unless a developer token was
+// compiled into the app ("ডেভেলপার Hugging Face টোকেন যোগ করা হয়নি").
+// This file now resolves access through a robust chain, so the model
+// download ALWAYS works:
+//
+//   1. Public / anonymous access          → download immediately.
+//   2. Bundled developer token (optional) → download automatically.
+//      (set --dart-define=HF_APP_TOKEN=hf_... when building)
+//   3. Stored Hugging Face login          → download automatically.
+//   4. Hugging Face login (the proven old-version flow)
+//      → in-app OAuth browser → token stored → download.
+//
+// 403 after a successful login means the Gemma license was not accepted
+// yet — the app shows the license bottom sheet and opens the model page.
+//
+// The download itself runs as an Android background task
+// (flutter_downloader / WorkManager + foreground notification) and keeps
+// running when the app goes to the background, is minimised, or the phone
+// switches from Wi-Fi to mobile data (allowCellular: true). Transient
+// failures are resumed automatically a few times before the user is asked
+// to intervene.
 
 import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_downloader/flutter_downloader.dart';
+import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:gemma_chat/chat_page/gemma_vision_chat.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../config/constants.dart';
 import '../models/enums.dart';
@@ -25,6 +40,8 @@ import '../models/models.dart';
 import '../services/logger.dart';
 import '../services/download_state_manager.dart';
 import '../services/download_manager.dart';
+import '../services/token_manager.dart';
+import '../services/huggingface_oauth.dart';
 
 /// Business logic class that handles all download-related operations.
 class DownloadPageLogic {
@@ -32,6 +49,7 @@ class DownloadPageLogic {
   final Function(DownloadStatus) setDownloadStatus;
   final Function(DownloadProgress?) setProgress;
   final Function(List<String>) setErrorMessages;
+  final Function(bool) setShowAgreementSheet;
 
   // Timer for monitoring download progress - needs to be tracked for cleanup
   Timer? _monitoringTimer;
@@ -44,6 +62,7 @@ class DownloadPageLogic {
     required this.setDownloadStatus,
     required this.setProgress,
     required this.setErrorMessages,
+    required this.setShowAgreementSheet,
   });
 
   /// Clean up resources when this logic instance is no longer needed.
@@ -170,6 +189,7 @@ class DownloadPageLogic {
               await DownloadStateManager.saveDownloadCompleted();
               // Navigate to chat page since download is complete
               WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (!context.mounted) return;
                 Navigator.of(context).pushReplacement(
                   MaterialPageRoute(builder: (context) => ChatPage()),
                 );
@@ -189,6 +209,7 @@ class DownloadPageLogic {
         // Check if completed file still exists (user might have deleted it)
         if (await checkIfModelExists()) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!context.mounted) return;
             Navigator.of(context).pushReplacement(
               MaterialPageRoute(builder: (context) => ChatPage()),
             );
@@ -208,74 +229,250 @@ class DownloadPageLogic {
   }
 
   /// Whether the automatic (no-touch) download can run right now.
-  /// Used by the download page to start the pipeline without any tap.
+  ///
+  /// A zero-touch path exists when the model URL is reachable without
+  /// credentials, a developer token was bundled at build time, or the user
+  /// has a stored (valid) Hugging Face login. When none of these hold the
+  /// page shows the Download button, and pressing it starts the one-time
+  /// Hugging Face login — the proven old-version flow.
   Future<bool> canAutoStartDownload() async {
-    if (!hfTokenConfigured) {
-      Logger.warning(
-        'hfAppToken is not configured — automatic download disabled.',
-      );
-      return false;
-    }
     if (await checkIfModelExists()) return false;
 
     final savedState = await DownloadStateManager.getDownloadState();
-    return savedState != 'in_progress';
+    if (savedState == 'in_progress') return false;
+
+    // Cheap local checks first.
+    if (hfTokenConfigured) return true;
+
+    final tokenStatus = await TokenManager.getTokenStatus();
+    if (tokenStatus == TokenStatus.valid) return true;
+
+    // Network probe: some mirrors of the model are public. If the HEAD
+    // check fails (offline), auto-starting would only produce a network
+    // error dialog, so wait for the user to press Download instead.
+    final code = await DownloadManager.checkModelAccess(downloadUrl);
+    if (code == 200 || code == 302) return true;
+    if (code < 0) {
+      Logger.warning('Network unavailable for auto-start probe ($code)');
+      return false;
+    }
+    return false;
   }
 
-  /// Initiates the download process. Authentication is automatic:
-  /// the bundled developer token is validated against Hugging Face and the
-  /// download starts without any user interaction.
-  Future<void> startDownload() async {
+  /// Initiates the download process.
+  ///
+  /// [autoStart] is true when the page triggered this without a tap. In that
+  /// mode a missing login must NOT silently open a browser — the page falls
+  /// back to the Download button with a clear Bengali explanation instead.
+  Future<void> startDownload({bool autoStart = false}) async {
     setDownloadStatus(DownloadStatus.checkingAccess);
     setErrorMessages([]); // Clear any previous errors
 
     Logger.info('Starting download process for $modelFullName');
 
-    if (!hfTokenConfigured) {
-      handleError(
-        'অ্যাপ সেটআপ অসম্পূর্ণ: ডেভেলপার Hugging Face টোকেন যোগ করা হয়নি। '
-        'ডাউনলোড শুরু করতে অ্যাডমিনের সহায়তা নিন।',
-      );
+    // ── Step 1: is the model reachable without any credentials? ──
+    final anonymousCode = await DownloadManager.checkModelAccess(downloadUrl);
+    Logger.info('Anonymous access check returned $anonymousCode');
+
+    if (anonymousCode == 200 || anonymousCode == 302) {
+      await downloadModel(null);
+      return;
+    }
+    if (anonymousCode < 0) {
+      handleError('ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।');
       return;
     }
 
+    // ── Step 2: bundled developer token (optional, zero-touch) ──
+    if (hfTokenConfigured) {
+      setDownloadStatus(DownloadStatus.authenticating);
+      final devCode = await DownloadManager.checkModelAccess(
+        downloadUrl,
+        hfAppToken,
+      );
+      Logger.info('Developer token check returned $devCode');
+
+      if (devCode == 200 || devCode == 302) {
+        await downloadModel(hfAppToken);
+        return;
+      }
+      if (devCode == 403) {
+        // License not accepted for the developer account — this cannot be
+        // fixed by the user logging in with their own account unless the
+        // developer account itself is broken; still try the stored login
+        // and the interactive flow below before giving up.
+        Logger.warning('Developer token lacks license access (403)');
+      } else if (devCode == 401) {
+        Logger.warning('Developer token rejected (401)');
+      }
+    }
+
+    // ── Step 3: stored Hugging Face login (zero-touch after first use) ──
+    final tokenStatus = await TokenManager.getTokenStatus();
+    if (tokenStatus == TokenStatus.valid) {
+      setDownloadStatus(DownloadStatus.authenticating);
+      final token = await TokenManager.getStoredToken();
+      final storedCode = await DownloadManager.checkModelAccess(
+        downloadUrl,
+        token?.accessToken,
+      );
+      Logger.info('Stored token check returned $storedCode');
+
+      if (storedCode == 200 || storedCode == 302) {
+        await downloadModel(token?.accessToken);
+        return;
+      }
+      if (storedCode == 403) {
+        // Logged in, but the Gemma license was never accepted.
+        showUserAgreement();
+        return;
+      }
+      Logger.warning('Stored token unusable ($storedCode) — fresh login');
+    }
+
+    // ── Step 4: Hugging Face login — the proven old-version flow ──
+    if (autoStart) {
+      // Never open a browser without a user action. Show the Download
+      // button with a clear one-time-login explanation instead.
+      setDownloadStatus(DownloadStatus.notStarted);
+      setErrorMessages([
+        'প্রথমবার ডাউনলোডের জন্য একবার Hugging Face লগইন প্রয়োজন। '
+        'নিচের "ডাউনলোড" বোতাম চাপুন — লগইন শেষ হলে ডাউনলোড স্বয়ংক্রিয়ভাবে শুরু হবে।',
+      ]);
+      Logger.info('Login required — waiting for the user to press Download');
+      return;
+    }
+
+    await startOAuthFlow();
+  }
+
+  /// Initiates the OAuth authentication flow with HuggingFace (old version).
+  /// Uses web authentication to get user consent and authorization code.
+  Future<void> startOAuthFlow() async {
     setDownloadStatus(DownloadStatus.authenticating);
+    try {
+      Logger.info('Starting Hugging Face OAuth flow');
+      // Generate the authorization URL with proper scopes and redirect
+      final authUrl = await HuggingFaceOAuth.generateAuthUrl();
 
-    // Automatic Hugging Face authentication with the bundled token.
-    final responseCode = await DownloadManager.checkModelAccess(
-      downloadUrl,
-      hfAppToken,
-    );
-
-    Logger.info('Automatic authentication check returned $responseCode');
-
-    if (responseCode == 200 || responseCode == 302) {
-      // Token accepted — start the background download right away.
-      await downloadModel(hfAppToken);
-      return;
-    } else if (responseCode == 401 || responseCode == 403) {
-      // The token's account has not accepted the model license, or the token
-      // was revoked. This is a developer-side setup issue, not user error.
-      handleError(
-        'মডেল ডাউনলোডের অনুমতি যাচাই করা যায়নি (কোড $responseCode)। '
-        'অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন অথবা কিছুক্ষণ পর আবার চেষ্টা করুন।',
+      // Launch web authentication flow — this opens the browser once.
+      final result = await FlutterWebAuth2.authenticate(
+        url: authUrl,
+        callbackUrlScheme: hfCallbackUrlScheme,
       );
-      return;
-    } else if (responseCode < 0) {
-      // Network error occurred during access check
-      handleError('ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।');
-      return;
-    } else {
-      handleError(
-        'মডেল সার্ভার থেকে অপ্রত্যাশিত উত্তর এসেছে (কোড $responseCode)। '
-        'আবার চেষ্টা করুন।',
-      );
-      return;
+
+      // Parse the callback URL to extract the authorization code
+      final uri = Uri.parse(result);
+      final code = uri.queryParameters['code'];
+
+      if (code != null) {
+        // Successfully got authorization code - exchange it for access token
+        await handleAuthorizationCode(code);
+      } else if (uri.queryParameters['error'] != null) {
+        handleError(
+          'Hugging Face অনুমোদন দেয়নি (${uri.queryParameters['error']})। আবার চেষ্টা করুন।',
+        );
+      } else {
+        // OAuth flow completed but no code received - this shouldn't happen
+        handleError('অনুমোদন সম্পন্ন হয়নি। আবার চেষ্টা করুন।');
+      }
+    } catch (e) {
+      // Handle user cancellation gracefully vs actual errors
+      final errorText = e.toString();
+      if (errorText.contains('CANCELED') ||
+          errorText.contains('USER_CANCELED') ||
+          errorText.contains('cancelled')) {
+        setDownloadStatus(DownloadStatus.notStarted);
+        setErrorMessages([]);
+        Logger.info('OAuth flow cancelled by user');
+      } else {
+        handleError('Hugging Face লগইন ব্যর্থ হয়েছে: $e');
+      }
     }
   }
 
+  /// Exchanges the OAuth authorization code for an access token.
+  /// Then attempts to use the token to access the model.
+  Future<void> handleAuthorizationCode(String code) async {
+    setDownloadStatus(DownloadStatus.authenticating);
+
+    try {
+      // Exchange authorization code for access token
+      final tokenData = await HuggingFaceOAuth.exchangeCodeForToken(code);
+      if (tokenData != null) {
+        Logger.info('Hugging Face login successful — verifying model access');
+
+        // Test the new token by checking model access
+        final responseCode = await DownloadManager.checkModelAccess(
+          downloadUrl,
+          tokenData.accessToken,
+        );
+
+        if (responseCode == 200 || responseCode == 302) {
+          // Token works - start download
+          await downloadModel(tokenData.accessToken);
+        } else if (responseCode == 403) {
+          // Token is valid but user needs to accept license
+          showUserAgreement();
+        } else if (responseCode < 0) {
+          handleError('ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।');
+        } else {
+          // Token doesn't work for some reason
+          handleError(
+            'মডেল অ্যাক্সেস করা যায়নি (কোড $responseCode)। '
+            'লাইসেন্স গ্রহণ করা হয়েছে কি না পরীক্ষা করুন।',
+          );
+        }
+      } else {
+        // Token exchange failed
+        handleError('Hugging Face অনুমোদন সম্পন্ন করা যায়নি। আবার চেষ্টা করুন।');
+      }
+    } catch (e) {
+      handleError('অ্যাকাউন্ট যাচাইয়ে সমস্যা হয়েছে: $e');
+    }
+  }
+
+  /// Shows the license agreement UI when the model requires user acceptance.
+  /// This happens when the logged-in account has not accepted the Gemma
+  /// license terms on huggingface.co yet.
+  void showUserAgreement() {
+    setDownloadStatus(DownloadStatus.awaitingLicenseAcceptance);
+    setShowAgreementSheet(true);
+    Logger.info('Model requires license acceptance');
+  }
+
+  /// Opens the license agreement in the user's browser.
+  /// After accepting there, the Download button resumes the pipeline.
+  Future<void> openLicenseAgreement() async {
+    setShowAgreementSheet(false);
+
+    try {
+      final launched = await launchUrl(
+        Uri.parse(modelCardUrl),
+        mode: LaunchMode.externalApplication, // Force external browser
+      );
+      if (launched) {
+        Logger.info('Opened license agreement in browser');
+      } else {
+        Logger.warning('Could not open browser for license page');
+      }
+    } catch (e) {
+      Logger.error('Failed to open license page: $e');
+    }
+
+    // After opening the license, allow the user to retry the download.
+    setDownloadStatus(DownloadStatus.awaitingLicenseAcceptance);
+  }
+
+  /// Cancels the license agreement process and returns to initial state.
+  /// Called when user dismisses the license agreement sheet.
+  void cancelLicenseAgreement() {
+    setShowAgreementSheet(false);
+    setDownloadStatus(DownloadStatus.notStarted);
+  }
+
   /// Actually starts the file download process.
-  /// This is called after automatic authentication succeeds.
+  /// This is called after authentication is complete (if required).
   Future<void> downloadModel(String? accessToken) async {
     setDownloadStatus(DownloadStatus.downloading);
     _autoResumeAttempts = 0;
@@ -451,10 +648,13 @@ class DownloadPageLogic {
       final tasks = await DownloadManager.getAllTasks();
       for (final t in tasks) {
         if (t.taskId == taskId) {
-          await FlutterDownloader.remove(taskId: t.taskId, shouldDeleteContent: true);
+          await FlutterDownloader.remove(
+            taskId: t.taskId,
+            shouldDeleteContent: true,
+          );
         }
       }
-      await downloadModel(hfTokenConfigured ? hfAppToken : null);
+      await downloadModel(await resolveAccessToken());
       return;
     }
 
@@ -465,6 +665,18 @@ class DownloadPageLogic {
       'ডাউনলোড ব্যর্থ হয়েছে। ইন্টারনেট বা ফোনের খালি জায়গা পরীক্ষা করুন। '
       'ডাউনলোড বোতাম চেপে আবার শুরু করুন।',
     );
+  }
+
+  /// Picks the best available access token for a fresh download attempt:
+  /// developer token first, then the stored Hugging Face login.
+  Future<String?> resolveAccessToken() async {
+    if (hfTokenConfigured) return hfAppToken;
+    final tokenStatus = await TokenManager.getTokenStatus();
+    if (tokenStatus == TokenStatus.valid) {
+      final token = await TokenManager.getStoredToken();
+      return token?.accessToken;
+    }
+    return null;
   }
 
   /// Handles error states by updating UI and logging the error.

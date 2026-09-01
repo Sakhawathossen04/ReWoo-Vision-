@@ -1,6 +1,7 @@
 // services/gemma_service.dart - Further Optimized Version
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_gemma/core/model.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:flutter_gemma/pigeon.g.dart';
@@ -22,6 +23,11 @@ class GemmaService {
 
   /// Initialize model with selected backend (CPU/GPU) - idempotent operation
   /// Uses local model file if available to avoid redundant downloads
+  ///
+  /// Device compatibility: some phones ship GPU drivers that cannot run the
+  /// model (white screens / instant crashes / load timeouts). When the
+  /// requested backend fails to load, we automatically fall back to CPU —
+  /// slower but working on every device.
   Future<void> init(PreferredBackend backend) async {
     if (_initialised && _currentBackend == backend) return;
 
@@ -34,20 +40,45 @@ class GemmaService {
     final dir = await getApplicationDocumentsDirectory();
     final path = '${dir.path}/gemma-3n-E2B-it-int4.task';
 
+    if (!File(path).existsSync()) {
+      throw Exception(
+        'মডেল ফাইল পাওয়া যায়নি। ইন্টারনেট সংযোগ রেখে অ্যাপটি আবার খুলুন — '
+        'মডেল স্বয়ংক্রিয়ভাবে ডাউনলোড হবে।',
+      );
+    }
+
     // Point plugin to local model file if it exists and plugin hasn't loaded one yet
-    if (!await _gemma.modelManager.isModelInstalled &&
-        File(path).existsSync()) {
+    if (!await _gemma.modelManager.isModelInstalled) {
       await _gemma.modelManager.setModelPath(path);
     }
 
-    // Create model instance with vision support and performance settings
-    _model ??= await _gemma.createModel(
-      preferredBackend: backend,
-      modelType: ModelType.gemmaIt, // Instruction-tuned variant
-      supportImage: true, // Enable vision capabilities
-      maxTokens: 8192, // Context window size
-      maxNumImages: 1, // Single image per message
-    );
+    // Create model instance with vision support and performance settings.
+    // GPU failures (unsupported Adreno/Mali drivers, OEM battery killers)
+    // transparently fall back to CPU so the assistant keeps working.
+    try {
+      _model ??= await _gemma.createModel(
+        preferredBackend: backend,
+        modelType: ModelType.gemmaIt, // Instruction-tuned variant
+        supportImage: true, // Enable vision capabilities
+        maxTokens: 8192, // Context window size
+        maxNumImages: 1, // Single image per message
+      );
+    } catch (e) {
+      if (backend == PreferredBackend.gpu) {
+        debugPrint('[GemmaService] GPU load failed ($e) — retrying with CPU');
+        _model = null;
+        _model = await _gemma.createModel(
+          preferredBackend: PreferredBackend.cpu,
+          modelType: ModelType.gemmaIt,
+          supportImage: true,
+          maxTokens: 8192,
+          maxNumImages: 1,
+        );
+        backend = PreferredBackend.cpu;
+      } else {
+        rethrow;
+      }
+    }
 
     // Create persistent chat session with optimized parameters
     _chat ??= await _model!.createChat(
