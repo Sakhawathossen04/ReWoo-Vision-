@@ -3,80 +3,204 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("kotlin-android")
-    // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+
+    // Flutter Gradle Plugin must be applied after
+    // the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// Release signing: read key.properties (keystore path + credentials).
-// Falls back to the debug key when key.properties is absent so the project
-// still builds out of the box.
+// ============================================================================
+// RELEASE SIGNING
+// ============================================================================
+//
+// Reads key.properties when available.
+//
+// If key.properties does not exist, the project falls back to the debug
+// signing key so development/test builds still work.
+//
+
 val keystoreProperties = Properties()
-val keystorePropertiesFile = rootProject.file("key.properties")
+
+val keystorePropertiesFile =
+    rootProject.file("key.properties")
+
 if (keystorePropertiesFile.exists()) {
-    keystorePropertiesFile.inputStream().use { keystoreProperties.load(it) }
+    keystorePropertiesFile.inputStream().use {
+        keystoreProperties.load(it)
+    }
 }
+
+// ============================================================================
+// ANDROID CONFIGURATION
+// ============================================================================
 
 android {
     namespace = "com.tommasogiovannini.gemma"
+
+    // Keep compile SDK controlled by the installed Flutter version.
+    //
+    // IMPORTANT:
+    // compileSdk can remain modern even though Android 9 is the minimum
+    // supported Android version.
     compileSdk = flutter.compileSdkVersion
-    // NDK pin removed: no native code is compiled in this project (prebuilt
-    // MediaPipe .so libraries ship inside the flutter_gemma AAR). Skipping
-    // the NDK avoids a 2 GB SDK download on the build machine.
-    //ndkVersion = "27.0.12077973"
-    //ndkVersion = flutter.ndkVersion
+
+    // ------------------------------------------------------------------------
+    // NDK
+    // ------------------------------------------------------------------------
+    //
+    // The project currently relies on prebuilt native libraries supplied by
+    // dependencies such as flutter_gemma / MediaPipe.
+    //
+    // Do not force an NDK version here unless a dependency/build error later
+    // specifically requires one.
+    //
+    // ndkVersion = flutter.ndkVersion
+
+    // ------------------------------------------------------------------------
+    // JAVA
+    // ------------------------------------------------------------------------
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility =
+            JavaVersion.VERSION_11
+
+        targetCompatibility =
+            JavaVersion.VERSION_11
     }
+
+    // ------------------------------------------------------------------------
+    // KOTLIN
+    // ------------------------------------------------------------------------
 
     kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11.toString()
+        jvmTarget =
+            JavaVersion.VERSION_11.toString()
     }
 
+    // ------------------------------------------------------------------------
+    // DEFAULT APP CONFIG
+    // ------------------------------------------------------------------------
+
     defaultConfig {
-        applicationId = "com.tommasogiovannini.gemma"
-        minSdk = 24
-        targetSdk = flutter.targetSdkVersion
-        versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        applicationId =
+            "com.tommasogiovannini.gemma"
+
+        // ====================================================================
+        // ANDROID 9 MINIMUM SUPPORT
+        // ====================================================================
+        //
+        // Android 9 = API level 28.
+        //
+        // This means:
+        //
+        // Android 8 / 8.1 and lower
+        // -> APK will NOT install.
+        //
+        // Android 9 and newer
+        // -> APK is allowed to install.
+        //
+        minSdk = 28
+
+        // ====================================================================
+        // KEEP TARGET SDK MODERN
+        // ====================================================================
+        //
+        // DO NOT set targetSdk = 28.
+        //
+        // A modern targetSdk is still compatible with Android 9 as long as
+        // minSdk is 28 or lower.
+        //
+        targetSdk =
+            flutter.targetSdkVersion
+
+        versionCode =
+            flutter.versionCode
+
+        versionName =
+            flutter.versionName
     }
+
+    // ------------------------------------------------------------------------
+    // SIGNING
+    // ------------------------------------------------------------------------
 
     signingConfigs {
         if (keystorePropertiesFile.exists()) {
             create("release") {
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
-                storeFile = rootProject.file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
+                keyAlias =
+                    keystoreProperties["keyAlias"]
+                        as String
+
+                keyPassword =
+                    keystoreProperties["keyPassword"]
+                        as String
+
+                storeFile =
+                    rootProject.file(
+                        keystoreProperties["storeFile"]
+                            as String
+                    )
+
+                storePassword =
+                    keystoreProperties["storePassword"]
+                        as String
             }
         }
     }
 
-    // No NDK on the build machine: keep every prebuilt .so as shipped
-    // (upstream AARs are already stripped) so AGP never needs llvm-strip.
+    // ------------------------------------------------------------------------
+    // NATIVE LIBRARY PACKAGING
+    // ------------------------------------------------------------------------
+    //
+    // flutter_gemma / MediaPipe ship prebuilt native .so libraries.
+    //
+    // Keep them as shipped and avoid requiring llvm-strip during packaging.
+    //
+
     packaging {
         jniLibs {
-            keepDebugSymbols += "**/*.so"
+            keepDebugSymbols +=
+                "**/*.so"
         }
     }
+
+    // ------------------------------------------------------------------------
+    // BUILD TYPES
+    // ------------------------------------------------------------------------
 
     buildTypes {
         release {
+            // Shrink unused Java/Kotlin code.
             isMinifyEnabled = true
+
+            // Remove unused Android resources.
             isShrinkResources = true
-            signingConfig = if (keystorePropertiesFile.exists()) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+
+            // Use real release key when key.properties exists.
+            //
+            // Otherwise use debug signing for local/testing builds.
+            signingConfig =
+                if (keystorePropertiesFile.exists()) {
+                    signingConfigs
+                        .getByName("release")
+                } else {
+                    signingConfigs
+                        .getByName("debug")
+                }
+
             proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
+                getDefaultProguardFile(
+                    "proguard-android-optimize.txt"
+                ),
                 "proguard-rules.pro"
             )
         }
     }
 }
+
+// ============================================================================
+// FLUTTER
+// ============================================================================
 
 flutter {
     source = "../.."
