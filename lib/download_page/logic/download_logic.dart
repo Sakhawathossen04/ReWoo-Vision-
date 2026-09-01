@@ -1,33 +1,39 @@
 // download_page/logic/download_logic.dart
 //
-// Reliable large-model download pipeline.
+// ReWoo Vision large-model download orchestration.
 //
-// IMPORTANT DATA-SAFETY RULE:
+// Core safety rules:
 //
-// Normal download failures MUST NEVER delete already downloaded model bytes.
+// 1. Network/system failure NEVER deletes partial download data.
+// 2. App restart NEVER starts a fresh task while a recoverable task exists.
+// 3. 100% progress is NOT treated as success until the final model is verified.
+// 4. background_downloader/DownloadManager owns .part -> final rename.
+// 5. This layer verifies the resulting final model again.
+// 6. Recoverable failure is persisted as "failed_recoverable".
+// 7. Only explicit user cancel/delete destroys partial download data.
 //
-// Network failure
-// Android worker failure
-// Wi-Fi -> mobile switch
-// app restart
-// temporary server error
-// retry unavailable
+// Optional SHA-256:
 //
-// => KEEP partial file.
+// Build with:
 //
-// A partial model is deleted ONLY when:
+//   flutter build apk \
+//     --dart-define=MODEL_SHA256=<64-character-official-sha256>
 //
-// 1. The user explicitly chooses "Cancel Download", OR
-// 2. FlutterDownloader reports COMPLETE but the final file fails validation.
-//
-// This prevents a 3+ GB model that reached 10%, 50%, 95%, etc. from being
-// unnecessarily restarted from zero.
+// If MODEL_SHA256 is absent, size validation remains mandatory.
+// Hashing is streamed; the 3+ GB model is never loaded entirely into RAM.
 
 import 'dart:async';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+
+// Temporary compatibility import.
+//
+// DownloadManager currently exposes flutter_downloader-compatible DownloadTask
+// objects while the project migrates internally to background_downloader.
 import 'package:flutter_downloader/flutter_downloader.dart';
+
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:gemma_chat/chat_page/gemma_vision_chat.dart';
 import 'package:http/http.dart' as http;
@@ -37,13 +43,12 @@ import 'package:url_launcher/url_launcher.dart';
 import '../config/constants.dart';
 import '../models/enums.dart';
 import '../models/models.dart';
-import '../services/logger.dart';
-import '../services/download_state_manager.dart';
 import '../services/download_manager.dart';
-import '../services/token_manager.dart';
+import '../services/download_state_manager.dart';
 import '../services/huggingface_oauth.dart';
+import '../services/logger.dart';
+import '../services/token_manager.dart';
 
-/// Business logic for the model-download page.
 class DownloadPageLogic {
   // ===========================================================================
   // UI CALLBACKS
@@ -55,31 +60,38 @@ class DownloadPageLogic {
   final Function(bool) setShowAgreementSheet;
 
   // ===========================================================================
-  // DOWNLOAD MONITOR
+  // MONITORING
   // ===========================================================================
 
   Timer? _monitoringTimer;
-
-  // ===========================================================================
-  // AUTO RECOVERY
-  // ===========================================================================
 
   int _autoResumeAttempts = 0;
 
   static const int _maxAutoResumeAttempts = 5;
 
   // ===========================================================================
-  // BYTE-ACCURATE PROGRESS
+  // PROGRESS
   // ===========================================================================
 
   int _expectedBytes = 0;
 
   int _lastSampledPercent = -1;
 
+  int _lastPersistedPercent = -1;
+
   DateTime _lastSampleTime = DateTime.now();
 
-  /// Smoothed bytes/second.
   double _downloadRate = 0;
+
+  // ===========================================================================
+  // OPTIONAL MODEL SHA-256
+  // ===========================================================================
+
+  static const String _configuredModelSha256 =
+      String.fromEnvironment(
+    'MODEL_SHA256',
+    defaultValue: '',
+  );
 
   // ===========================================================================
   // CONSTRUCTOR
@@ -102,17 +114,8 @@ class DownloadPageLogic {
   }
 
   // ===========================================================================
-  // TASK HELPERS
+  // BASIC TASK HELPERS
   // ===========================================================================
-
-  bool _isRecoverableStatus(
-    DownloadTaskStatus status,
-  ) {
-    return status == DownloadTaskStatus.running ||
-        status == DownloadTaskStatus.enqueued ||
-        status == DownloadTaskStatus.paused ||
-        status == DownloadTaskStatus.failed;
-  }
 
   bool _isModelTask(
     DownloadTask task,
@@ -120,18 +123,17 @@ class DownloadPageLogic {
     return task.filename == modelName;
   }
 
-  String? _taskFilePath(
-    DownloadTask task,
+  bool _isRecoverableStatus(
+    DownloadTaskStatus status,
   ) {
-    final filename = task.filename;
-
-    if (filename == null ||
-        filename.isEmpty ||
-        task.savedDir.isEmpty) {
-      return null;
-    }
-
-    return '${task.savedDir}/$filename';
+    return status ==
+            DownloadTaskStatus.running ||
+        status ==
+            DownloadTaskStatus.enqueued ||
+        status ==
+            DownloadTaskStatus.paused ||
+        status ==
+            DownloadTaskStatus.failed;
   }
 
   DownloadTask? _latestTaskWhere(
@@ -146,7 +148,8 @@ class DownloadPageLogic {
       }
 
       if (selected == null ||
-          task.timeCreated > selected.timeCreated) {
+          task.timeCreated >
+              selected.timeCreated) {
         selected = task;
       }
     }
@@ -154,355 +157,75 @@ class DownloadPageLogic {
     return selected;
   }
 
-  /// Returns the newest task that still contains recoverable progress.
-  DownloadTask? _latestRecoverableModelTask(
+  DownloadTask?
+      _latestRecoverableModelTask(
     List<DownloadTask> tasks,
   ) {
     return _latestTaskWhere(
       tasks,
       (task) =>
           _isModelTask(task) &&
-          _isRecoverableStatus(task.status),
+          _isRecoverableStatus(
+            task.status,
+          ),
     );
   }
 
-  /// Returns the newest model task that Android believes completed.
-  DownloadTask? _latestCompletedModelTask(
+  DownloadTask?
+      _findTaskById(
     List<DownloadTask> tasks,
+    String taskId,
   ) {
-    return _latestTaskWhere(
-      tasks,
-      (task) =>
-          _isModelTask(task) &&
-          task.status == DownloadTaskStatus.complete,
+    for (final task in tasks) {
+      if (task.taskId ==
+          taskId) {
+        return task;
+      }
+    }
+
+    return null;
+  }
+
+  String? _taskFinalFilePath(
+    DownloadTask task,
+  ) {
+    final filename =
+        task.filename;
+
+    if (filename == null ||
+        filename.trim().isEmpty ||
+        task.savedDir.trim().isEmpty) {
+      return null;
+    }
+
+    return '${task.savedDir}/$filename';
+  }
+
+  String? _taskPartialFilePath(
+    DownloadTask task,
+  ) {
+    final finalPath =
+        _taskFinalFilePath(
+      task,
     );
-  }
 
-  // ===========================================================================
-  // MODEL VALIDATION
-  // ===========================================================================
-
-  /// Returns true only when a sufficiently large completed model exists.
-  ///
-  /// CRITICAL:
-  ///
-  /// An undersized file is NOT automatically deleted anymore.
-  ///
-  /// If the file belongs to:
-  ///
-  /// running / enqueued / paused / failed task
-  ///
-  /// it is treated as valid PARTIAL DOWNLOAD DATA and preserved.
-  ///
-  /// Only a file belonging to a task already marked COMPLETE is considered
-  /// corrupt when it is undersized.
-  Future<bool> checkIfModelExists() async {
-    try {
-      final tasks =
-          await DownloadManager.getAllTasks();
-
-      final documents =
-          await getApplicationDocumentsDirectory();
-
-      final minValid =
-          (expectedModelFileSize *
-                  modelSizeTolerance)
-              .round();
-
-      // -----------------------------------------------------------------------
-      // Build every possible model location.
-      // -----------------------------------------------------------------------
-
-      final candidatePaths = <String>{
-        '${documents.path}/$modelName',
-      };
-
-      for (final task in tasks) {
-        if (!_isModelTask(task)) {
-          continue;
-        }
-
-        final path =
-            _taskFilePath(task);
-
-        if (path != null) {
-          candidatePaths.add(path);
-        }
-      }
-
-      for (final path in candidatePaths) {
-        final file = File(path);
-
-        if (!await file.exists()) {
-          continue;
-        }
-
-        final size =
-            await file.length();
-
-        // ---------------------------------------------------------------------
-        // Valid final model.
-        // ---------------------------------------------------------------------
-
-        if (size >= minValid) {
-          Logger.info(
-            'Found valid model file: '
-            '$path ($size bytes)',
-          );
-
-          setDownloadStatus(
-            DownloadStatus.completed,
-          );
-
-          return true;
-        }
-
-        // ---------------------------------------------------------------------
-        // File is undersized.
-        //
-        // Determine whether this is:
-        //
-        // A) legitimate partial data, or
-        // B) corrupt "completed" output.
-        // ---------------------------------------------------------------------
-
-        DownloadTask? associatedTask;
-
-        for (final task in tasks) {
-          if (!_isModelTask(task)) {
-            continue;
-          }
-
-          if (_taskFilePath(task) == path) {
-            associatedTask = task;
-
-            if (_isRecoverableStatus(
-              task.status,
-            )) {
-              break;
-            }
-          }
-        }
-
-        // ---------------------------------------------------------------------
-        // Recoverable partial download.
-        //
-        // NEVER DELETE.
-        // ---------------------------------------------------------------------
-
-        if (associatedTask != null &&
-            _isRecoverableStatus(
-              associatedTask.status,
-            )) {
-          Logger.info(
-            'Preserving partial model file: '
-            '$path '
-            '($size bytes, task=${associatedTask.taskId}, '
-            'status=${associatedTask.status})',
-          );
-
-          continue;
-        }
-
-        // ---------------------------------------------------------------------
-        // Android reported COMPLETE but final model is too small.
-        //
-        // This is the one automatic corruption case where deletion is safe.
-        // ---------------------------------------------------------------------
-
-        if (associatedTask != null &&
-            associatedTask.status ==
-                DownloadTaskStatus.complete) {
-          Logger.error(
-            'Completed model is corrupt/truncated: '
-            '$path '
-            '($size bytes, minimum=$minValid).',
-          );
-
-          try {
-            await file.delete();
-
-            Logger.info(
-              'Deleted corrupt completed model: $path',
-            );
-          } catch (e) {
-            Logger.error(
-              'Could not delete corrupt completed model: $e',
-            );
-          }
-
-          // File was already explicitly handled above.
-          // Remove only the stale DB/task record.
-          try {
-            await FlutterDownloader.remove(
-              taskId:
-                  associatedTask.taskId,
-              shouldDeleteContent: false,
-            );
-          } catch (e) {
-            Logger.warning(
-              'Could not remove corrupt completed task record: $e',
-            );
-          }
-
-          continue;
-        }
-
-        // ---------------------------------------------------------------------
-        // Orphan undersized file.
-        //
-        // We cannot prove that it is corrupt.
-        //
-        // Preserve it instead of destroying potentially gigabytes of user data.
-        // ---------------------------------------------------------------------
-
-        Logger.warning(
-          'Found undersized model artifact without a recoverable task: '
-          '$path ($size bytes). '
-          'Keeping it conservatively.',
-        );
-      }
-
-      Logger.debug(
-        'No verified completed model found.',
-      );
-
-      return false;
-    } catch (e) {
-      Logger.error(
-        'Model validation failed: $e',
-      );
-
-      return false;
+    if (finalPath == null) {
+      return null;
     }
+
+    return '$finalPath.part';
+  }
+
+  Future<String>
+      _defaultPartialFilePath() async {
+    final dir =
+        await getApplicationDocumentsDirectory();
+
+    return '${dir.path}/$modelName.part';
   }
 
   // ===========================================================================
-  // SAFE ARTIFACT CLEANUP
-  // ===========================================================================
-
-  /// Conservative cleanup.
-  ///
-  /// Previous behaviour deleted:
-  ///
-  /// - *.part
-  /// - undersized modelName
-  ///
-  /// before starting a download.
-  ///
-  /// That could destroy several GB of resumable data.
-  ///
-  /// New behaviour:
-  ///
-  /// - non-empty partial file   -> KEEP
-  /// - failed-task partial      -> KEEP
-  /// - paused partial           -> KEEP
-  /// - running partial          -> KEEP
-  /// - orphan partial           -> KEEP conservatively
-  /// - zero-byte orphan temp    -> DELETE
-  ///
-  /// Corrupt COMPLETE files are handled separately by checkIfModelExists().
-  Future<void> _cleanupStaleModelArtifacts() async {
-    try {
-      final dir =
-          await getApplicationDocumentsDirectory();
-
-      final tasks =
-          await DownloadManager.getAllTasks();
-
-      final protectedPaths =
-          <String>{};
-
-      for (final task in tasks) {
-        if (!_isModelTask(task) ||
-            !_isRecoverableStatus(
-              task.status,
-            )) {
-          continue;
-        }
-
-        final path =
-            _taskFilePath(task);
-
-        if (path != null) {
-          protectedPaths.add(path);
-        }
-      }
-
-      await for (final entity in dir.list()) {
-        if (entity is! File) {
-          continue;
-        }
-
-        final name =
-            entity.uri.pathSegments.last
-                .toLowerCase();
-
-        final lowerModel =
-            modelName.toLowerCase();
-
-        final relevant =
-            name == lowerModel ||
-                name.startsWith(
-                  '$lowerModel.',
-                ) ||
-                name.startsWith(
-                  lowerModel,
-                );
-
-        if (!relevant) {
-          continue;
-        }
-
-        final size =
-            await entity.length();
-
-        // Anything tied to a native recoverable task is protected.
-        if (protectedPaths.contains(
-          entity.path,
-        )) {
-          Logger.info(
-            'Keeping active/recoverable download artifact: '
-            '${entity.path} ($size bytes)',
-          );
-
-          continue;
-        }
-
-        // Never automatically destroy non-empty partial data.
-        if (size > 0) {
-          Logger.info(
-            'Keeping non-empty model artifact conservatively: '
-            '${entity.path} ($size bytes)',
-          );
-
-          continue;
-        }
-
-        // Zero-byte orphan files contain no useful progress.
-        try {
-          await entity.delete();
-
-          Logger.info(
-            'Removed zero-byte stale artifact: '
-            '${entity.path}',
-          );
-        } catch (e) {
-          Logger.warning(
-            'Could not remove zero-byte artifact '
-            '${entity.path}: $e',
-          );
-        }
-      }
-    } catch (e) {
-      Logger.error(
-        'Safe stale-artifact cleanup failed: $e',
-      );
-    }
-  }
-
-  // ===========================================================================
-  // REMOTE FILE SIZE
+  // EXPECTED SIZE
   // ===========================================================================
 
   Future<int> _resolveExpectedBytes(
@@ -518,53 +241,682 @@ class DownloadPageLogic {
         Uri.parse(downloadUrl),
       );
 
-      if (accessToken != null) {
+      request.followRedirects =
+          true;
+
+      if (accessToken != null &&
+          accessToken.trim().isNotEmpty) {
         request.headers[
             'Authorization'] =
             'Bearer $accessToken';
       }
 
-      request.followRedirects = true;
-
       final response =
           await client
               .send(request)
               .timeout(
-        const Duration(seconds: 20),
+        const Duration(
+          seconds: 20,
+        ),
       );
 
       final length =
-          response.contentLength ?? 0;
+          response.contentLength ??
+              0;
 
       if (length > 0) {
         Logger.info(
-          'Remote model size: $length bytes',
+          'Remote model Content-Length: '
+          '$length bytes',
         );
 
         return length;
       }
+    } on TimeoutException catch (e) {
+      Logger.warning(
+        'Model size lookup timed out: $e',
+      );
+    } on SocketException catch (e) {
+      Logger.warning(
+        'Model size lookup network error: $e',
+      );
     } catch (e) {
       Logger.warning(
-        'Could not read Content-Length: $e',
+        'Could not resolve model size: $e',
       );
     } finally {
       client.close();
     }
 
+    Logger.info(
+      'Using bundled expected model size: '
+      '$expectedModelFileSize bytes',
+    );
+
     return expectedModelFileSize;
   }
 
   // ===========================================================================
-  // EXISTING TASK RECOVERY
+  // FINAL MODEL VERIFICATION
   // ===========================================================================
 
-  /// Reuses an already existing model task instead of starting another one.
+  Future<_ModelVerificationResult>
+      _verifyFinalFile(
+    File file, {
+    required bool verifyChecksum,
+  }) async {
+    if (!await file.exists()) {
+      return const _ModelVerificationResult(
+        valid: false,
+        reason: _ModelVerificationFailure.missing,
+        size: 0,
+      );
+    }
+
+    final size =
+        await file.length();
+
+    // Use the published model size as the stable verification baseline.
+    //
+    // HEAD responses can vary across CDN/proxy implementations, so the
+    // published constant is safer for corruption detection.
+    final minimumValidSize =
+        (expectedModelFileSize *
+                modelSizeTolerance)
+            .round();
+
+    if (size <
+        minimumValidSize) {
+      return _ModelVerificationResult(
+        valid: false,
+        reason:
+            _ModelVerificationFailure.tooSmall,
+        size: size,
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Optional SHA-256
+    // -----------------------------------------------------------------------
+
+    if (verifyChecksum &&
+        _configuredModelSha256
+            .trim()
+            .isNotEmpty) {
+      final expectedHash =
+          _configuredModelSha256
+              .trim()
+              .toLowerCase();
+
+      final validHashFormat =
+          RegExp(
+        r'^[0-9a-f]{64}$',
+      ).hasMatch(
+        expectedHash,
+      );
+
+      if (!validHashFormat) {
+        return _ModelVerificationResult(
+          valid: false,
+          reason:
+              _ModelVerificationFailure
+                  .invalidChecksumConfiguration,
+          size: size,
+        );
+      }
+
+      Logger.info(
+        'Calculating SHA-256 for final model...',
+      );
+
+      try {
+        // Streaming hash:
+        // no 3+ GB memory allocation.
+        final digest =
+            await sha256
+                .bind(
+                  file.openRead(),
+                )
+                .first;
+
+        final actualHash =
+            digest
+                .toString()
+                .toLowerCase();
+
+        if (actualHash !=
+            expectedHash) {
+          Logger.error(
+            'Model SHA-256 mismatch. '
+            'Expected=$expectedHash '
+            'Actual=$actualHash',
+          );
+
+          return _ModelVerificationResult(
+            valid: false,
+            reason:
+                _ModelVerificationFailure
+                    .checksumMismatch,
+            size: size,
+          );
+        }
+
+        Logger.info(
+          'Model SHA-256 verified successfully.',
+        );
+      } catch (e) {
+        Logger.error(
+          'SHA-256 verification failed: $e',
+        );
+
+        return _ModelVerificationResult(
+          valid: false,
+          reason:
+              _ModelVerificationFailure
+                  .checksumCalculationFailed,
+          size: size,
+        );
+      }
+    }
+
+    return _ModelVerificationResult(
+      valid: true,
+      reason:
+          _ModelVerificationFailure.none,
+      size: size,
+    );
+  }
+
+  /// Verifies whether a usable final model already exists.
   ///
-  /// Returns true when a task existed and this method handled it.
-  Future<bool> _reuseExistingModelTask() async {
+  /// Recoverable partial data is NEVER deleted here.
+  ///
+  /// A final file may be deleted only when we can prove it belongs to a
+  /// completed result and verification fails.
+  Future<bool> checkIfModelExists() async {
+    try {
+      // Calling getAllTasks() also gives DownloadManager an opportunity to
+      // finish a completed background task's:
+      //
+      // model.task.part -> model.task
+      final tasks =
+          await DownloadManager
+              .getAllTasks();
+
+      final recovery =
+          await DownloadStateManager
+              .getRecoveryState();
+
+      final documents =
+          await getApplicationDocumentsDirectory();
+
+      final candidatePaths =
+          <String>{
+        '${documents.path}/$modelName',
+      };
+
+      for (final task in tasks) {
+        if (!_isModelTask(
+          task,
+        )) {
+          continue;
+        }
+
+        final path =
+            _taskFinalFilePath(
+          task,
+        );
+
+        if (path != null) {
+          candidatePaths.add(
+            path,
+          );
+        }
+      }
+
+      for (final path in candidatePaths) {
+        final file =
+            File(path);
+
+        if (!await file.exists()) {
+          continue;
+        }
+
+        DownloadTask?
+            associatedTask;
+
+        for (final task in tasks) {
+          if (!_isModelTask(
+            task,
+          )) {
+            continue;
+          }
+
+          if (_taskFinalFilePath(
+                task,
+              ) ==
+              path) {
+            associatedTask =
+                task;
+
+            if (_isRecoverableStatus(
+              task.status,
+            )) {
+              break;
+            }
+          }
+        }
+
+        // -------------------------------------------------------------------
+        // Legacy active downloader may write directly to modelName.
+        //
+        // Never mistake that active partial file for a corrupt final file.
+        // -------------------------------------------------------------------
+
+        if (associatedTask != null &&
+            _isRecoverableStatus(
+              associatedTask.status,
+            )) {
+          Logger.info(
+            'Keeping recoverable model artifact: '
+            '$path, '
+            'task=${associatedTask.taskId}, '
+            'status=${associatedTask.status}',
+          );
+
+          continue;
+        }
+
+        // If the state was already hash-verified previously, startup only
+        // performs the cheap size check.
+        //
+        // Hash verification happens again on a newly completed download.
+        final verifyChecksum =
+            !recovery.verified;
+
+        final verification =
+            await _verifyFinalFile(
+          file,
+          verifyChecksum:
+              verifyChecksum,
+        );
+
+        if (verification.valid) {
+          Logger.info(
+            'Verified model found: '
+            '$path '
+            '(${verification.size} bytes)',
+          );
+
+          setDownloadStatus(
+            DownloadStatus.completed,
+          );
+
+          return true;
+        }
+
+        // -------------------------------------------------------------------
+        // Only delete an invalid FINAL file when it is provably a completed
+        // output.
+        // -------------------------------------------------------------------
+
+        final finalWasSupposedToBeComplete =
+            associatedTask?.status ==
+                    DownloadTaskStatus
+                        .complete ||
+                recovery.completed ||
+                recovery.status ==
+                    DownloadStateManager
+                        .verifying;
+
+        if (finalWasSupposedToBeComplete) {
+          Logger.error(
+            'Completed final model failed verification: '
+            '$path '
+            'reason=${verification.reason}',
+          );
+
+          try {
+            await file.delete();
+
+            Logger.info(
+              'Deleted verified corrupt final model: '
+              '$path',
+            );
+          } catch (e) {
+            Logger.error(
+              'Could not delete corrupt final model: $e',
+            );
+          }
+
+          continue;
+        }
+
+        // Unknown/orphan file:
+        //
+        // preserve it rather than destroying potentially useful data.
+        Logger.warning(
+          'Unverified model artifact found at '
+          '$path. '
+          'It is being preserved because completion '
+          'cannot be proven.',
+        );
+      }
+
+      return false;
+    } catch (e, st) {
+      Logger.error(
+        'Model verification failed: $e',
+      );
+
+      Logger.error(
+        '$st',
+      );
+
+      return false;
+    }
+  }
+
+  // ===========================================================================
+  // FINAL DOWNLOAD COMPLETION
+  // ===========================================================================
+
+  Future<bool> _verifyCompletedDownload({
+    required String taskId,
+    required BuildContext? context,
+  }) async {
+    final tasks =
+        await DownloadManager
+            .getAllTasks();
+
+    final task =
+        _findTaskById(
+      tasks,
+      taskId,
+    );
+
+    final total =
+        _expectedBytes > 0
+            ? _expectedBytes
+            : expectedModelFileSize;
+
+    final partialPath =
+        task != null
+            ? _taskPartialFilePath(
+                task,
+              )
+            : await _defaultPartialFilePath();
+
+    await DownloadStateManager
+        .saveDownloadVerifying(
+      taskId: taskId,
+      downloadedBytes: total,
+      expectedBytes: total,
+      partialFilePath:
+          partialPath,
+    );
+
+    Logger.info(
+      'Native task reached completion. '
+      'Performing application-level final verification.',
+    );
+
+    // DownloadManager.getAllTasks() performs manager-level finalization for
+    // background_downloader:
+    //
+    // modelName.part
+    //   -> size verification
+    //   -> atomic rename
+    //   -> modelName
+    //
+    // We now independently verify the final output again.
+    final valid =
+        await checkIfModelExists();
+
+    if (!valid) {
+      await DownloadStateManager
+          .saveDownloadFailedRecoverable(
+        taskId: taskId,
+        progressPercent: 100,
+        downloadedBytes:
+            total,
+        expectedBytes:
+            total,
+        partialFilePath:
+            partialPath,
+      );
+
+      setDownloadStatus(
+        DownloadStatus.failed,
+      );
+
+      setErrorMessages([
+        'মডেল ডাউনলোড ১০০% দেখালেও final verification ব্যর্থ হয়েছে। '
+            'ফাইল অসম্পূর্ণ, corrupt, অথবা checksum মিলেনি। '
+            'Corrupt final file থাকলে সেটি সরানো হয়েছে। '
+            'আংশিক recoverable data স্বয়ংক্রিয়ভাবে মুছে ফেলা হয়নি।',
+      ]);
+
+      Logger.error(
+        'Model completion verification failed.',
+      );
+
+      return false;
+    }
+
+    await DownloadStateManager
+        .saveDownloadCompleted(
+      downloadedBytes:
+          total,
+      expectedBytes:
+          total,
+      verified: true,
+    );
+
+    setDownloadStatus(
+      DownloadStatus.completed,
+    );
+
+    setErrorMessages([]);
+
+    setProgress(
+      DownloadProgress(
+        totalBytes: total,
+        downloadedBytes:
+            total,
+        downloadRate: 0,
+        remainingTime:
+            Duration.zero,
+        status:
+            DownloadTaskStatus.complete,
+      ),
+    );
+
+    Logger.info(
+      'Model download finalized and verified successfully.',
+    );
+
+    if (context != null &&
+        context.mounted) {
+      Navigator.of(context)
+          .pushReplacement(
+        MaterialPageRoute(
+          builder: (_) =>
+              const ChatPage(),
+        ),
+      );
+    }
+
+    return true;
+  }
+
+  // ===========================================================================
+  // SAFE STALE-ARTIFACT CLEANUP
+  // ===========================================================================
+
+  /// Removes ONLY zero-byte stale files.
+  ///
+  /// Non-empty .part files are always preserved unless explicit user delete
+  /// occurs elsewhere.
+  Future<void>
+      _cleanupStaleModelArtifacts() async {
+    try {
+      final dir =
+          await getApplicationDocumentsDirectory();
+
+      final tasks =
+          await DownloadManager
+              .getAllTasks();
+
+      final protectedPaths =
+          <String>{};
+
+      for (final task in tasks) {
+        if (!_isModelTask(
+              task,
+            ) ||
+            !_isRecoverableStatus(
+              task.status,
+            )) {
+          continue;
+        }
+
+        final finalPath =
+            _taskFinalFilePath(
+          task,
+        );
+
+        final partPath =
+            _taskPartialFilePath(
+          task,
+        );
+
+        if (finalPath != null) {
+          protectedPaths.add(
+            finalPath,
+          );
+        }
+
+        if (partPath != null) {
+          protectedPaths.add(
+            partPath,
+          );
+        }
+      }
+
+      await for (final entity
+          in dir.list()) {
+        if (entity is! File) {
+          continue;
+        }
+
+        final filename =
+            entity.uri.pathSegments
+                .last
+                .toLowerCase();
+
+        final lowerModel =
+            modelName.toLowerCase();
+
+        final relevant =
+            filename ==
+                    lowerModel ||
+                filename ==
+                    '$lowerModel.part' ||
+                filename.startsWith(
+                  '$lowerModel.',
+                );
+
+        if (!relevant) {
+          continue;
+        }
+
+        final size =
+            await entity.length();
+
+        if (protectedPaths
+            .contains(
+          entity.path,
+        )) {
+          Logger.debug(
+            'Preserving active model artifact: '
+            '${entity.path}',
+          );
+
+          continue;
+        }
+
+        // Non-empty unknown file:
+        // preserve conservatively.
+        if (size > 0) {
+          Logger.info(
+            'Preserving non-empty model artifact: '
+            '${entity.path} '
+            '($size bytes)',
+          );
+
+          continue;
+        }
+
+        try {
+          await entity.delete();
+
+          Logger.info(
+            'Deleted zero-byte stale artifact: '
+            '${entity.path}',
+          );
+        } catch (e) {
+          Logger.warning(
+            'Could not delete zero-byte artifact: $e',
+          );
+        }
+      }
+    } catch (e) {
+      Logger.error(
+        'Safe artifact cleanup failed: $e',
+      );
+    }
+  }
+
+  // ===========================================================================
+  // RESTORE PROGRESS VARIABLES FROM PERSISTENT STATE
+  // ===========================================================================
+
+  Future<void>
+      _restoreProgressState() async {
+    final recovery =
+        await DownloadStateManager
+            .getRecoveryState();
+
+    _expectedBytes =
+        recovery.expectedBytes > 0
+            ? recovery.expectedBytes
+            : expectedModelFileSize;
+
+    _lastSampledPercent =
+        recovery.progressPercent;
+
+    _lastPersistedPercent =
+        recovery.progressPercent;
+
+    _lastSampleTime =
+        DateTime.now();
+
+    _downloadRate = 0;
+  }
+
+  // ===========================================================================
+  // REUSE EXISTING TASK
+  // ===========================================================================
+
+  Future<bool>
+      _reuseExistingModelTask({
+    BuildContext? context,
+  }) async {
     try {
       final tasks =
-          await DownloadManager.getAllTasks();
+          await DownloadManager
+              .getAllTasks();
 
       final existing =
           _latestRecoverableModelTask(
@@ -576,36 +928,83 @@ class DownloadPageLogic {
       }
 
       Logger.info(
-        'Found existing recoverable model task: '
+        'Existing recoverable model task found: '
         '${existing.taskId}, '
         'status=${existing.status}, '
         'progress=${existing.progress}%',
       );
 
+      await _restoreProgressState();
+
       DownloadManager.attachToTask(
         existing.taskId,
       );
 
-      await DownloadStateManager
-          .saveDownloadInProgress(
-        existing.taskId,
+      final total =
+          _expectedBytes > 0
+              ? _expectedBytes
+              : expectedModelFileSize;
+
+      final downloaded =
+          ((existing.progress / 100) *
+                  total)
+              .round();
+
+      final partialPath =
+          _taskPartialFilePath(
+        existing,
       );
 
       switch (existing.status) {
+        // -------------------------------------------------------------------
+        // ACTIVE
+        // -------------------------------------------------------------------
+
         case DownloadTaskStatus.running:
         case DownloadTaskStatus.enqueued:
+          await DownloadStateManager
+              .saveDownloadInProgress(
+            existing.taskId,
+            progressPercent:
+                existing.progress,
+            downloadedBytes:
+                downloaded,
+            expectedBytes:
+                total,
+            partialFilePath:
+                partialPath,
+          );
+
           setDownloadStatus(
             DownloadStatus.downloading,
           );
 
           monitorDownload(
             existing.taskId,
-            null,
+            context,
           );
 
           return true;
 
+        // -------------------------------------------------------------------
+        // PAUSED
+        // -------------------------------------------------------------------
+
         case DownloadTaskStatus.paused:
+          await DownloadStateManager
+              .saveDownloadPaused(
+            taskId:
+                existing.taskId,
+            progressPercent:
+                existing.progress,
+            downloadedBytes:
+                downloaded,
+            expectedBytes:
+                total,
+            partialFilePath:
+                partialPath,
+          );
+
           final resumed =
               await DownloadManager
                   .resumeDownload();
@@ -614,6 +1013,14 @@ class DownloadPageLogic {
             await DownloadStateManager
                 .saveDownloadInProgress(
               resumed,
+              progressPercent:
+                  existing.progress,
+              downloadedBytes:
+                  downloaded,
+              expectedBytes:
+                  total,
+              partialFilePath:
+                  partialPath,
             );
 
             setDownloadStatus(
@@ -622,19 +1029,48 @@ class DownloadPageLogic {
 
             monitorDownload(
               resumed,
-              null,
+              context,
             );
           } else {
-            _showPreservedProgressError(
-              'ডাউনলোডটি এখনই resume করা যায়নি। '
-              'আগের ডাউনলোড করা অংশ মুছে ফেলা হয়নি। '
-              'ইন্টারনেট সংযোগ পরীক্ষা করে আবার চেষ্টা করুন।',
+            await _markRecoverableFailure(
+              taskId:
+                  existing.taskId,
+              progressPercent:
+                  existing.progress,
+              downloadedBytes:
+                  downloaded,
+              expectedBytes:
+                  total,
+              partialFilePath:
+                  partialPath,
+              message:
+                  'ডাউনলোডটি pause অবস্থায় আছে, কিন্তু এখনই resume করা যায়নি। '
+                  'আগের ${existing.progress}% progress নিরাপদ রাখা হয়েছে। '
+                  'ইন্টারনেট সংযোগ ঠিক করে আবার চেষ্টা করুন।',
             );
           }
 
           return true;
 
+        // -------------------------------------------------------------------
+        // FAILED BUT RECOVERABLE
+        // -------------------------------------------------------------------
+
         case DownloadTaskStatus.failed:
+          await DownloadStateManager
+              .saveDownloadFailedRecoverable(
+            taskId:
+                existing.taskId,
+            progressPercent:
+                existing.progress,
+            downloadedBytes:
+                downloaded,
+            expectedBytes:
+                total,
+            partialFilePath:
+                partialPath,
+          );
+
           final retried =
               await DownloadManager
                   .retryDownload();
@@ -643,6 +1079,14 @@ class DownloadPageLogic {
             await DownloadStateManager
                 .saveDownloadInProgress(
               retried,
+              progressPercent:
+                  existing.progress,
+              downloadedBytes:
+                  downloaded,
+              expectedBytes:
+                  total,
+              partialFilePath:
+                  partialPath,
             );
 
             setDownloadStatus(
@@ -651,13 +1095,24 @@ class DownloadPageLogic {
 
             monitorDownload(
               retried,
-              null,
+              context,
             );
           } else {
-            _showPreservedProgressError(
-              'আগের ডাউনলোড task এখনই retry করা যায়নি। '
-              'আংশিক ডাউনলোড করা model file রাখা হয়েছে; '
-              'এটি স্বয়ংক্রিয়ভাবে delete করা হয়নি।',
+            await _markRecoverableFailure(
+              taskId:
+                  existing.taskId,
+              progressPercent:
+                  existing.progress,
+              downloadedBytes:
+                  downloaded,
+              expectedBytes:
+                  total,
+              partialFilePath:
+                  partialPath,
+              message:
+                  'আগের download task এখনই resume করা যায়নি। '
+                  'ডাউনলোড করা ${existing.progress}% data মুছে ফেলা হয়নি। '
+                  'আবার চেষ্টা করলে একই task recover করার চেষ্টা করা হবে।',
             );
           }
 
@@ -668,7 +1123,7 @@ class DownloadPageLogic {
       }
     } catch (e) {
       Logger.error(
-        'Existing-task recovery failed: $e',
+        'Existing task recovery failed: $e',
       );
 
       return false;
@@ -676,194 +1131,40 @@ class DownloadPageLogic {
   }
 
   // ===========================================================================
-  // STARTUP DOWNLOAD RECOVERY
+  // STARTUP RECOVERY
   // ===========================================================================
 
   Future<void> checkForOngoingDownloads(
     BuildContext context,
   ) async {
     try {
-      final savedState =
+      final recovery =
           await DownloadStateManager
-              .getDownloadState();
-
-      final savedTaskId =
-          await DownloadStateManager
-              .getDownloadTaskId();
+              .getRecoveryState();
 
       Logger.info(
-        'Checking download state - '
-        'saved: $savedState, '
-        'taskId: $savedTaskId',
+        'Persistent download recovery state: '
+        '$recovery',
       );
 
-      if (savedState ==
-              'in_progress' &&
-          savedTaskId != null) {
-        DownloadManager.attachToTask(
-          savedTaskId,
-        );
+      _expectedBytes =
+          recovery.expectedBytes > 0
+              ? recovery.expectedBytes
+              : expectedModelFileSize;
 
-        final tasks =
-            await DownloadManager
-                .getAllTasks();
+      // -----------------------------------------------------------------------
+      // COMPLETED + VERIFIED
+      // -----------------------------------------------------------------------
 
-        DownloadTask? task;
-
-        for (final candidate in tasks) {
-          if (candidate.taskId ==
-              savedTaskId) {
-            task = candidate;
-            break;
-          }
-        }
-
-        // ---------------------------------------------------------------------
-        // Native task disappeared.
-        //
-        // IMPORTANT:
-        // Do NOT clean/delete the partial file here.
-        // ---------------------------------------------------------------------
-
-        if (task == null) {
-          Logger.warning(
-            'Saved task $savedTaskId is no longer present in '
-            'FlutterDownloader. Partial file will be preserved.',
-          );
-
-          setDownloadStatus(
-            DownloadStatus.failed,
-          );
-
-          setErrorMessages([
-            'আগের ডাউনলোড task Android থেকে পাওয়া যাচ্ছে না। '
-                'ইতিমধ্যে ডাউনলোড করা model data মুছে ফেলা হয়নি। '
-                'ডাউনলোড recovery system আপডেটের পরে এটি পুনরায় ব্যবহার করা যাবে।',
-          ]);
-
-          return;
-        }
-
-        Logger.info(
-          'Recovered download task: '
-          '${task.taskId}, '
-          '${task.status}, '
-          '${task.progress}%',
-        );
-
-        switch (task.status) {
-          case DownloadTaskStatus.paused:
-            await resumeDownload();
-            return;
-
-          case DownloadTaskStatus.running:
-          case DownloadTaskStatus.enqueued:
-            setDownloadStatus(
-              DownloadStatus.downloading,
-            );
-
-            monitorDownload(
-              task.taskId,
-              context,
-            );
-
-            return;
-
-          case DownloadTaskStatus.failed:
-            Logger.info(
-              'Retrying preserved failed task.',
-            );
-
-            final retried =
-                await DownloadManager
-                    .retryDownload();
-
-            if (retried != null) {
-              await DownloadStateManager
-                  .saveDownloadInProgress(
-                retried,
-              );
-
-              setDownloadStatus(
-                DownloadStatus.downloading,
-              );
-
-              monitorDownload(
-                retried,
-                context,
-              );
-            } else {
-              _showPreservedProgressError(
-                'আগের ডাউনলোড এখনই resume করা যায়নি। '
-                'ডাউনলোড করা অংশ মুছে ফেলা হয়নি। '
-                'ইন্টারনেট সংযোগ ঠিক হলে আবার চেষ্টা করুন।',
-              );
-            }
-
-            return;
-
-          case DownloadTaskStatus.complete:
-            if (await checkIfModelExists()) {
-              await DownloadStateManager
-                  .saveDownloadCompleted();
-
-              WidgetsBinding.instance
-                  .addPostFrameCallback(
-                (_) {
-                  if (!context.mounted) {
-                    return;
-                  }
-
-                  Navigator.of(context)
-                      .pushReplacement(
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          const ChatPage(),
-                    ),
-                  );
-                },
-              );
-            } else {
-              // Completed task but final file failed validation.
-              //
-              // checkIfModelExists() already handles corrupt-complete cleanup.
-              setDownloadStatus(
-                DownloadStatus.failed,
-              );
-
-              setErrorMessages([
-                'ডাউনলোড সম্পূর্ণ দেখালেও model file অসম্পূর্ণ ছিল। '
-                    'Corrupt final file সরানো হয়েছে। আবার ডাউনলোড করুন।',
-              ]);
-            }
-
-            return;
-
-          case DownloadTaskStatus.canceled:
-            // An explicit user cancellation is handled by cancelDownload().
-            //
-            // If Android unexpectedly reports canceled, do not delete anything
-            // from this recovery path.
-            _showPreservedProgressError(
-              'ডাউনলোড task বাতিল অবস্থায় পাওয়া গেছে। '
-              'যদি কোনো আংশিক file থাকে সেটি স্বয়ংক্রিয়ভাবে মুছে ফেলা হয়নি।',
-            );
-
-            return;
-
-          case DownloadTaskStatus.undefined:
-            _showPreservedProgressError(
-              'আগের download task-এর অবস্থা নির্ধারণ করা যাচ্ছে না। '
-              'আংশিক model file মুছে ফেলা হয়নি।',
-            );
-
-            return;
-        }
-      }
-
-      if (savedState ==
-          'completed') {
+      if (recovery.status ==
+              DownloadStateManager
+                  .completed &&
+          recovery.verified) {
         if (await checkIfModelExists()) {
+          setDownloadStatus(
+            DownloadStatus.completed,
+          );
+
           WidgetsBinding.instance
               .addPostFrameCallback(
             (_) {
@@ -880,63 +1181,501 @@ class DownloadPageLogic {
               );
             },
           );
-        } else {
-          await DownloadStateManager
-              .clearDownloadState();
+
+          return;
         }
 
+        // Metadata said verified, but final model disappeared or became
+        // invalid. No partial file is destroyed here.
+        setDownloadStatus(
+          DownloadStatus.failed,
+        );
+
+        setErrorMessages([
+          'আগে verified model ছিল, কিন্তু final model file এখন পাওয়া যাচ্ছে না '
+              'অথবা file validation ব্যর্থ হয়েছে। নতুন করে model download করতে হবে।',
+        ]);
+
+        Logger.error(
+          'Persistent state said completed/verified but final model is invalid.',
+        );
+
         return;
       }
 
-      // No saved state.
+      // -----------------------------------------------------------------------
+      // VERIFYING
       //
-      // First check the final model.
-      if (await checkIfModelExists()) {
+      // App may have been killed after 100% but before final verification or
+      // .part -> final state was persisted.
+      // -----------------------------------------------------------------------
+
+      if (recovery.status ==
+          DownloadStateManager
+              .verifying) {
+        Logger.info(
+          'Recovering interrupted model verification.',
+        );
+
+        // getAllTasks() lets DownloadManager finalize any completed .part file.
+        final tasks =
+            await DownloadManager
+                .getAllTasks();
+
+        DownloadTask? task;
+
+        if (recovery.taskId !=
+            null) {
+          task =
+              _findTaskById(
+            tasks,
+            recovery.taskId!,
+          );
+        }
+
+        if (await checkIfModelExists()) {
+          await DownloadStateManager
+              .saveDownloadCompleted(
+            downloadedBytes:
+                recovery.downloadedBytes,
+            expectedBytes:
+                recovery.expectedBytes >
+                        0
+                    ? recovery
+                        .expectedBytes
+                    : expectedModelFileSize,
+            verified: true,
+          );
+
+          setDownloadStatus(
+            DownloadStatus.completed,
+          );
+
+          WidgetsBinding.instance
+              .addPostFrameCallback(
+            (_) {
+              if (!context.mounted) {
+                return;
+              }
+
+              Navigator.of(context)
+                  .pushReplacement(
+                MaterialPageRoute(
+                  builder: (_) =>
+                      const ChatPage(),
+                ),
+              );
+            },
+          );
+
+          return;
+        }
+
+        // If the task still exists and is not actually complete, recover it
+        // rather than starting over.
+        if (task != null &&
+            _isRecoverableStatus(
+              task.status,
+            )) {
+          DownloadManager.attachToTask(
+            task.taskId,
+          );
+
+          await _handleRecoveredTask(
+            task,
+            context,
+          );
+
+          return;
+        }
+
+        await DownloadStateManager
+            .saveDownloadFailedRecoverable(
+          taskId:
+              recovery.taskId,
+          progressPercent:
+              recovery.progressPercent,
+          downloadedBytes:
+              recovery.downloadedBytes,
+          expectedBytes:
+              recovery.expectedBytes,
+          partialFilePath:
+              recovery.partialFilePath,
+        );
+
+        setDownloadStatus(
+          DownloadStatus.failed,
+        );
+
+        setErrorMessages([
+          'মডেল ১০০% হওয়ার পর verification সম্পন্ন করা যায়নি। '
+              'Partial/final recovery data মুছে ফেলা হয়নি। '
+              'আবার চেষ্টা করলে verification/recovery পুনরায় চেষ্টা করা হবে।',
+        ]);
+
         return;
       }
 
-      // Then look for an existing native partial task.
-      await _reuseExistingModelTask();
-    } catch (e) {
-      Logger.error(
-        'Error checking ongoing downloads: $e',
+      // -----------------------------------------------------------------------
+      // DOWNLOADING / PAUSED / FAILED_RECOVERABLE
+      // -----------------------------------------------------------------------
+
+      if (recovery.isRecoverable) {
+        final tasks =
+            await DownloadManager
+                .getAllTasks();
+
+        DownloadTask? task;
+
+        if (recovery.taskId !=
+            null) {
+          task =
+              _findTaskById(
+            tasks,
+            recovery.taskId!,
+          );
+        }
+
+        // Exact task ID survived.
+        if (task != null) {
+          DownloadManager.attachToTask(
+            task.taskId,
+          );
+
+          await _handleRecoveredTask(
+            task,
+            context,
+          );
+
+          return;
+        }
+
+        // Task ID may have changed after native resume or a migration.
+        final latest =
+            _latestRecoverableModelTask(
+          tasks,
+        );
+
+        if (latest != null) {
+          Logger.warning(
+            'Saved task ID not found; '
+            'using newest recoverable model task '
+            '${latest.taskId}.',
+          );
+
+          DownloadManager.attachToTask(
+            latest.taskId,
+          );
+
+          await _handleRecoveredTask(
+            latest,
+            context,
+          );
+
+          return;
+        }
+
+        // -------------------------------------------------------------------
+        // IMPORTANT:
+        // Saved recovery state exists but native task disappeared.
+        //
+        // DO NOT start a fresh download automatically.
+        // DO NOT delete the saved partial path.
+        // -------------------------------------------------------------------
+
+        await DownloadStateManager
+            .saveDownloadFailedRecoverable(
+          taskId:
+              recovery.taskId,
+          progressPercent:
+              recovery.progressPercent,
+          downloadedBytes:
+              recovery.downloadedBytes,
+          expectedBytes:
+              recovery.expectedBytes,
+          partialFilePath:
+              recovery.partialFilePath,
+        );
+
+        setDownloadStatus(
+          DownloadStatus.failed,
+        );
+
+        setErrorMessages([
+          'আগের download task Android-এর task database-এ পাওয়া যাচ্ছে না। '
+              'তবে আগের progress এবং partial file information মুছে ফেলা হয়নি। '
+              'Fresh download স্বয়ংক্রিয়ভাবে শুরু করা হয়নি।',
+        ]);
+
+        return;
+      }
+
+      // -----------------------------------------------------------------------
+      // NO PERSISTED ACTIVE STATE
+      //
+      // First verify final model.
+      // -----------------------------------------------------------------------
+
+      if (await checkIfModelExists()) {
+        await DownloadStateManager
+            .saveDownloadCompleted(
+          downloadedBytes:
+              expectedModelFileSize,
+          expectedBytes:
+              expectedModelFileSize,
+          verified: true,
+        );
+
+        setDownloadStatus(
+          DownloadStatus.completed,
+        );
+
+        return;
+      }
+
+      // Native database may still contain a task even if SharedPreferences
+      // were lost/upgraded.
+      final reused =
+          await _reuseExistingModelTask(
+        context: context,
       );
 
-      // IMPORTANT:
-      // Never clear download state merely because recovery inspection failed.
-      //
-      // Clearing state here could orphan several GB of useful progress.
+      if (reused) {
+        return;
+      }
+
+      // Nothing exists.
+      setDownloadStatus(
+        DownloadStatus.notStarted,
+      );
+    } catch (e, st) {
+      Logger.error(
+        'Startup download recovery failed: $e',
+      );
+
+      Logger.error(
+        '$st',
+      );
+
       setDownloadStatus(
         DownloadStatus.failed,
       );
 
       setErrorMessages([
-        'আগের ডাউনলোডের অবস্থা পরীক্ষা করা যায়নি। '
-            'ডাউনলোড করা অংশ নিরাপদ রাখা হয়েছে।',
+        _friendlyExceptionMessage(
+          e,
+          fallback:
+              'আগের ডাউনলোডের অবস্থা পরীক্ষা করা যায়নি। '
+              'Partial download data নিরাপদ রাখা হয়েছে।',
+        ),
       ]);
     }
   }
 
+  Future<void> _handleRecoveredTask(
+    DownloadTask task,
+    BuildContext? context,
+  ) async {
+    final total =
+        _expectedBytes > 0
+            ? _expectedBytes
+            : expectedModelFileSize;
+
+    final downloaded =
+        ((task.progress / 100) *
+                total)
+            .round();
+
+    final partialPath =
+        _taskPartialFilePath(
+      task,
+    );
+
+    switch (task.status) {
+      case DownloadTaskStatus.running:
+      case DownloadTaskStatus.enqueued:
+        await DownloadStateManager
+            .saveDownloadInProgress(
+          task.taskId,
+          progressPercent:
+              task.progress,
+          downloadedBytes:
+              downloaded,
+          expectedBytes:
+              total,
+          partialFilePath:
+              partialPath,
+        );
+
+        setDownloadStatus(
+          DownloadStatus.downloading,
+        );
+
+        monitorDownload(
+          task.taskId,
+          context,
+        );
+
+        return;
+
+      case DownloadTaskStatus.paused:
+        await DownloadStateManager
+            .saveDownloadPaused(
+          taskId:
+              task.taskId,
+          progressPercent:
+              task.progress,
+          downloadedBytes:
+              downloaded,
+          expectedBytes:
+              total,
+          partialFilePath:
+              partialPath,
+        );
+
+        final resumed =
+            await DownloadManager
+                .resumeDownload();
+
+        if (resumed != null) {
+          await DownloadStateManager
+              .saveDownloadInProgress(
+            resumed,
+            progressPercent:
+                task.progress,
+            downloadedBytes:
+                downloaded,
+            expectedBytes:
+                total,
+            partialFilePath:
+                partialPath,
+          );
+
+          setDownloadStatus(
+            DownloadStatus.downloading,
+          );
+
+          monitorDownload(
+            resumed,
+            context,
+          );
+        } else {
+          await _markRecoverableFailure(
+            taskId:
+                task.taskId,
+            progressPercent:
+                task.progress,
+            downloadedBytes:
+                downloaded,
+            expectedBytes:
+                total,
+            partialFilePath:
+                partialPath,
+            message:
+                'ডাউনলোড pause অবস্থায় আছে কিন্তু এখন resume করা যাচ্ছে না। '
+                'আগের progress রাখা হয়েছে।',
+          );
+        }
+
+        return;
+
+      case DownloadTaskStatus.failed:
+        await DownloadStateManager
+            .saveDownloadFailedRecoverable(
+          taskId:
+              task.taskId,
+          progressPercent:
+              task.progress,
+          downloadedBytes:
+              downloaded,
+          expectedBytes:
+              total,
+          partialFilePath:
+              partialPath,
+        );
+
+        await _autoRecoverOrFail(
+          task.taskId,
+          context,
+        );
+
+        return;
+
+      case DownloadTaskStatus.complete:
+        await _verifyCompletedDownload(
+          taskId:
+              task.taskId,
+          context:
+              context,
+        );
+
+        return;
+
+      case DownloadTaskStatus.canceled:
+        await _markRecoverableFailure(
+          taskId:
+              task.taskId,
+          progressPercent:
+              task.progress,
+          downloadedBytes:
+              downloaded,
+          expectedBytes:
+              total,
+          partialFilePath:
+              partialPath,
+          message:
+              'Download task canceled অবস্থায় পাওয়া গেছে। '
+              'যদি partial data থাকে সেটি automatic delete করা হয়নি।',
+        );
+
+        return;
+
+      case DownloadTaskStatus.undefined:
+        await _markRecoverableFailure(
+          taskId:
+              task.taskId,
+          progressPercent:
+              task.progress,
+          downloadedBytes:
+              downloaded,
+          expectedBytes:
+              total,
+          partialFilePath:
+              partialPath,
+          message:
+              'Download task-এর অবস্থা নির্ধারণ করা যাচ্ছে না। '
+              'আগের progress মুছে ফেলা হয়নি।',
+        );
+
+        return;
+    }
+  }
+
   // ===========================================================================
-  // AUTO-START CHECK
+  // AUTO START CHECK
   // ===========================================================================
 
-  Future<bool> canAutoStartDownload() async {
+  Future<bool>
+      canAutoStartDownload() async {
     if (await checkIfModelExists()) {
       return false;
     }
 
-    final savedState =
+    final recovery =
         await DownloadStateManager
-            .getDownloadState();
+            .getRecoveryState();
 
-    if (savedState ==
-        'in_progress') {
+    if (recovery.isRecoverable ||
+        recovery.status ==
+            DownloadStateManager
+                .verifying ||
+        recovery.isReady) {
       return false;
     }
 
     final tasks =
-        await DownloadManager.getAllTasks();
+        await DownloadManager
+            .getAllTasks();
 
     if (_latestRecoverableModelTask(
           tasks,
@@ -969,19 +1708,11 @@ class DownloadPageLogic {
       return true;
     }
 
-    if (code < 0) {
-      Logger.warning(
-        'Network unavailable for auto-start probe ($code)',
-      );
-
-      return false;
-    }
-
     return false;
   }
 
   // ===========================================================================
-  // AUTH + START
+  // START DOWNLOAD / AUTH
   // ===========================================================================
 
   Future<void> startDownload({
@@ -994,10 +1725,14 @@ class DownloadPageLogic {
     setErrorMessages([]);
 
     Logger.info(
-      'Starting download process for $modelFullName',
+      'Starting model download flow for '
+      '$modelFullName',
     );
 
-    // Before authentication/network probing, try to recover an existing task.
+    // -----------------------------------------------------------------------
+    // Recovery ALWAYS comes before fresh authentication/download.
+    // -----------------------------------------------------------------------
+
     final reused =
         await _reuseExistingModelTask();
 
@@ -1005,9 +1740,27 @@ class DownloadPageLogic {
       return;
     }
 
-    // -------------------------------------------------------------------------
+    final recovery =
+        await DownloadStateManager
+            .getRecoveryState();
+
+    if (recovery.isRecoverable) {
+      setDownloadStatus(
+        DownloadStatus.failed,
+      );
+
+      setErrorMessages([
+        'আগের download recovery state এখনো আছে। '
+            'Fresh download শুরু করে আগের progress overwrite করা হবে না। '
+            'আগের task recover/resume করুন অথবা download explicitly cancel করুন।',
+      ]);
+
+      return;
+    }
+
+    // -----------------------------------------------------------------------
     // 1. Anonymous access
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
 
     final anonymousCode =
         await DownloadManager
@@ -1016,27 +1769,31 @@ class DownloadPageLogic {
     );
 
     Logger.info(
-      'Anonymous access check returned $anonymousCode',
+      'Anonymous model access: '
+      '$anonymousCode',
     );
 
     if (anonymousCode == 200 ||
         anonymousCode == 302) {
-      await downloadModel(null);
+      await downloadModel(
+        null,
+      );
 
       return;
     }
 
     if (anonymousCode < 0) {
       handleError(
-        'ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।',
+        'ইন্টারনেট সংযোগ পাওয়া যাচ্ছে না। '
+        'Wi-Fi বা mobile data চালু আছে কিনা পরীক্ষা করুন।',
       );
 
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // 2. Developer token
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // 2. Bundled developer token
+    // -----------------------------------------------------------------------
 
     if (hfTokenConfigured) {
       setDownloadStatus(
@@ -1050,10 +1807,6 @@ class DownloadPageLogic {
         hfAppToken,
       );
 
-      Logger.info(
-        'Developer token check returned $devCode',
-      );
-
       if (devCode == 200 ||
           devCode == 302) {
         await downloadModel(
@@ -1065,18 +1818,25 @@ class DownloadPageLogic {
 
       if (devCode == 403) {
         Logger.warning(
-          'Developer token lacks license access (403)',
+          'Developer token does not have Gemma license access.',
         );
       } else if (devCode == 401) {
         Logger.warning(
-          'Developer token rejected (401)',
+          'Developer Hugging Face token is invalid/expired.',
         );
+      } else if (devCode < 0) {
+        handleError(
+          'Hugging Face server-এর সাথে connection করা যাচ্ছে না। '
+          'ইন্টারনেট সংযোগ পরীক্ষা করুন।',
+        );
+
+        return;
       }
     }
 
-    // -------------------------------------------------------------------------
-    // 3. Stored Hugging Face token
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // 3. Stored user token
+    // -----------------------------------------------------------------------
 
     final tokenStatus =
         await TokenManager
@@ -1099,10 +1859,6 @@ class DownloadPageLogic {
         token?.accessToken,
       );
 
-      Logger.info(
-        'Stored token check returned $storedCode',
-      );
-
       if (storedCode == 200 ||
           storedCode == 302) {
         await downloadModel(
@@ -1118,14 +1874,25 @@ class DownloadPageLogic {
         return;
       }
 
-      Logger.warning(
-        'Stored token unusable ($storedCode) — fresh login',
-      );
+      if (storedCode == 401) {
+        Logger.warning(
+          'Stored Hugging Face login is no longer valid.',
+        );
+      }
+
+      if (storedCode < 0) {
+        handleError(
+          'Hugging Face server-এর সাথে connection করা যাচ্ছে না। '
+          'ইন্টারনেট সংযোগ পরীক্ষা করুন।',
+        );
+
+        return;
+      }
     }
 
-    // -------------------------------------------------------------------------
-    // 4. Interactive OAuth
-    // -------------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // 4. Interactive login
+    // -----------------------------------------------------------------------
 
     if (autoStart) {
       setDownloadStatus(
@@ -1133,9 +1900,8 @@ class DownloadPageLogic {
       );
 
       setErrorMessages([
-        'প্রথমবার ডাউনলোডের জন্য একবার Hugging Face লগইন প্রয়োজন। '
-            'নিচের "ডাউনলোড" বোতাম চাপুন — লগইন শেষ হলে '
-            'ডাউনলোড স্বয়ংক্রিয়ভাবে শুরু হবে।',
+        'প্রথমবার model download করার জন্য একবার Hugging Face login প্রয়োজন। '
+            '"ডাউনলোড" বোতাম চাপুন। Login শেষ হলে download শুরু হবে।',
       ]);
 
       return;
@@ -1154,10 +1920,6 @@ class DownloadPageLogic {
     );
 
     try {
-      Logger.info(
-        'Starting Hugging Face OAuth flow',
-      );
-
       final authUrl =
           await HuggingFaceOAuth
               .generateAuthUrl();
@@ -1171,10 +1933,14 @@ class DownloadPageLogic {
       );
 
       final uri =
-          Uri.parse(result);
+          Uri.parse(
+        result,
+      );
 
       final code =
-          uri.queryParameters['code'];
+          uri.queryParameters[
+            'code'
+          ];
 
       if (code != null) {
         await handleAuthorizationCode(
@@ -1184,32 +1950,35 @@ class DownloadPageLogic {
         return;
       }
 
-      if (uri.queryParameters[
-              'error'] !=
-          null) {
+      final oauthError =
+          uri.queryParameters[
+            'error'
+          ];
+
+      if (oauthError != null) {
         handleError(
-          'Hugging Face অনুমোদন দেয়নি '
-          '(${uri.queryParameters['error']})। আবার চেষ্টা করুন।',
+          'Hugging Face অনুমোদন দেয়নি: $oauthError',
         );
 
         return;
       }
 
       handleError(
-        'অনুমোদন সম্পন্ন হয়নি। আবার চেষ্টা করুন।',
+        'Hugging Face login সম্পন্ন হয়নি। আবার চেষ্টা করুন।',
       );
     } catch (e) {
-      final errorText =
-          e.toString();
+      final text =
+          e.toString()
+              .toLowerCase();
 
-      if (errorText.contains(
-            'CANCELED',
+      if (text.contains(
+            'canceled',
           ) ||
-          errorText.contains(
-            'USER_CANCELED',
-          ) ||
-          errorText.contains(
+          text.contains(
             'cancelled',
+          ) ||
+          text.contains(
+            'user_canceled',
           )) {
         setDownloadStatus(
           DownloadStatus.notStarted,
@@ -1217,20 +1986,21 @@ class DownloadPageLogic {
 
         setErrorMessages([]);
 
-        Logger.info(
-          'OAuth flow cancelled by user',
-        );
-
         return;
       }
 
       handleError(
-        'Hugging Face লগইন ব্যর্থ হয়েছে: $e',
+        _friendlyExceptionMessage(
+          e,
+          fallback:
+              'Hugging Face login ব্যর্থ হয়েছে। আবার চেষ্টা করুন।',
+        ),
       );
     }
   }
 
-  Future<void> handleAuthorizationCode(
+  Future<void>
+      handleAuthorizationCode(
     String code,
   ) async {
     setDownloadStatus(
@@ -1246,15 +2016,11 @@ class DownloadPageLogic {
 
       if (tokenData == null) {
         handleError(
-          'Hugging Face অনুমোদন সম্পন্ন করা যায়নি। আবার চেষ্টা করুন।',
+          'Hugging Face authorization token পাওয়া যায়নি। আবার চেষ্টা করুন।',
         );
 
         return;
       }
-
-      Logger.info(
-        'Hugging Face login successful — verifying model access',
-      );
 
       final responseCode =
           await DownloadManager
@@ -1278,22 +2044,35 @@ class DownloadPageLogic {
         return;
       }
 
+      if (responseCode == 401) {
+        handleError(
+          'Hugging Face login সফল হলেও access token গ্রহণ করা হয়নি। '
+          'আবার login করুন।',
+        );
+
+        return;
+      }
+
       if (responseCode < 0) {
         handleError(
-          'ইন্টারনেট সংযোগে সমস্যা হয়েছে। সংযোগ পরীক্ষা করুন।',
+          'Hugging Face server-এর সাথে connection করা যাচ্ছে না। '
+          'ইন্টারনেট পরীক্ষা করুন।',
         );
 
         return;
       }
 
       handleError(
-        'মডেল অ্যাক্সেস করা যায়নি '
-        '(কোড $responseCode)। '
-        'লাইসেন্স গ্রহণ করা হয়েছে কি না পরীক্ষা করুন।',
+        'Model access ব্যর্থ হয়েছে। '
+        'Server response code: $responseCode',
       );
     } catch (e) {
       handleError(
-        'অ্যাকাউন্ট যাচাইয়ে সমস্যা হয়েছে: $e',
+        _friendlyExceptionMessage(
+          e,
+          fallback:
+              'Hugging Face account verification ব্যর্থ হয়েছে।',
+        ),
       );
     }
   }
@@ -1304,49 +2083,57 @@ class DownloadPageLogic {
 
   void showUserAgreement() {
     setDownloadStatus(
-      DownloadStatus.awaitingLicenseAcceptance,
+      DownloadStatus
+          .awaitingLicenseAcceptance,
     );
 
-    setShowAgreementSheet(true);
+    setShowAgreementSheet(
+      true,
+    );
 
     Logger.info(
-      'Model requires license acceptance',
+      'Gemma license acceptance required.',
     );
   }
 
-  Future<void> openLicenseAgreement() async {
-    setShowAgreementSheet(false);
+  Future<void>
+      openLicenseAgreement() async {
+    setShowAgreementSheet(
+      false,
+    );
 
     try {
       final launched =
           await launchUrl(
-        Uri.parse(modelCardUrl),
+        Uri.parse(
+          modelCardUrl,
+        ),
         mode:
-            LaunchMode.externalApplication,
+            LaunchMode
+                .externalApplication,
       );
 
-      if (launched) {
-        Logger.info(
-          'Opened license agreement in browser',
-        );
-      } else {
-        Logger.warning(
-          'Could not open browser for license page',
-        );
+      if (!launched) {
+        setErrorMessages([
+          'লাইসেন্স page browser-এ খোলা যায়নি।',
+        ]);
       }
     } catch (e) {
-      Logger.error(
-        'Failed to open license page: $e',
-      );
+      setErrorMessages([
+        'লাইসেন্স page খোলা যায়নি: $e',
+      ]);
     }
 
     setDownloadStatus(
-      DownloadStatus.awaitingLicenseAcceptance,
+      DownloadStatus
+          .awaitingLicenseAcceptance,
     );
   }
 
   void cancelLicenseAgreement() {
-    setShowAgreementSheet(false);
+    setShowAgreementSheet(
+      false,
+    );
 
     setDownloadStatus(
       DownloadStatus.notStarted,
@@ -1354,7 +2141,7 @@ class DownloadPageLogic {
   }
 
   // ===========================================================================
-  // ACTUAL DOWNLOAD START
+  // START ACTUAL DOWNLOAD
   // ===========================================================================
 
   Future<void> downloadModel(
@@ -1366,66 +2153,51 @@ class DownloadPageLogic {
 
     setErrorMessages([]);
 
-    _autoResumeAttempts = 0;
+    _autoResumeAttempts =
+        0;
 
-    // -------------------------------------------------------------------------
-    // CRITICAL:
-    // Before creating a brand-new task, attempt to reuse any existing
-    // running/paused/failed model task.
-    // -------------------------------------------------------------------------
-
-    final reused =
-        await _reuseExistingModelTask();
-
-    if (reused) {
+    // Never create another task if one already exists.
+    if (await _reuseExistingModelTask()) {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // SAFE cleanup only.
-    //
-    // No non-empty partial model is deleted.
-    // -------------------------------------------------------------------------
-
     await _cleanupStaleModelArtifacts();
-
-    // -------------------------------------------------------------------------
-    // Resolve true file size.
-    // -------------------------------------------------------------------------
 
     _expectedBytes =
         await _resolveExpectedBytes(
       accessToken,
     );
 
-    _lastSampledPercent = -1;
-    _lastSampleTime = DateTime.now();
-    _downloadRate = 0;
+    _lastSampledPercent =
+        -1;
 
-    // -------------------------------------------------------------------------
-    // IMPORTANT:
-    //
-    // DO NOT call:
-    //
-    // DownloadManager.cleanupFailedDownloads();
-    //
-    // here.
-    //
-    // A failed task may contain GBs of useful resumable data.
-    // -------------------------------------------------------------------------
+    _lastPersistedPercent =
+        -1;
+
+    _lastSampleTime =
+        DateTime.now();
+
+    _downloadRate =
+        0;
+
+    final partPath =
+        await _defaultPartialFilePath();
 
     final taskId =
         await DownloadManager
             .startDownload(
-      url: downloadUrl,
-      fileName: modelName,
-      accessToken: accessToken,
+      url:
+          downloadUrl,
+      fileName:
+          modelName,
+      accessToken:
+          accessToken,
     );
 
     if (taskId == null) {
       handleError(
-        'ডাউনলোড শুরু করা যায়নি। '
-        'আগের কোনো আংশিক model data থাকলে সেটি মুছে ফেলা হয়নি।',
+        'Model download task তৈরি করা যায়নি। '
+        'Storage, network এবং Android background-download permission পরীক্ষা করুন।',
       );
 
       return;
@@ -1434,6 +2206,12 @@ class DownloadPageLogic {
     await DownloadStateManager
         .saveDownloadInProgress(
       taskId,
+      progressPercent: 0,
+      downloadedBytes: 0,
+      expectedBytes:
+          _expectedBytes,
+      partialFilePath:
+          partPath,
     );
 
     monitorDownload(
@@ -1443,22 +2221,26 @@ class DownloadPageLogic {
   }
 
   // ===========================================================================
-  // DOWNLOAD MONITOR
+  // MONITOR
   // ===========================================================================
 
   void monitorDownload(
     String taskId,
     BuildContext? context,
   ) {
-    _monitoringTimer?.cancel();
+    _monitoringTimer
+        ?.cancel();
 
     Logger.info(
-      'Starting download monitoring for task: $taskId',
+      'Monitoring model download task: '
+      '$taskId',
     );
 
     _monitoringTimer =
         Timer.periodic(
-      const Duration(seconds: 1),
+      const Duration(
+        seconds: 1,
+      ),
       (
         timer,
       ) async {
@@ -1467,43 +2249,54 @@ class DownloadPageLogic {
               await DownloadManager
                   .getAllTasks();
 
-          DownloadTask? task;
-
-          for (final candidate in tasks) {
-            if (candidate.taskId ==
-                taskId) {
-              task = candidate;
-
-              break;
-            }
-          }
-
-          // -------------------------------------------------------------------
-          // Task disappeared.
-          //
-          // DO NOT delete the partial file.
-          // -------------------------------------------------------------------
+          final task =
+              _findTaskById(
+            tasks,
+            taskId,
+          );
 
           if (task == null) {
-            Logger.warning(
-              'Task $taskId disappeared from FlutterDownloader. '
-              'Partial model data is being preserved.',
-            );
-
             timer.cancel();
-            _monitoringTimer = null;
+            _monitoringTimer =
+                null;
 
-            _showPreservedProgressError(
-              'ডাউনলোড task Android থেকে পাওয়া যাচ্ছে না। '
-              'ডাউনলোড করা model data মুছে ফেলা হয়নি।',
+            final recovery =
+                await DownloadStateManager
+                    .getRecoveryState();
+
+            await DownloadStateManager
+                .saveDownloadFailedRecoverable(
+              taskId:
+                  taskId,
+              progressPercent:
+                  recovery
+                      .progressPercent,
+              downloadedBytes:
+                  recovery
+                      .downloadedBytes,
+              expectedBytes:
+                  recovery
+                              .expectedBytes >
+                          0
+                      ? recovery
+                          .expectedBytes
+                      : _expectedBytes,
+              partialFilePath:
+                  recovery
+                      .partialFilePath,
             );
+
+            setDownloadStatus(
+              DownloadStatus.failed,
+            );
+
+            setErrorMessages([
+              'Android download task আর খুঁজে পাওয়া যাচ্ছে না। '
+                  'আগের downloaded data এবং recovery information মুছে ফেলা হয়নি।',
+            ]);
 
             return;
           }
-
-          // -------------------------------------------------------------------
-          // PROGRESS CALCULATION
-          // -------------------------------------------------------------------
 
           final total =
               _expectedBytes > 0
@@ -1511,7 +2304,8 @@ class DownloadPageLogic {
                   : expectedModelFileSize;
 
           final downloaded =
-              ((task.progress / 100) *
+              ((task.progress /
+                          100) *
                       total)
                   .round();
 
@@ -1522,30 +2316,31 @@ class DownloadPageLogic {
                   0 &&
               task.progress >
                   _lastSampledPercent) {
-            final dt =
+            final milliseconds =
                 now
                     .difference(
                       _lastSampleTime,
                     )
                     .inMilliseconds;
 
-            if (dt > 0) {
+            if (milliseconds > 0) {
               final deltaBytes =
                   ((task.progress -
                               _lastSampledPercent) /
                           100) *
                       total;
 
-              final instant =
+              final instantRate =
                   deltaBytes /
-                      (dt / 1000);
+                      (milliseconds /
+                          1000);
 
               _downloadRate =
                   _downloadRate <= 0
-                      ? instant
+                      ? instantRate
                       : (_downloadRate *
-                              0.7 +
-                          instant *
+                              0.7) +
+                          (instantRate *
                               0.3);
             }
           }
@@ -1560,11 +2355,13 @@ class DownloadPageLogic {
           }
 
           final remainingBytes =
-              (total - downloaded)
+              (total -
+                      downloaded)
                   .clamp(
-            0,
-            total,
-          );
+                    0,
+                    total,
+                  )
+                  .toInt();
 
           final remainingTime =
               _downloadRate > 1024
@@ -1578,132 +2375,133 @@ class DownloadPageLogic {
 
           setProgress(
             DownloadProgress(
-              totalBytes: total,
+              totalBytes:
+                  total,
               downloadedBytes:
                   downloaded,
               downloadRate:
                   _downloadRate,
               remainingTime:
                   remainingTime,
-              status: task.status,
+              status:
+                  task.status,
             ),
           );
 
-          // -------------------------------------------------------------------
-          // STATUS
-          // -------------------------------------------------------------------
+          // Persist only when percentage changes to avoid unnecessary
+          // SharedPreferences writes every second.
+          if (task.progress !=
+              _lastPersistedPercent) {
+            _lastPersistedPercent =
+                task.progress;
+
+            await DownloadStateManager
+                .saveProgress(
+              taskId:
+                  task.taskId,
+              progressPercent:
+                  task.progress,
+              downloadedBytes:
+                  downloaded,
+              expectedBytes:
+                  total,
+              partialFilePath:
+                  _taskPartialFilePath(
+                task,
+              ),
+            );
+          }
 
           switch (task.status) {
-            // -----------------------------------------------------------------
+            // ===============================================================
             // COMPLETE
-            // -----------------------------------------------------------------
+            // ===============================================================
 
             case DownloadTaskStatus.complete:
               timer.cancel();
-              _monitoringTimer = null;
+              _monitoringTimer =
+                  null;
 
               Logger.info(
-                'Download completed: $taskId',
+                'Native model download reports 100%. '
+                'Starting final verification.',
               );
 
-              if (await checkIfModelExists()) {
-                setDownloadStatus(
-                  DownloadStatus.completed,
-                );
-
-                await DownloadStateManager
-                    .saveDownloadCompleted();
-
-                Logger.info(
-                  'Downloaded model passed validation.',
-                );
-
-                if (context != null &&
-                    context.mounted) {
-                  Navigator.of(context)
-                      .pushReplacement(
-                    MaterialPageRoute(
-                      builder: (_) =>
-                          const ChatPage(),
-                    ),
-                  );
-                }
-
-                return;
-              }
-
-              // A COMPLETE task with an invalid/truncated final file is the
-              // only non-user case where corrupt bytes may be removed.
-              Logger.error(
-                'Completed model failed final validation.',
-              );
-
-              await _autoRecoverOrFail(
-                taskId,
-                context,
+              await _verifyCompletedDownload(
+                taskId:
+                    task.taskId,
+                context:
+                    context,
               );
 
               return;
 
-            // -----------------------------------------------------------------
+            // ===============================================================
             // FAILED
-            //
-            // KEEP CONTENT.
-            // -----------------------------------------------------------------
+            // ===============================================================
 
             case DownloadTaskStatus.failed:
               timer.cancel();
-              _monitoringTimer = null;
+              _monitoringTimer =
+                  null;
+
+              await DownloadStateManager
+                  .saveDownloadFailedRecoverable(
+                taskId:
+                    task.taskId,
+                progressPercent:
+                    task.progress,
+                downloadedBytes:
+                    downloaded,
+                expectedBytes:
+                    total,
+                partialFilePath:
+                    _taskPartialFilePath(
+                  task,
+                ),
+              );
 
               Logger.warning(
-                'Download task failed: $taskId. '
-                'Partial content will be preserved.',
+                'Download failed at '
+                '${task.progress}%. '
+                'Partial data preserved.',
               );
 
               await _autoRecoverOrFail(
-                taskId,
+                task.taskId,
                 context,
               );
 
               return;
 
-            // -----------------------------------------------------------------
-            // CANCELED
-            //
-            // If this came from explicit cancelDownload(), monitor was already
-            // stopped first.
-            //
-            // Therefore an unexpected canceled status here is treated
-            // conservatively and content is preserved.
-            // -----------------------------------------------------------------
-
-            case DownloadTaskStatus.canceled:
-              timer.cancel();
-              _monitoringTimer = null;
-
-              Logger.warning(
-                'Task $taskId reported canceled unexpectedly. '
-                'No automatic content deletion will occur here.',
-              );
-
-              _showPreservedProgressError(
-                'ডাউনলোড বন্ধ হয়েছে। '
-                'যদি আংশিক model file থেকে থাকে সেটি নিরাপদ রাখা হয়েছে।',
-              );
-
-              return;
-
-            // -----------------------------------------------------------------
+            // ===============================================================
             // PAUSED
-            // -----------------------------------------------------------------
+            // ===============================================================
 
             case DownloadTaskStatus.paused:
-              setDownloadStatus(
-                DownloadStatus.downloading,
+              timer.cancel();
+              _monitoringTimer =
+                  null;
+
+              await DownloadStateManager
+                  .saveDownloadPaused(
+                taskId:
+                    task.taskId,
+                progressPercent:
+                    task.progress,
+                downloadedBytes:
+                    downloaded,
+                expectedBytes:
+                    total,
+                partialFilePath:
+                    _taskPartialFilePath(
+                  task,
+                ),
               );
 
-              DownloadManager.attachToTask(
-                taskId,
+              DownloadManager
+                  .attachToTask(
+                task.taskId,
               );
 
               final resumed =
@@ -1714,70 +2512,173 @@ class DownloadPageLogic {
                 await DownloadStateManager
                     .saveDownloadInProgress(
                   resumed,
+                  progressPercent:
+                      task.progress,
+                  downloadedBytes:
+                      downloaded,
+                  expectedBytes:
+                      total,
+                  partialFilePath:
+                      _taskPartialFilePath(
+                    task,
+                  ),
                 );
 
-                timer.cancel();
+                setDownloadStatus(
+                  DownloadStatus
+                      .downloading,
+                );
 
                 monitorDownload(
                   resumed,
                   context,
                 );
               } else {
-                timer.cancel();
-                _monitoringTimer = null;
-
-                _showPreservedProgressError(
-                  'ডাউনলোড pause হয়েছে কিন্তু এখনই resume করা যায়নি। '
-                  'আগের progress মুছে ফেলা হয়নি।',
+                await _markRecoverableFailure(
+                  taskId:
+                      task.taskId,
+                  progressPercent:
+                      task.progress,
+                  downloadedBytes:
+                      downloaded,
+                  expectedBytes:
+                      total,
+                  partialFilePath:
+                      _taskPartialFilePath(
+                    task,
+                  ),
+                  message:
+                      'Download pause হয়েছে এবং এখন resume করা যাচ্ছে না। '
+                      'আগের ${task.progress}% progress রাখা হয়েছে।',
                 );
               }
 
               return;
 
-            // -----------------------------------------------------------------
-            // NORMAL ACTIVE STATES
-            // -----------------------------------------------------------------
+            // ===============================================================
+            // UNEXPECTED CANCELED
+            // ===============================================================
+
+            case DownloadTaskStatus.canceled:
+              timer.cancel();
+              _monitoringTimer =
+                  null;
+
+              await _markRecoverableFailure(
+                taskId:
+                    task.taskId,
+                progressPercent:
+                    task.progress,
+                downloadedBytes:
+                    downloaded,
+                expectedBytes:
+                    total,
+                partialFilePath:
+                    _taskPartialFilePath(
+                  task,
+                ),
+                message:
+                    'Android download task canceled হয়েছে। '
+                    'এটি user-confirmed delete নয়, তাই partial data automatic delete করা হয়নি।',
+              );
+
+              return;
+
+            // ===============================================================
+            // ACTIVE
+            // ===============================================================
 
             case DownloadTaskStatus.running:
             case DownloadTaskStatus.enqueued:
               setDownloadStatus(
-                DownloadStatus.downloading,
+                DownloadStatus
+                    .downloading,
               );
 
               return;
 
-            // -----------------------------------------------------------------
+            // ===============================================================
             // UNDEFINED
-            // -----------------------------------------------------------------
+            // ===============================================================
 
             case DownloadTaskStatus.undefined:
               timer.cancel();
-              _monitoringTimer = null;
+              _monitoringTimer =
+                  null;
 
-              Logger.warning(
-                'Task $taskId has undefined status. '
-                'Preserving any downloaded bytes.',
-              );
-
-              _showPreservedProgressError(
-                'ডাউনলোডের বর্তমান অবস্থা নির্ধারণ করা যাচ্ছে না। '
-                'আগের progress মুছে ফেলা হয়নি।',
+              await _markRecoverableFailure(
+                taskId:
+                    task.taskId,
+                progressPercent:
+                    task.progress,
+                downloadedBytes:
+                    downloaded,
+                expectedBytes:
+                    total,
+                partialFilePath:
+                    _taskPartialFilePath(
+                  task,
+                ),
+                message:
+                    'Download task-এর status Android থেকে নির্ধারণ করা যাচ্ছে না। '
+                    'Partial data রাখা হয়েছে।',
               );
 
               return;
           }
-        } catch (e) {
-          Logger.error(
-            'ডাউনলোড পর্যবেক্ষণে সমস্যা হয়েছে: $e',
-          );
-
+        } catch (e, st) {
           timer.cancel();
-          _monitoringTimer = null;
 
-          _showPreservedProgressError(
-            'ডাউনলোড পর্যবেক্ষণে সমস্যা হয়েছে। '
-            'ডাউনলোড করা model data মুছে ফেলা হয়নি।',
+          _monitoringTimer =
+              null;
+
+          Logger.error(
+            'Download monitoring exception: $e',
           );
+
+          Logger.error(
+            '$st',
+          );
+
+          final recovery =
+              await DownloadStateManager
+                  .getRecoveryState();
+
+          await DownloadStateManager
+              .saveDownloadFailedRecoverable(
+            taskId:
+                recovery.taskId ??
+                    taskId,
+            progressPercent:
+                recovery
+                    .progressPercent,
+            downloadedBytes:
+                recovery
+                    .downloadedBytes,
+            expectedBytes:
+                recovery
+                            .expectedBytes >
+                        0
+                    ? recovery
+                        .expectedBytes
+                    : _expectedBytes,
+            partialFilePath:
+                recovery
+                    .partialFilePath,
+          );
+
+          setDownloadStatus(
+            DownloadStatus.failed,
+          );
+
+          setErrorMessages([
+            _friendlyExceptionMessage(
+              e,
+              fallback:
+                  'Download monitoring বন্ধ হয়েছে। '
+                  'আগের partial progress নিরাপদ রাখা হয়েছে।',
+            ),
+          ]);
         }
       },
     );
@@ -1787,31 +2688,6 @@ class DownloadPageLogic {
   // AUTO RECOVERY
   // ===========================================================================
 
-  /// Attempts to retry the SAME failed task.
-  ///
-  /// CRITICAL DIFFERENCE FROM THE OLD CODE:
-  ///
-  /// OLD:
-  ///
-  /// retry == null
-  ///     ↓
-  /// shouldDeleteContent: true
-  ///     ↓
-  /// downloadModel()
-  ///     ↓
-  /// 0%
-  ///
-  ///
-  /// NEW:
-  ///
-  /// retry == null
-  ///     ↓
-  /// KEEP FILE
-  ///     ↓
-  /// KEEP TASK STATE
-  ///     ↓
-  /// show recoverable error
-  ///
   Future<void> _autoRecoverOrFail(
     String taskId,
     BuildContext? context,
@@ -1828,9 +2704,8 @@ class DownloadPageLogic {
           _autoResumeAttempts;
 
       Logger.warning(
-        'Retrying failed download '
-        '$attempt/$_maxAutoResumeAttempts. '
-        'Partial content is preserved.',
+        'Recoverable download retry '
+        '$attempt/$_maxAutoResumeAttempts',
       );
 
       setDownloadStatus(
@@ -1838,24 +2713,38 @@ class DownloadPageLogic {
       );
 
       await Future.delayed(
-        const Duration(seconds: 4),
+        const Duration(
+          seconds: 4,
+        ),
       );
 
-      // The user may have left/disposed the screen, but the native task can
-      // still be recovered later.
       final retried =
           await DownloadManager
               .retryDownload();
 
       if (retried != null) {
-        Logger.info(
-          'Failed task resumed/retried successfully: '
-          '$taskId -> $retried',
-        );
+        final recovery =
+            await DownloadStateManager
+                .getRecoveryState();
 
         await DownloadStateManager
             .saveDownloadInProgress(
           retried,
+          progressPercent:
+              recovery.progressPercent,
+          downloadedBytes:
+              recovery.downloadedBytes,
+          expectedBytes:
+              recovery.expectedBytes > 0
+                  ? recovery.expectedBytes
+                  : _expectedBytes,
+          partialFilePath:
+              recovery.partialFilePath,
+        );
+
+        Logger.info(
+          'Recoverable task resumed: '
+          '$taskId -> $retried',
         );
 
         monitorDownload(
@@ -1867,47 +2756,189 @@ class DownloadPageLogic {
       }
 
       Logger.warning(
-        'Retry attempt $attempt unavailable. '
-        'No content deleted.',
+        'Retry $attempt unavailable. '
+        'Nothing deleted.',
       );
 
-      // Re-attach original task before another retry attempt.
       DownloadManager.attachToTask(
         taskId,
       );
     }
 
-    // -------------------------------------------------------------------------
-    // OUT OF AUTO RETRIES
-    //
-    // IMPORTANT:
-    //
-    // DO NOT:
-    //
-    // FlutterDownloader.remove(... shouldDeleteContent: true)
-    // DownloadStateManager.clearDownloadState()
-    // downloadModel(...)
-    //
-    // here.
-    //
-    // Keeping the task ID is important for later recovery.
-    // -------------------------------------------------------------------------
+    final recovery =
+        await DownloadStateManager
+            .getRecoveryState();
 
     await DownloadStateManager
-        .saveDownloadInProgress(
-      taskId,
+        .saveDownloadFailedRecoverable(
+      taskId: taskId,
+      progressPercent:
+          recovery.progressPercent,
+      downloadedBytes:
+          recovery.downloadedBytes,
+      expectedBytes:
+          recovery.expectedBytes > 0
+              ? recovery.expectedBytes
+              : _expectedBytes,
+      partialFilePath:
+          recovery.partialFilePath,
     );
 
-    _showPreservedProgressError(
-      'ডাউনলোড সাময়িকভাবে বন্ধ হয়েছে। '
-      'ইন্টারনেট, ব্যাটারি restriction এবং ফোনের খালি জায়গা পরীক্ষা করুন। '
-      'ইতিমধ্যে ডাউনলোড করা অংশ মুছে ফেলা হয়নি। '
-      'আবার চেষ্টা করলে একই download task resume করার চেষ্টা করা হবে।',
+    setDownloadStatus(
+      DownloadStatus.failed,
+    );
+
+    setErrorMessages([
+      _recoverableFailureMessage(
+        recovery.progressPercent,
+      ),
+    ]);
+
+    Logger.warning(
+      'Automatic recovery exhausted. '
+      'Task/data preserved.',
+    );
+  }
+
+  String _recoverableFailureMessage(
+    int progressPercent,
+  ) {
+    final progressText =
+        progressPercent > 0
+            ? 'আগের $progressPercent% progress রাখা হয়েছে। '
+            : '';
+
+    return 'Download সাময়িকভাবে বন্ধ হয়েছে। '
+        '$progressText'
+        'ইন্টারনেট সংযোগ, battery restriction এবং phone storage পরীক্ষা করুন। '
+        'Partial model delete করা হয়নি। '
+        'আবার চেষ্টা করলে একই task resume করার চেষ্টা হবে।';
+  }
+
+  Future<void>
+      _markRecoverableFailure({
+    required String? taskId,
+    required int progressPercent,
+    required int downloadedBytes,
+    required int expectedBytes,
+    required String? partialFilePath,
+    required String message,
+  }) async {
+    await DownloadStateManager
+        .saveDownloadFailedRecoverable(
+      taskId: taskId,
+      progressPercent:
+          progressPercent,
+      downloadedBytes:
+          downloadedBytes,
+      expectedBytes:
+          expectedBytes,
+      partialFilePath:
+          partialFilePath,
+    );
+
+    setDownloadStatus(
+      DownloadStatus.failed,
+    );
+
+    setErrorMessages([
+      message,
+    ]);
+
+    Logger.warning(
+      '$message '
+      '[recoverable data preserved]',
     );
   }
 
   // ===========================================================================
-  // TOKEN RESOLUTION
+  // ERROR CLASSIFICATION
+  // ===========================================================================
+
+  String _friendlyExceptionMessage(
+    Object error, {
+    required String fallback,
+  }) {
+    if (error is SocketException) {
+      return 'ইন্টারনেট connection বিচ্ছিন্ন হয়েছে। '
+          'Download করা অংশ রাখা হয়েছে; connection ফিরে এলে resume করুন।';
+    }
+
+    if (error is TimeoutException) {
+      return 'Network request timeout হয়েছে। '
+          'Download করা অংশ রাখা হয়েছে; আবার resume করা যাবে।';
+    }
+
+    final text =
+        error
+            .toString()
+            .toLowerCase();
+
+    if (text.contains(
+          'no space',
+        ) ||
+        text.contains(
+          'not enough space',
+        ) ||
+        text.contains(
+          'insufficient space',
+        ) ||
+        text.contains(
+          'storage',
+        ) &&
+            text.contains(
+              'low',
+            ) ||
+        text.contains(
+          'enospc',
+        )) {
+      return 'ফোনে পর্যাপ্ত খালি storage নেই। '
+          'Model download-এর জন্য অন্তত প্রায় ৬ GB খালি জায়গা রাখুন। '
+          'আগের partial download মুছে ফেলা হয়নি।';
+    }
+
+    if (text.contains(
+          '401',
+        )) {
+      return 'Hugging Face authorization ব্যর্থ হয়েছে। '
+          'Login/token আবার যাচাই করুন।';
+    }
+
+    if (text.contains(
+          '403',
+        )) {
+      return 'Hugging Face model access পাওয়া যায়নি। '
+          'Gemma license গ্রহণ করা হয়েছে কিনা পরীক্ষা করুন।';
+    }
+
+    if (text.contains(
+          'checksum',
+        ) ||
+        text.contains(
+          'hash',
+        )) {
+      return 'Downloaded model-এর checksum verification ব্যর্থ হয়েছে। '
+          'Final model corrupt হতে পারে।';
+    }
+
+    if (text.contains(
+          'connection',
+        ) ||
+        text.contains(
+          'network',
+        ) ||
+        text.contains(
+          'socket',
+        )) {
+      return 'Network connection-এর কারণে download বন্ধ হয়েছে। '
+          'আগের progress রাখা হয়েছে এবং resume করা যাবে।';
+    }
+
+    return fallback;
+  }
+
+  // ===========================================================================
+  // TOKEN
   // ===========================================================================
 
   Future<String?>
@@ -1916,24 +2947,25 @@ class DownloadPageLogic {
       return hfAppToken;
     }
 
-    final tokenStatus =
+    final status =
         await TokenManager
             .getTokenStatus();
 
-    if (tokenStatus ==
+    if (status ==
         TokenStatus.valid) {
       final token =
           await TokenManager
               .getStoredToken();
 
-      return token?.accessToken;
+      return token
+          ?.accessToken;
     }
 
     return null;
   }
 
   // ===========================================================================
-  // ERROR HELPERS
+  // GENERIC ERROR
   // ===========================================================================
 
   void handleError(
@@ -1947,24 +2979,8 @@ class DownloadPageLogic {
       error,
     ]);
 
-    Logger.error(error);
-  }
-
-  /// Failure helper specifically for errors where existing partial bytes must
-  /// remain untouched.
-  void _showPreservedProgressError(
-    String message,
-  ) {
-    setDownloadStatus(
-      DownloadStatus.failed,
-    );
-
-    setErrorMessages([
-      message,
-    ]);
-
-    Logger.warning(
-      '$message [partial download preserved]',
+    Logger.error(
+      error,
     );
   }
 
@@ -1972,35 +2988,42 @@ class DownloadPageLogic {
   // CANCEL CONFIRMATION
   // ===========================================================================
 
-  Future<void> showCancelConfirmation(
+  Future<void>
+      showCancelConfirmation(
     BuildContext context,
   ) async {
     final result =
         await showDialog<bool>(
       context: context,
-      barrierDismissible: false,
-      builder:
-          (BuildContext context) {
+      barrierDismissible:
+          false,
+      builder: (
+        BuildContext context,
+      ) {
         return Dialog(
           shape:
               RoundedRectangleBorder(
             borderRadius:
-                BorderRadius.circular(
+                BorderRadius
+                    .circular(
               20,
             ),
           ),
           child: Container(
             padding:
-                const EdgeInsets.all(
+                const EdgeInsets
+                    .all(
               24,
             ),
             decoration:
                 BoxDecoration(
               borderRadius:
-                  BorderRadius.circular(
+                  BorderRadius
+                      .circular(
                 20,
               ),
-              color: Colors.white,
+              color:
+                  Colors.white,
             ),
             child: Column(
               mainAxisSize:
@@ -2016,14 +3039,17 @@ class DownloadPageLogic {
                     gradient:
                         LinearGradient(
                       colors: [
-                        Colors.red[400]!,
-                        Colors.red[600]!,
+                        Colors.red[
+                            400]!,
+                        Colors.red[
+                            600]!,
                       ],
                     ),
                   ),
                   child:
                       const Icon(
-                    Icons.warning_rounded,
+                    Icons
+                        .warning_rounded,
                     size: 32,
                     color:
                         Colors.white,
@@ -2042,7 +3068,9 @@ class DownloadPageLogic {
                     fontWeight:
                         FontWeight.bold,
                     color:
-                        Colors.grey[800],
+                        Colors
+                            .grey[
+                        800],
                   ),
                   textAlign:
                       TextAlign.center,
@@ -2053,14 +3081,16 @@ class DownloadPageLogic {
                 ),
 
                 Text(
-                  'আপনি কি নিশ্চিত? '
-                  'শুধুমাত্র এই বোতাম দিয়ে বাতিল করলে বর্তমান progress '
-                  'এবং আংশিক model file মুছে ফেলা হবে।',
+                  'আপনি নিশ্চিত হলে বর্তমান download task, '
+                  'progress এবং partial model file মুছে যাবে। '
+                  'Network failure হলে app নিজে এই data মুছে দেয় না।',
                   style:
                       TextStyle(
                     fontSize: 16,
                     color:
-                        Colors.grey[600],
+                        Colors
+                            .grey[
+                        600],
                     height: 1.4,
                   ),
                   textAlign:
@@ -2075,56 +3105,22 @@ class DownloadPageLogic {
                   children: [
                     Expanded(
                       child:
-                          Container(
-                        constraints:
-                            const BoxConstraints(
-                          minHeight:
-                              48,
-                        ),
-                        decoration:
-                            BoxDecoration(
-                          borderRadius:
-                              BorderRadius
-                                  .circular(
-                            12,
-                          ),
-                          border:
-                              Border.all(
-                            color:
-                                Colors
-                                    .grey[
-                                300]!,
-                          ),
-                        ),
+                          OutlinedButton(
+                        onPressed:
+                            () =>
+                                Navigator
+                                    .of(
+                                      context,
+                                    )
+                                    .pop(
+                                      false,
+                                    ),
                         child:
-                            TextButton(
-                          onPressed:
-                              () {
-                            Navigator.of(
-                              context,
-                            ).pop(
-                              false,
-                            );
-                          },
-                          child:
-                              Text(
-                            'ডাউনলোড চালিয়ে যান',
-                            style:
-                                TextStyle(
-                              color:
-                                  Colors
-                                      .grey[
-                                  700],
-                              fontSize:
-                                  16,
-                              fontWeight:
-                                  FontWeight
-                                      .w600,
-                            ),
-                            textAlign:
-                                TextAlign
-                                    .center,
-                          ),
+                            const Text(
+                          'ডাউনলোড চালিয়ে যান',
+                          textAlign:
+                              TextAlign
+                                  .center,
                         ),
                       ),
                     ),
@@ -2135,57 +3131,22 @@ class DownloadPageLogic {
 
                     Expanded(
                       child:
-                          Container(
-                        constraints:
-                            const BoxConstraints(
-                          minHeight:
-                              48,
-                        ),
-                        decoration:
-                            BoxDecoration(
-                          gradient:
-                              LinearGradient(
-                            colors: [
-                              Colors.red[
-                                  400]!,
-                              Colors.red[
-                                  600]!,
-                            ],
-                          ),
-                          borderRadius:
-                              BorderRadius
-                                  .circular(
-                            12,
-                          ),
-                        ),
+                          ElevatedButton(
+                        onPressed:
+                            () =>
+                                Navigator
+                                    .of(
+                                      context,
+                                    )
+                                    .pop(
+                                      true,
+                                    ),
                         child:
-                            TextButton(
-                          onPressed:
-                              () {
-                            Navigator.of(
-                              context,
-                            ).pop(
-                              true,
-                            );
-                          },
-                          child:
-                              const Text(
-                            'ডাউনলোড বাতিল করুন',
-                            style:
-                                TextStyle(
-                              color:
-                                  Colors
-                                      .white,
-                              fontSize:
-                                  16,
-                              fontWeight:
-                                  FontWeight
-                                      .w600,
-                            ),
-                            textAlign:
-                                TextAlign
-                                    .center,
-                          ),
+                            const Text(
+                          'ডাউনলোড বাতিল করুন',
+                          textAlign:
+                              TextAlign
+                                  .center,
                         ),
                       ),
                     ),
@@ -2198,28 +3159,29 @@ class DownloadPageLogic {
       },
     );
 
-    if (result == true) {
+    if (result ==
+        true) {
       await cancelDownload();
     }
   }
 
   // ===========================================================================
-  // EXPLICIT USER CANCEL
+  // EXPLICIT USER CANCEL + DELETE
   // ===========================================================================
 
-  /// THIS is intentionally destructive.
-  ///
-  /// The user explicitly confirmed that they want to cancel and delete the
-  /// partial model.
   Future<void> cancelDownload() async {
-    _monitoringTimer?.cancel();
-    _monitoringTimer = null;
+    _monitoringTimer
+        ?.cancel();
 
-    _autoResumeAttempts = 0;
+    _monitoringTimer =
+        null;
 
-    // Explicit user action:
+    _autoResumeAttempts =
+        0;
+
+    // THIS is intentionally destructive.
     //
-    // deleting partial content is allowed here.
+    // User explicitly confirmed delete.
     await DownloadManager
         .cancelAndDeleteDownload();
 
@@ -2230,11 +3192,15 @@ class DownloadPageLogic {
       DownloadStatus.notStarted,
     );
 
-    setProgress(null);
+    setProgress(
+      null,
+    );
+
+    setErrorMessages([]);
 
     Logger.info(
-      'User explicitly cancelled download; '
-      'partial content was deleted.',
+      'User explicitly canceled download; '
+      'task and partial data deleted.',
     );
   }
 
@@ -2243,10 +3209,27 @@ class DownloadPageLogic {
   // ===========================================================================
 
   Future<void> pauseDownload() async {
+    final recovery =
+        await DownloadStateManager
+            .getRecoveryState();
+
     await DownloadManager
         .pauseDownload();
 
-    // Keep persistent state as in_progress so restart recovery still sees it.
+    await DownloadStateManager
+        .saveDownloadPaused(
+      taskId:
+          recovery.taskId,
+      progressPercent:
+          recovery.progressPercent,
+      downloadedBytes:
+          recovery.downloadedBytes,
+      expectedBytes:
+          recovery.expectedBytes,
+      partialFilePath:
+          recovery.partialFilePath,
+    );
+
     setDownloadStatus(
       DownloadStatus.paused,
     );
@@ -2257,17 +3240,14 @@ class DownloadPageLogic {
   // ===========================================================================
 
   Future<void> resumeDownload() async {
-    // -------------------------------------------------------------------------
-    // Recover attached task first.
-    // -------------------------------------------------------------------------
-
-    final savedTaskId =
+    final recovery =
         await DownloadStateManager
-            .getDownloadTaskId();
+            .getRecoveryState();
 
-    if (savedTaskId != null) {
+    if (recovery.taskId !=
+        null) {
       DownloadManager.attachToTask(
-        savedTaskId,
+        recovery.taskId!,
       );
     } else {
       final tasks =
@@ -2286,39 +3266,91 @@ class DownloadPageLogic {
       }
     }
 
-    final newTaskId =
+    final resumedTaskId =
         await DownloadManager
             .resumeDownload();
 
-    if (newTaskId == null) {
-      // -----------------------------------------------------------------------
-      // CRITICAL:
-      //
-      // Do NOT start from scratch.
-      // Do NOT delete content.
-      // -----------------------------------------------------------------------
-
-      _showPreservedProgressError(
-        'ডাউনলোড এখনই resume করা যায়নি। '
-        'আগের progress এবং partial model file মুছে ফেলা হয়নি। '
-        'ইন্টারনেট সংযোগ ঠিক করে আবার চেষ্টা করুন।',
+    if (resumedTaskId ==
+        null) {
+      await DownloadStateManager
+          .saveDownloadFailedRecoverable(
+        taskId:
+            recovery.taskId,
+        progressPercent:
+            recovery.progressPercent,
+        downloadedBytes:
+            recovery.downloadedBytes,
+        expectedBytes:
+            recovery.expectedBytes,
+        partialFilePath:
+            recovery.partialFilePath,
       );
+
+      setDownloadStatus(
+        DownloadStatus.failed,
+      );
+
+      setErrorMessages([
+        'Download এখন resume করা যাচ্ছে না। '
+            'আগের ${recovery.progressPercent}% progress এবং partial model রাখা হয়েছে। '
+            'ইন্টারনেট connection ঠিক করে আবার চেষ্টা করুন।',
+      ]);
 
       return;
     }
 
     await DownloadStateManager
         .saveDownloadInProgress(
-      newTaskId,
+      resumedTaskId,
+      progressPercent:
+          recovery.progressPercent,
+      downloadedBytes:
+          recovery.downloadedBytes,
+      expectedBytes:
+          recovery.expectedBytes > 0
+              ? recovery.expectedBytes
+              : expectedModelFileSize,
+      partialFilePath:
+          recovery.partialFilePath,
     );
 
     setDownloadStatus(
       DownloadStatus.downloading,
     );
 
+    setErrorMessages([]);
+
     monitorDownload(
-      newTaskId,
+      resumedTaskId,
       null,
     );
   }
+}
+
+// =============================================================================
+// MODEL VERIFICATION TYPES
+// =============================================================================
+
+enum _ModelVerificationFailure {
+  none,
+  missing,
+  tooSmall,
+  checksumMismatch,
+  checksumCalculationFailed,
+  invalidChecksumConfiguration,
+}
+
+class _ModelVerificationResult {
+  final bool valid;
+
+  final _ModelVerificationFailure
+      reason;
+
+  final int size;
+
+  const _ModelVerificationResult({
+    required this.valid,
+    required this.reason,
+    required this.size,
+  });
 }
