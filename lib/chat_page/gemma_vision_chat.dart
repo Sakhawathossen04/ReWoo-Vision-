@@ -214,13 +214,21 @@ class _ChatPageState extends State<ChatPage>
     if (_disposed || _speechService == null) return;
 
     if (state == AppLifecycleState.resumed) {
+      // Bug fix: while a video recording was running when the app went to
+      // the background, recognition was stopped but the mode flag was also
+      // cleared, so the microphone never came back after returning to the
+      // app. Recording keeps the mic free (enableAudio: false), so the
+      // command loop must ALWAYS resume on foreground.
       if (_resumeVoiceOnForeground) {
         unawaited(_speechService!.startCommandListening());
       }
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
-      _resumeVoiceOnForeground = _speechService!.commandModeEnabled;
+      // The loop must come back on foreground both in normal command mode
+      // AND after a background trip during recording.
+      _resumeVoiceOnForeground =
+          _speechService!.commandModeEnabled || _chatHelpers!.isRecording;
       // Keep recording alive in the background; only pause recognition.
       if (!_chatHelpers!.isRecording) {
         unawaited(_speechService!.pauseLoop());

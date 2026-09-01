@@ -4,16 +4,7 @@ Controller-free, Bangla-first visual assistance app for blind and low-vision use
 
 The original app used an 8BitDo controller as a fast hardware shortcut layer. This version removes the controller from the primary workflow and makes Bengali voice commands the main interaction method while preserving the original on-device Gemma 3n vision pipeline.
 
-## What's new in this release (v1.4 — official ReWoo branding)
-
-| # | Change | Detail |
-|---|---|---|
-| 1 | **Official app icon** | The ReWoo logo (https://rewoo.tech) now appears everywhere: home-screen launcher (all densities), adaptive icon (Android 8+, incl. Android 13 themed/monochrome icons), round-icon launchers, splash screen, iOS app icon set, and web icons. A 512 px Play Store icon is included at `store/play-store-icon-512.png` |
-| 2 | **App name is "ReWoo Vision" everywhere** | Android launcher label, iOS `CFBundleDisplayName`/`CFBundleName` (was "Gemma Chat"/"Gemma Vision"), web manifest + page title, in-app chat header (now shows the logo beside the name), and the model-download screen (logo card on top). Loading text changed from "Gemma প্রস্তুত হচ্ছে…" to "ReWoo Vision প্রস্তুত হচ্ছে…" |
-| 3 | **Branded splash screen** | Launch background is now the ReWoo warm off-white (`#FAF9F4`) with the centered ReWoo glyph instead of plain white; on Android 12+ the system splash automatically uses the new ReWoo launcher icon |
-| 4 | CI artifact renamed | The GitHub Actions APK artifact is now `rewoo-vision-apk` (was `gemma-vision-bangla-apk`) |
-
-## What's new in v1.3 (download fixed)
+## What's new in this release (v1.3 — download fixed)
 
 | # | Problem | Fix |
 |---|---|---|

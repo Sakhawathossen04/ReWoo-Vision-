@@ -70,3 +70,37 @@
 - `lib/main.dart`
 - `lib/settings_page.dart`
 - `pubspec.yaml`
+
+## v1.3.0 — Final delivery (Gemma 3n swap verified + AGP 8.11 build fixes)
+
+### Fixed
+- `android/app/src/main/AndroidManifest.xml` — removed the obsolete
+  `package="..."` attribute. AGP 8.11 (used by this project) fails the build
+  when it is present; `namespace` in `android/app/build.gradle.kts` already
+  provides the value.
+- `.github/workflows/build-apk.yml` — no longer downloads the Android NDK
+  (this project compiles no native code; prebuilt MediaPipe .so ship inside
+  the flutter_gemma AAR). Installs exactly what AGP needs
+  (platform-tools, build-tools 35.0.0, platforms;android-36). Saves ~10
+  minutes per cloud build.
+- `android/gradle.properties` — Gradle heap raised to 3 GB (Kotlin 2 GB) so
+  R8 minification of the release APK never dies with an out-of-memory.
+- `.gitignore` — added (was completely missing): keeps .dart_tool/, .gradle/,
+  build/ and local machine files out of the repository.
+- `lib/chat_page/services/sound_manager.dart` — replaced `print()` with
+  `debugPrint()` (release-build log hygiene).
+
+### Verified (senior double-check pass)
+- Model: `gemma-3n-E2B-it-int4.task` @ google/gemma-3n-E2B-it-litert-preview —
+  exact published size 3,136,226,711 bytes re-confirmed against the Hugging
+  Face API; `expectedModelFileSize` matches byte-for-byte (~3.1 GB, down from
+  the previous 8 GB setup).
+- The model repo is gated (401 without login): the one-time Hugging Face
+  OAuth login (old-version flow) is required and fully wired
+  (OAuth 2.0 + PKCE, callback activity, token storage, license sheet on 403).
+- All 38 Dart files: imports resolve, braces balanced, assets present.
+- Adaptive launcher icons (rewoo logo) present in every density + anydpi-v26.
+- Release signing material present: `android/key.properties` +
+  `rewoo-vision-release.jks` (used by the cloud workflow).
+- pubspec.lock resolved versions consistent with pubspec.yaml
+  (flutter_gemma 0.10.0, flutter_downloader 1.12.0, flutter_web_auth_2 4.1.0).

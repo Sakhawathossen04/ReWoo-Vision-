@@ -31,6 +31,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_downloader/flutter_downloader.dart';
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:gemma_chat/chat_page/gemma_vision_chat.dart';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -58,6 +59,16 @@ class DownloadPageLogic {
   int _autoResumeAttempts = 0;
   static const int _maxAutoResumeAttempts = 5;
 
+  // Byte-accurate progress bookkeeping. flutter_downloader only reports a
+  // 0-100 percentage, so the true total size (from the HTTP Content-Length
+  // header, with the published HF size as fallback) lets us show real
+  // "GB downloaded / GB total", speed and remaining time instead of a bare
+  // percentage that previously confused users about the actual download size.
+  int _expectedBytes = 0;
+  int _lastSampledPercent = -1;
+  DateTime _lastSampleTime = DateTime.now();
+  double _downloadRate = 0; // bytes per second (smoothed)
+
   DownloadPageLogic({
     required this.setDownloadStatus,
     required this.setProgress,
@@ -73,8 +84,14 @@ class DownloadPageLogic {
   }
 
   /// Checks if the model file already exists on the device and is valid.
-  /// Returns true when the model file is present and > 0 bytes.
-  /// Also updates the UI state to `DownloadStatus.completed` if found.
+  ///
+  /// A file is VALID only when its size is at least [modelSizeTolerance] of
+  /// the published model size. Earlier builds accepted ANY non-empty file,
+  /// so a partially-downloaded or truncated file from a previous install was
+  /// treated as "model installed", the app jumped to the chat page and then
+  /// failed to load the model on every start. Invalid files are now deleted
+  /// automatically so the app falls back to a clean re-download.
+  /// Returns true only when a valid model file is present.
   Future<bool> checkIfModelExists() async {
     // Step 1: Find a completed download task that matches our model filename
     final tasks = await DownloadManager.getAllTasks();
@@ -92,19 +109,96 @@ class DownloadPageLogic {
         ? '${task.savedDir}/${task.filename}'
         : '${(await getApplicationDocumentsDirectory()).path}/$modelName';
 
-    // Step 3: Validate that the file exists and has content
+    // Step 3: Validate that the file exists and has the expected size
     final file = File(filePath);
     if (await file.exists()) {
       final size = await file.length();
-      if (size > 0) {
-        Logger.info('Found model file ($size bytes) at $filePath');
+      final minValid = (expectedModelFileSize * modelSizeTolerance).round();
+      if (size >= minValid) {
+        Logger.info(
+          'Found valid model file ($size bytes, expected ~$expectedModelFileSize) at $filePath',
+        );
         setDownloadStatus(DownloadStatus.completed);
         return true;
+      }
+
+      // Step 4: the file is partial/corrupt — remove it so the app can
+      // re-download cleanly instead of looping on a broken model.
+      Logger.warning(
+        'Model file invalid: $size bytes (need ≥$minValid). Deleting stale file.',
+      );
+      try {
+        await file.delete();
+        Logger.info('Stale model file deleted: $filePath');
+      } catch (e) {
+        Logger.error('Could not delete stale model file: $e');
+      }
+      // Also clear any stale flutter_downloader record for it.
+      if (task != null) {
+        try {
+          await FlutterDownloader.remove(taskId: task.taskId);
+        } catch (_) {}
       }
     }
 
     Logger.debug('Model file not found at $filePath');
     return false;
+  }
+
+  /// Deletes leftover partial download artifacts ("*.part", temp files and
+  /// undersized model files) from the documents directory. Called before a
+  /// fresh download so old broken chunks never waste user storage — one of
+  /// the reasons devices appeared to hold ~8 GB for a 3.1 GB model.
+  Future<void> _cleanupStaleModelArtifacts() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final minValid = (expectedModelFileSize * modelSizeTolerance).round();
+
+      for (final entity in dir.listSync()) {
+        if (entity is! File) continue;
+        final name = entity.uri.pathSegments.last.toLowerCase();
+        final isModelName = name == modelName.toLowerCase();
+        final isPartial = name.startsWith(modelName.toLowerCase()) &&
+            name != modelName.toLowerCase();
+        if (!isModelName && !isPartial) continue;
+
+        final size = await entity.length();
+        final tooSmall = isModelName && size < minValid;
+        if (isPartial || tooSmall) {
+          try {
+            await entity.delete();
+            Logger.info('Removed stale download artifact: ${entity.path} ($size bytes)');
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      Logger.error('Stale artifact cleanup failed: $e');
+    }
+  }
+
+  /// Resolves the true download size from the HTTP Content-Length header
+  /// (follows the HF redirect). Falls back to the published size constant.
+  Future<int> _resolveExpectedBytes(String? accessToken) async {
+    try {
+      final client = http.Client();
+      final request = http.Request('HEAD', Uri.parse(downloadUrl));
+      if (accessToken != null) {
+        request.headers['Authorization'] = 'Bearer $accessToken';
+      }
+      request.followRedirects = true;
+      final response = await client
+          .send(request)
+          .timeout(const Duration(seconds: 20));
+      final length = response.contentLength ?? 0;
+      client.close();
+      if (length > 0) {
+        Logger.info('Remote model size: $length bytes');
+        return length;
+      }
+    } catch (e) {
+      Logger.warning('Could not read Content-Length: $e');
+    }
+    return expectedModelFileSize;
   }
 
   /// Checks for downloads that were in progress when the app was last closed.
@@ -477,6 +571,16 @@ class DownloadPageLogic {
     setDownloadStatus(DownloadStatus.downloading);
     _autoResumeAttempts = 0;
 
+    // Remove stale partial files left by earlier attempts/versions so the
+    // user never pays storage twice for the same 3.1 GB model.
+    await _cleanupStaleModelArtifacts();
+
+    // Resolve the true byte total for accurate progress reporting.
+    _expectedBytes = await _resolveExpectedBytes(accessToken);
+    _lastSampledPercent = -1;
+    _lastSampleTime = DateTime.now();
+    _downloadRate = 0;
+
     // Clean up any failed downloads from previous attempts
     await DownloadManager.cleanupFailedDownloads();
 
@@ -536,13 +640,40 @@ class DownloadPageLogic {
           return;
         }
 
-        // Update UI with current progress information
+        // Update UI with byte-accurate progress (flutter_downloader only
+        // exposes a percentage, so bytes are derived from the true total).
+        final total = _expectedBytes > 0 ? _expectedBytes : expectedModelFileSize;
+        final downloaded = ((task.progress / 100) * total).round();
+
+        // Smoothed download-rate estimate from consecutive percentage samples.
+        final now = DateTime.now();
+        if (_lastSampledPercent >= 0 && task.progress > _lastSampledPercent) {
+          final dt = now.difference(_lastSampleTime).inMilliseconds;
+          if (dt > 0) {
+            final deltaBytes =
+                ((task.progress - _lastSampledPercent) / 100) * total;
+            final instant = deltaBytes / (dt / 1000);
+            _downloadRate = _downloadRate <= 0
+                ? instant
+                : (_downloadRate * 0.7 + instant * 0.3);
+          }
+        }
+        if (task.progress != _lastSampledPercent) {
+          _lastSampledPercent = task.progress;
+          _lastSampleTime = now;
+        }
+
+        final remainingBytes = (total - downloaded).clamp(0, total);
+        final remainingTime = _downloadRate > 1024
+            ? Duration(seconds: (remainingBytes / _downloadRate).round())
+            : Duration.zero;
+
         setProgress(
           DownloadProgress(
-            totalBytes: 100, // Using percentage-based progress
-            downloadedBytes: task.progress,
-            downloadRate: 0, // Rate calculation not implemented
-            remainingTime: Duration.zero, // Time calculation not implemented
+            totalBytes: total,
+            downloadedBytes: downloaded,
+            downloadRate: _downloadRate,
+            remainingTime: remainingTime,
             status: task.status,
           ),
         );
@@ -554,16 +685,23 @@ class DownloadPageLogic {
             timer.cancel();
             _monitoringTimer = null;
 
-            // Download successfully completed
-            setDownloadStatus(DownloadStatus.completed);
-            await DownloadStateManager.saveDownloadCompleted();
-            Logger.info('Download completed successfully');
+            // Verify the finished file BEFORE declaring success: a truncated
+            // download must never reach the chat page (it would fail model
+            // loading later). checkIfModelExists deletes invalid files.
+            if (await checkIfModelExists()) {
+              setDownloadStatus(DownloadStatus.completed);
+              await DownloadStateManager.saveDownloadCompleted();
+              Logger.info('Download completed and validated successfully');
 
-            // Automatically navigate to the chat page
-            if (context != null && context.mounted) {
-              Navigator.of(context).pushReplacement(
-                MaterialPageRoute(builder: (context) => ChatPage()),
-              );
+              // Automatically navigate to the chat page
+              if (context != null && context.mounted) {
+                Navigator.of(context).pushReplacement(
+                  MaterialPageRoute(builder: (context) => ChatPage()),
+                );
+              }
+            } else {
+              Logger.error('Downloaded model failed size validation — retrying');
+              await _autoRecoverOrFail(taskId, context);
             }
             break;
 

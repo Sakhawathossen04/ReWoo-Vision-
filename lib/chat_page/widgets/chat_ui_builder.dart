@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../../download_page/config/constants.dart';
 import '../models/message_models.dart';
 import 'chat_bubble.dart';
 import 'prompt_bar.dart';
@@ -15,22 +16,21 @@ class ChatUIBuilder {
       elevation: 0,
       backgroundColor: Colors.white,
       systemOverlayStyle: SystemUiOverlayStyle.dark,
-      // Image.asset is not const-constructible, so the Row itself cannot be const.
       title: Row(
         children: [
           ClipRRect(
-            borderRadius: BorderRadius.all(Radius.circular(8)),
+            borderRadius: BorderRadius.circular(8),
             child: Image.asset(
-              'assets/logo.png',
-              width: 34,
-              height: 34,
+              appLogoAsset,
+              width: 30,
+              height: 30,
               fit: BoxFit.cover,
-              excludeFromSemantics: true,
+              errorBuilder: (_, __, ___) => const SizedBox(width: 30),
             ),
           ),
           const SizedBox(width: 10),
           const Text(
-            'ReWoo Vision',
+            'rewoo vision',
             style: TextStyle(
               color: Colors.black87,
               fontSize: 20,
@@ -468,7 +468,7 @@ class ChatUIBuilder {
             CircularProgressIndicator(),
             SizedBox(height: 22),
             Text(
-              'ReWoo Vision প্রস্তুত হচ্ছে…',
+              'Gemma প্রস্তুত হচ্ছে…',
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
             ),
           ],

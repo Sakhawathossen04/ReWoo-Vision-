@@ -67,6 +67,20 @@ const String downloadUrl =
 const String modelCardUrl =
     'https://huggingface.co/google/gemma-3n-E2B-it-litert-preview';
 
+/// Exact published size of gemma-3n-E2B-it-int4.task on Hugging Face
+/// (3.14 GB). Used to validate a finished download AND to detect stale or
+/// partially-downloaded files left by earlier app versions — previously ANY
+/// non-empty file was treated as a valid model, which made the app believe
+/// a corrupt file was installed and then fail on every launch.
+const int expectedModelFileSize = 3136226711;
+
+/// A model file is accepted only when it is within this tolerance of the
+/// expected size. Anything smaller is deleted and re-downloaded.
+const double modelSizeTolerance = 0.98;
+
+/// App logo (bundled from https://rewoo.tech/assets/logo.jpg).
+const String appLogoAsset = 'assets/rewoo_logo.png';
+
 // ─────────────────────────────────────────────────────────────────────
 // SharedPreferences Keys
 // ─────────────────────────────────────────────────────────────────────

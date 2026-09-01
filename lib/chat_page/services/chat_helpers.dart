@@ -396,8 +396,18 @@ A Latin-script OCR engine produced this optional hint. It may be incomplete or w
       // Give auto-exposure/focus a brief moment after initialization. This is a
       // small latency tradeoff for noticeably more reliable text/object images.
       await Future.delayed(const Duration(milliseconds: 180));
-      final image = await controller.takePicture();
-      return File(image.path);
+      try {
+        final image = await controller.takePicture();
+        return File(image.path);
+      } catch (e) {
+        // Device-compatibility: a few OEM camera HALs reject the very first
+        // capture right after initialization. One short retry keeps those
+        // phones working instead of failing the whole voice command.
+        debugPrint('[ChatHelpers] first takePicture failed, retrying: $e');
+        await Future.delayed(const Duration(milliseconds: 400));
+        final image = await controller.takePicture();
+        return File(image.path);
+      }
     } finally {
       try {
         await controller.dispose();

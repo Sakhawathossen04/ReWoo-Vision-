@@ -1,5 +1,6 @@
 // lib/chat_page/services/sound_manager.dart
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 /// Centralized audio management for app sounds with fallback handling
@@ -22,7 +23,7 @@ class SoundManager {
       await _audioPlayer.setVolume(1.0); // Maximum volume for clear feedback
       await _audioPlayer.play(AssetSource('woosh.mp3'));
     } catch (e) {
-      print('Error playing woosh sound: $e');
+      debugPrint('Error playing woosh sound: $e');
       // Graceful fallback to system sound
       await SystemSound.play(SystemSoundType.click);
     }
@@ -33,9 +34,9 @@ class SoundManager {
     try {
       await _dictationPlayer.setVolume(1.0); // Max volume for accessibility
       await _dictationPlayer.play(AssetSource('dictation_start.mp3'));
-      print('Playing dictation start sound');
+      debugPrint('Playing dictation start sound');
     } catch (e) {
-      print('Error playing dictation start sound: $e');
+      debugPrint('Error playing dictation start sound: $e');
       // Multi-modal fallback: haptic + system sound
       await HapticFeedback.lightImpact();
       await SystemSound.play(SystemSoundType.click);
@@ -47,9 +48,9 @@ class SoundManager {
     try {
       await _dictationPlayer.setVolume(1.0); // Max volume for accessibility
       await _dictationPlayer.play(AssetSource('dictation_stop.mp3'));
-      print('Playing dictation stop sound');
+      debugPrint('Playing dictation stop sound');
     } catch (e) {
-      print('Error playing dictation stop sound: $e');
+      debugPrint('Error playing dictation stop sound: $e');
       // Stronger haptic feedback for "stop" action
       await HapticFeedback.mediumImpact();
       await SystemSound.play(SystemSoundType.click);
@@ -67,7 +68,7 @@ class SoundManager {
       await _loadingPlayer.play(AssetSource('loading.mp3'));
     } catch (e) {
       _isLoadingPlaying = false;
-      print('Error playing loading sound: $e');
+      debugPrint('Error playing loading sound: $e');
     }
   }
 
@@ -79,7 +80,7 @@ class SoundManager {
       _isLoadingPlaying = false;
       await _loadingPlayer.stop();
     } catch (e) {
-      print('Error stopping loading sound: $e');
+      debugPrint('Error stopping loading sound: $e');
     }
   }
 
@@ -90,7 +91,7 @@ class SoundManager {
     try {
       await _loadingPlayer.pause();
     } catch (e) {
-      print('Error pausing loading sound: $e');
+      debugPrint('Error pausing loading sound: $e');
     }
   }
 
@@ -101,7 +102,7 @@ class SoundManager {
     try {
       await _loadingPlayer.resume();
     } catch (e) {
-      print('Error resuming loading sound: $e');
+      debugPrint('Error resuming loading sound: $e');
     }
   }
 
