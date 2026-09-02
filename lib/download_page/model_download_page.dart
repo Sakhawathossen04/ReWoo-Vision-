@@ -8,6 +8,7 @@
 // 3. Check device capability and free storage before a NEW model download.
 // 4. Preserve existing recoverable partial downloads.
 // 5. Show and speak clear Bengali storage/device errors.
+// 6. NEVER start a fresh Hugging Face download when a verified model exists.
 
 import 'dart:async';
 
@@ -28,47 +29,87 @@ import 'ui/modern_ui_widgets.dart';
 import 'ui/ui_helpers.dart';
 
 class ModelDownloadPage extends StatefulWidget {
-  const ModelDownloadPage({super.key});
+  const ModelDownloadPage({
+    super.key,
+  });
 
   @override
-  State<ModelDownloadPage> createState() => _ModelDownloadPageState();
+  State<ModelDownloadPage> createState() =>
+      _ModelDownloadPageState();
 }
 
-class _ModelDownloadPageState extends State<ModelDownloadPage> {
+class _ModelDownloadPageState
+    extends State<ModelDownloadPage> {
   // ===========================================================================
   // TTS
   // ===========================================================================
 
-  final FlutterTts _tts = FlutterTts();
-  bool _ttsConfigured = false;
+  final FlutterTts _tts =
+      FlutterTts();
+
+  bool _ttsConfigured =
+      false;
 
   // ===========================================================================
   // DOWNLOAD STATE
   // ===========================================================================
 
-  DownloadStatus _downloadStatus = DownloadStatus.notStarted;
+  DownloadStatus _downloadStatus =
+      DownloadStatus.notStarted;
+
   DownloadProgress? _progress;
-  List<String> _errorMessages = [];
-  bool _showAgreementSheet = false;
+
+  List<String> _errorMessages =
+      [];
+
+  bool _showAgreementSheet =
+      false;
 
   // ===========================================================================
   // CAPABILITY STATE
   // ===========================================================================
 
-  bool _checkingCapability = false;
-  bool _startingDownload = false;
+  bool _checkingCapability =
+      false;
+
+  bool _startingDownload =
+      false;
+
   String? _capabilityMessage;
+
+  // ===========================================================================
+  // STARTUP / ROUTING STATE
+  // ===========================================================================
+
+  /// Prevents duplicate automatic download attempts.
+  bool _autoStartAttempted =
+      false;
+
+  /// Prevents duplicate ChatPage navigation.
+  bool _redirectingToChat =
+      false;
+
+  /// Once a verified model artifact has been discovered, a fresh 3+ GB
+  /// download must not be allowed unless DownloadLogic later proves that no
+  /// usable verified model remains.
+  ///
+  /// This is especially important when a legacy model exists but migration to
+  /// the canonical path cannot be completed immediately.
+  bool _blockFreshDownload =
+      false;
+
+  bool _disposed =
+      false;
 
   // ===========================================================================
   // OTHER STATE
   // ===========================================================================
 
-  late final DownloadPageLogic _logic;
+  late final DownloadPageLogic
+      _logic;
 
-  StreamSubscription? _logSubscription;
-
-  bool _autoStartAttempted = false;
-  bool _disposed = false;
+  StreamSubscription?
+      _logSubscription;
 
   // ===========================================================================
   // INIT
@@ -81,42 +122,116 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     _initializeLogic();
     _setupLogListener();
 
-    unawaited(_initializePage());
+    unawaited(
+      _initializePage(),
+    );
   }
 
   Future<void> _initializePage() async {
     try {
+      // -----------------------------------------------------------------------
+      // 1. TTS
+      // -----------------------------------------------------------------------
+
       await _configureTts();
 
-      if (!mounted || _disposed) return;
+      if (!mounted ||
+          _disposed) {
+        return;
+      }
+
+      // -----------------------------------------------------------------------
+      // 2. INITIALIZE DOWNLOAD MANAGER FIRST
+      //
+      // This allows background_downloader to finalize:
+      //
+      // model.task.part
+      //        ↓
+      // model.task
+      //
+      // before we decide whether another HF download is needed.
+      // -----------------------------------------------------------------------
+
+      await DownloadManager
+          .initialize();
+
+      Logger.info(
+        'Download manager initialized',
+      );
+
+      if (!mounted ||
+          _disposed) {
+        return;
+      }
+
+      // -----------------------------------------------------------------------
+      // 3. HARD MODEL GUARD
+      //
+      // Do this BEFORE saying that a model will be downloaded.
+      // -----------------------------------------------------------------------
+
+      final redirected =
+          await _redirectIfVerifiedModelReady(
+        source:
+            'initial startup',
+      );
+
+      if (!mounted ||
+          _disposed ||
+          redirected ||
+          _blockFreshDownload) {
+        return;
+      }
+
+      // -----------------------------------------------------------------------
+      // 4. ANNOUNCE SETUP
+      //
+      // Only reached when no verified reusable model was found.
+      // -----------------------------------------------------------------------
 
       await _announceInitialSetup();
 
-      if (!mounted || _disposed) return;
+      if (!mounted ||
+          _disposed) {
+        return;
+      }
 
-      await DownloadManager.initialize();
-
-      Logger.info('Download manager initialized');
-
-      if (!mounted || _disposed) return;
+      // -----------------------------------------------------------------------
+      // 5. RECOVERY / AUTO-START
+      // -----------------------------------------------------------------------
 
       await _checkDownloadState();
     } catch (e, st) {
       Logger.error(
         'ModelDownloadPage initialization failed: $e',
       );
-      debugPrint('$st');
 
-      if (!mounted || _disposed) return;
+      debugPrint(
+        '$st',
+      );
 
-      final message = _friendlyInitializationError(e);
+      if (!mounted ||
+          _disposed) {
+        return;
+      }
+
+      final message =
+          _friendlyInitializationError(
+        e,
+      );
 
       setState(() {
-        _downloadStatus = DownloadStatus.failed;
-        _errorMessages = [message];
+        _downloadStatus =
+            DownloadStatus.failed;
+
+        _errorMessages = [
+          message,
+        ];
       });
 
-      await _speak(message);
+      await _speak(
+        message,
+      );
     }
   }
 
@@ -125,36 +240,226 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // ===========================================================================
 
   void _initializeLogic() {
-    _logic = DownloadPageLogic(
-      setDownloadStatus: (status) {
-        if (!mounted || _disposed) return;
+    _logic =
+        DownloadPageLogic(
+      setDownloadStatus:
+          (status) {
+        if (!mounted ||
+            _disposed) {
+          return;
+        }
 
         setState(() {
-          _downloadStatus = status;
+          _downloadStatus =
+              status;
         });
       },
-      setProgress: (progress) {
-        if (!mounted || _disposed) return;
+
+      setProgress:
+          (progress) {
+        if (!mounted ||
+            _disposed) {
+          return;
+        }
 
         setState(() {
-          _progress = progress;
+          _progress =
+              progress;
         });
       },
-      setErrorMessages: (messages) {
-        if (!mounted || _disposed) return;
+
+      setErrorMessages:
+          (messages) {
+        if (!mounted ||
+            _disposed) {
+          return;
+        }
 
         setState(() {
-          _errorMessages = List<String>.from(messages);
+          _errorMessages =
+              List<String>.from(
+            messages,
+          );
         });
       },
-      setShowAgreementSheet: (show) {
-        if (!mounted || _disposed) return;
+
+      setShowAgreementSheet:
+          (show) {
+        if (!mounted ||
+            _disposed) {
+          return;
+        }
 
         setState(() {
-          _showAgreementSheet = show;
+          _showAgreementSheet =
+              show;
         });
       },
     );
+  }
+
+  // ===========================================================================
+  // VERIFIED MODEL HARD GUARD
+  // ===========================================================================
+
+  /// Checks physical/model recovery first.
+  ///
+  /// Result:
+  ///
+  /// usable verified model
+  ///      ↓
+  /// completed + verified
+  ///      ↓
+  /// ChatPage
+  ///
+  /// verified model exists but migration/path repair is incomplete
+  ///      ↓
+  /// BLOCK fresh download
+  ///
+  /// no model
+  ///      ↓
+  /// normal recovery/download flow may continue
+  Future<bool>
+      _redirectIfVerifiedModelReady({
+    required String source,
+  }) async {
+    if (_disposed ||
+        !mounted) {
+      return false;
+    }
+
+    if (_redirectingToChat) {
+      return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // PHYSICAL MODEL IS SOURCE OF TRUTH
+    // -------------------------------------------------------------------------
+
+    final modelExists =
+        await _logic
+            .checkIfModelExists();
+
+    if (!mounted ||
+        _disposed) {
+      return false;
+    }
+
+    if (!modelExists) {
+      return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // IMPORTANT
+    //
+    // The corrected DownloadLogic repairs DownloadStateManager to:
+    //
+    // completed + verified
+    //
+    // only when the model is actually ready at the canonical path used by
+    // GemmaService.
+    //
+    // Therefore check the persisted state again before navigating.
+    // -------------------------------------------------------------------------
+
+    final recovery =
+        await DownloadStateManager
+            .getRecoveryState();
+
+    final ready =
+        recovery.status ==
+                DownloadStateManager
+                    .completed &&
+            recovery.verified;
+
+    if (!ready) {
+      // A verified legacy model may exist, but DownloadLogic could not yet make
+      // it usable from the canonical model location.
+      //
+      // DO NOT start another 3+ GB download.
+      _blockFreshDownload =
+          true;
+
+      _autoStartAttempted =
+          true;
+
+      Logger.warning(
+        'Verified model artifact found during $source, '
+        'but canonical completed/verified state is not ready. '
+        'Fresh Hugging Face download is BLOCKED.',
+      );
+
+      if (_errorMessages.isEmpty &&
+          mounted &&
+          !_disposed) {
+        setState(() {
+          _downloadStatus =
+              DownloadStatus.failed;
+
+          _errorMessages = [
+            'আগের সম্পূর্ণ AI model file পাওয়া গেছে। '
+                'তাই নতুন Hugging Face download শুরু করা হবে না। '
+                'Model recovery/migration সম্পন্ন না হওয়া পর্যন্ত '
+                'আগের file নিরাপদ রাখা হয়েছে।',
+          ];
+        });
+      }
+
+      return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // VERIFIED + READY
+    // -------------------------------------------------------------------------
+
+    _blockFreshDownload =
+        true;
+
+    _autoStartAttempted =
+        true;
+
+    _redirectingToChat =
+        true;
+
+    setState(() {
+      _downloadStatus =
+          DownloadStatus.completed;
+
+      _capabilityMessage =
+          null;
+
+      _errorMessages =
+          [];
+
+      _showAgreementSheet =
+          false;
+    });
+
+    Logger.info(
+      'Verified installed model confirmed during $source. '
+      'Skipping Hugging Face download and opening ChatPage.',
+    );
+
+    // Do not allow download-page speech to continue over ChatPage startup.
+    try {
+      await _tts.stop();
+    } catch (_) {}
+
+    if (!mounted ||
+        _disposed) {
+      return false;
+    }
+
+    Navigator.of(context)
+        .pushReplacement(
+      MaterialPageRoute(
+        builder:
+            (_) =>
+                const ChatPage(),
+      ),
+    );
+
+    return true;
   }
 
   // ===========================================================================
@@ -162,12 +467,19 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // ===========================================================================
 
   Future<void> _configureTts() async {
-    if (_ttsConfigured || _disposed) return;
+    if (_ttsConfigured ||
+        _disposed) {
+      return;
+    }
 
     try {
-      await TtsEngineService.configure(_tts);
+      await TtsEngineService
+          .configure(
+        _tts,
+      );
 
-      _ttsConfigured = true;
+      _ttsConfigured =
+          true;
 
       Logger.info(
         'Download-page TTS configured through TtsEngineService',
@@ -179,19 +491,28 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     }
   }
 
-  Future<void> _speak(String message) async {
-    final text = message.trim();
+  Future<void> _speak(
+    String message,
+  ) async {
+    final text =
+        message.trim();
 
-    if (text.isEmpty || _disposed) return;
+    if (text.isEmpty ||
+        _disposed) {
+      return;
+    }
 
     try {
       if (!_ttsConfigured) {
         await _configureTts();
       }
 
-      if (_disposed) return;
+      if (_disposed) {
+        return;
+      }
 
-      await TtsEngineService.speakWithTimeout(
+      await TtsEngineService
+          .speakWithTimeout(
         _tts,
         text,
       );
@@ -202,16 +523,22 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     }
   }
 
-  Future<void> _announceInitialSetup() async {
+  Future<void>
+      _announceInitialSetup() async {
     await Future.delayed(
-      const Duration(milliseconds: 650),
+      const Duration(
+        milliseconds: 650,
+      ),
     );
 
-    if (!mounted || _disposed) return;
+    if (!mounted ||
+        _disposed) {
+      return;
+    }
 
     await _speak(
       'ReWoo Vision প্রস্তুত হচ্ছে। '
-      'প্রয়োজনীয় AI মডেল ডাউনলোড হবে। '
+      'প্রয়োজনীয় AI মডেল পাওয়া না গেলে ডাউনলোড হবে। '
       'প্রথমবার প্রয়োজন হলে ডাউনলোড বোতাম চেপে '
       'Hugging Face লগইন করুন। '
       'ইন্টারনেট সংযোগ চালু রাখুন।',
@@ -223,11 +550,17 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // ===========================================================================
 
   void _setupLogListener() {
-    _logSubscription = Logger.logStream.listen(
+    _logSubscription =
+        Logger.logStream.listen(
       (_) {
-        if (!mounted || _disposed) return;
+        if (!mounted ||
+            _disposed) {
+          return;
+        }
 
-        setState(() {});
+        setState(
+          () {},
+        );
       },
     );
   }
@@ -236,30 +569,142 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // DOWNLOAD RECOVERY / AUTO START
   // ===========================================================================
 
-  Future<void> _checkDownloadState() async {
-    // Recover existing task first.
-    await _logic.checkForOngoingDownloads(context);
+  Future<void>
+      _checkDownloadState() async {
+    // -------------------------------------------------------------------------
+    // GUARD #1
+    // Before recovery.
+    // -------------------------------------------------------------------------
 
-    if (!mounted || _disposed) return;
-
-    if (_autoStartAttempted) return;
-
-    _autoStartAttempted = true;
-
-    final canAutoStart = await _logic.canAutoStartDownload();
-
-    if (!mounted || _disposed || !canAutoStart) return;
-
-    await Future.delayed(
-      const Duration(milliseconds: 1200),
+    final redirectedBeforeRecovery =
+        await _redirectIfVerifiedModelReady(
+      source:
+          'before recovery',
     );
 
-    if (!mounted || _disposed) return;
+    if (!mounted ||
+        _disposed ||
+        redirectedBeforeRecovery ||
+        _blockFreshDownload) {
+      return;
+    }
 
-    if (_downloadStatus == DownloadStatus.notStarted ||
-        _downloadStatus == DownloadStatus.failed) {
+    // -------------------------------------------------------------------------
+    // Recover existing task.
+    // -------------------------------------------------------------------------
+
+    await _logic
+        .checkForOngoingDownloads(
+      context,
+    );
+
+    if (!mounted ||
+        _disposed) {
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // GUARD #2
+    //
+    // Recovery may just have finalized:
+    //
+    // .part → final
+    //
+    // so check again.
+    // -------------------------------------------------------------------------
+
+    final redirectedAfterRecovery =
+        await _redirectIfVerifiedModelReady(
+      source:
+          'after recovery',
+    );
+
+    if (!mounted ||
+        _disposed ||
+        redirectedAfterRecovery ||
+        _blockFreshDownload) {
+      return;
+    }
+
+    if (_autoStartAttempted) {
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // GUARD #3
+    //
+    // Final verification before auto-start eligibility.
+    // -------------------------------------------------------------------------
+
+    final redirectedBeforeAutoCheck =
+        await _redirectIfVerifiedModelReady(
+      source:
+          'before auto-start eligibility',
+    );
+
+    if (!mounted ||
+        _disposed ||
+        redirectedBeforeAutoCheck ||
+        _blockFreshDownload) {
+      return;
+    }
+
+    final canAutoStart =
+        await _logic
+            .canAutoStartDownload();
+
+    if (!mounted ||
+        _disposed ||
+        !canAutoStart ||
+        _blockFreshDownload) {
+      return;
+    }
+
+    // From this point only one automatic attempt is allowed.
+    _autoStartAttempted =
+        true;
+
+    await Future.delayed(
+      const Duration(
+        milliseconds: 1200,
+      ),
+    );
+
+    if (!mounted ||
+        _disposed) {
+      return;
+    }
+
+    // -------------------------------------------------------------------------
+    // GUARD #4
+    //
+    // Race-condition protection:
+    //
+    // model may have completed during the 1.2 second delay.
+    // -------------------------------------------------------------------------
+
+    final redirectedLastMoment =
+        await _redirectIfVerifiedModelReady(
+      source:
+          'last moment before auto-start',
+    );
+
+    if (!mounted ||
+        _disposed ||
+        redirectedLastMoment ||
+        _blockFreshDownload) {
+      return;
+    }
+
+    if (_downloadStatus ==
+            DownloadStatus
+                .notStarted ||
+        _downloadStatus ==
+            DownloadStatus
+                .failed) {
       await _startDownloadSafely(
-        autoStart: true,
+        autoStart:
+            true,
       );
     }
   }
@@ -271,13 +716,46 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   Future<void> _startDownloadSafely({
     bool autoStart = false,
   }) async {
-    if (_disposed || _startingDownload) return;
+    if (_disposed ||
+        _startingDownload ||
+        _redirectingToChat ||
+        _blockFreshDownload) {
+      return;
+    }
 
-    _startingDownload = true;
+    _startingDownload =
+        true;
 
     try {
+      // -----------------------------------------------------------------------
+      // FINAL HARD GUARD
+      //
+      // Applies to BOTH:
+      //
+      // automatic download
+      // manual Download button
+      //
+      // No new task may be created while a verified model exists.
+      // -----------------------------------------------------------------------
+
+      final redirected =
+          await _redirectIfVerifiedModelReady(
+        source:
+            autoStart
+                ? 'automatic download request'
+                : 'manual download request',
+      );
+
+      if (!mounted ||
+          _disposed ||
+          redirected ||
+          _blockFreshDownload) {
+        return;
+      }
+
       final recovery =
-          await DownloadStateManager.getRecoveryState();
+          await DownloadStateManager
+              .getRecoveryState();
 
       // -----------------------------------------------------------------------
       // EXISTING RECOVERABLE DOWNLOAD
@@ -290,8 +768,10 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
           'Fresh-download capability gate skipped.',
         );
 
-        await _logic.startDownload(
-          autoStart: autoStart,
+        await _logic
+            .startDownload(
+          autoStart:
+              autoStart,
         );
 
         return;
@@ -301,14 +781,20 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       // INTERRUPTED VERIFICATION
       // -----------------------------------------------------------------------
 
-      if (recovery.status == DownloadStateManager.verifying) {
+      if (recovery.status ==
+          DownloadStateManager
+              .verifying) {
         const message =
             'মডেল ডাউনলোড শেষ হয়েছে এবং verification সম্পন্ন হওয়ার '
             'অপেক্ষায় আছে। নতুন download শুরু করা হবে না।';
 
-        _setCapabilityError(message);
+        _setCapabilityError(
+          message,
+        );
 
-        await _speak(message);
+        await _speak(
+          message,
+        );
 
         return;
       }
@@ -320,15 +806,48 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       final allowed =
           await _checkCapabilityForNewDownload();
 
-      if (!allowed) return;
+      if (!allowed) {
+        return;
+      }
 
-      if (!mounted || _disposed) return;
+      if (!mounted ||
+          _disposed ||
+          _blockFreshDownload) {
+        return;
+      }
 
-      await _logic.startDownload(
-        autoStart: autoStart,
+      // -----------------------------------------------------------------------
+      // FINAL CHECK DIRECTLY BEFORE DownloadLogic.startDownload()
+      // -----------------------------------------------------------------------
+
+      final finalRedirect =
+          await _redirectIfVerifiedModelReady(
+        source:
+            'immediately before creating download task',
+      );
+
+      if (!mounted ||
+          _disposed ||
+          finalRedirect ||
+          _blockFreshDownload) {
+        return;
+      }
+
+      await _logic
+          .startDownload(
+        autoStart:
+            autoStart,
       );
     } finally {
-      _startingDownload = false;
+      _startingDownload =
+          false;
+
+      if (mounted &&
+          !_disposed) {
+        setState(
+          () {},
+        );
+      }
     }
   }
 
@@ -336,16 +855,26 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // DEVICE CAPABILITY GATE
   // ===========================================================================
 
-  Future<bool> _checkCapabilityForNewDownload() async {
-    if (_checkingCapability || _disposed) {
+  Future<bool>
+      _checkCapabilityForNewDownload() async {
+    if (_checkingCapability ||
+        _disposed) {
       return false;
     }
 
-    _checkingCapability = true;
+    // A verified installed model always wins over a fresh-download request.
+    if (_blockFreshDownload ||
+        _redirectingToChat) {
+      return false;
+    }
+
+    _checkingCapability =
+        true;
 
     if (mounted) {
       setState(() {
-        _capabilityMessage = null;
+        _capabilityMessage =
+            null;
       });
     }
 
@@ -355,30 +884,41 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       );
 
       final capability =
-          await DeviceCapabilityService.check();
+          await DeviceCapabilityService
+              .check();
 
-      if (!mounted || _disposed) {
+      if (!mounted ||
+          _disposed) {
         return false;
       }
 
       final reason =
-          _getDownloadBlockReason(capability);
+          _getDownloadBlockReason(
+        capability,
+      );
 
       if (reason != null) {
         Logger.warning(
           'Model download blocked: $reason',
         );
 
-        _setCapabilityError(reason);
+        _setCapabilityError(
+          reason,
+        );
 
-        await _speak(reason);
+        await _speak(
+          reason,
+        );
 
         return false;
       }
 
       setState(() {
-        _capabilityMessage = null;
-        _errorMessages = [];
+        _capabilityMessage =
+            null;
+
+        _errorMessages =
+            [];
       });
 
       Logger.info(
@@ -393,9 +933,13 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       Logger.error(
         'Device capability check failed: $e',
       );
-      debugPrint('$st');
 
-      if (!mounted || _disposed) {
+      debugPrint(
+        '$st',
+      );
+
+      if (!mounted ||
+          _disposed) {
         return false;
       }
 
@@ -404,16 +948,24 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
           'পরীক্ষা করা যায়নি। নিরাপত্তার জন্য বড় AI model '
           'download শুরু করা হয়নি।';
 
-      _setCapabilityError(message);
+      _setCapabilityError(
+        message,
+      );
 
-      await _speak(message);
+      await _speak(
+        message,
+      );
 
       return false;
     } finally {
-      _checkingCapability = false;
+      _checkingCapability =
+          false;
 
-      if (mounted && !_disposed) {
-        setState(() {});
+      if (mounted &&
+          !_disposed) {
+        setState(
+          () {},
+        );
       }
     }
   }
@@ -429,7 +981,8 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // 1. FREE STORAGE
     // -------------------------------------------------------------------------
 
-    if (!capability.hasEnoughStorageForDownload) {
+    if (!capability
+        .hasEnoughStorageForDownload) {
       return 'মডেল ডাউনলোড করতে অন্তত ৬ জিবি খালি জায়গা প্রয়োজন। '
           'এই ফোনে বর্তমানে প্রায় '
           '${capability.freeStorageGb.toStringAsFixed(1)} জিবি খালি আছে। '
@@ -440,7 +993,8 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // 2. ANDROID
     // -------------------------------------------------------------------------
 
-    if (!capability.android9OrLater) {
+    if (!capability
+        .android9OrLater) {
       return 'ReWoo Vision ব্যবহার করতে Android 9 '
           'বা তার পরের version প্রয়োজন।';
     }
@@ -449,7 +1003,8 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // 3. 64-BIT
     // -------------------------------------------------------------------------
 
-    if (!capability.is64BitCapable) {
+    if (!capability
+        .is64BitCapable) {
       return 'এই ফোনে 64-bit AI runtime support নেই। '
           'এই device-এ local Gemma model চালানো যাবে না।';
     }
@@ -458,7 +1013,8 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // 4. ARM64
     // -------------------------------------------------------------------------
 
-    if (!capability.hasArm64) {
+    if (!capability
+        .hasArm64) {
       return 'এই ফোনে ARM64 architecture পাওয়া যায়নি। '
           'বর্তমান local Gemma runtime এই device-এর সাথে compatible নয়।';
     }
@@ -467,20 +1023,25 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // 5. RAM
     // -------------------------------------------------------------------------
 
-    if (capability.physicalRamMb <= 0) {
+    if (capability
+            .physicalRamMb <=
+        0) {
       return 'এই ফোনের RAM capacity নির্ভরযোগ্যভাবে যাচাই করা যায়নি। '
           'নিরাপত্তার জন্য বড় local AI model download শুরু করা হয়নি।';
     }
 
-    if (capability.physicalRamMb <
-        DeviceCapabilityService.minimumLocalGemmaRamMb) {
+    if (capability
+            .physicalRamMb <
+        DeviceCapabilityService
+            .minimumLocalGemmaRamMb) {
       return 'এই ফোনে প্রায় '
           '${capability.physicalRamGb.toStringAsFixed(1)} জিবি RAM আছে। '
           'Local Gemma model চালাতে অন্তত ৬ জিবি RAM প্রয়োজন। '
           'তাই model download শুরু করা হচ্ছে না।';
     }
 
-    if (capability.isLowRamDevice) {
+    if (capability
+        .isLowRamDevice) {
       return 'Android এই ফোনটিকে low-RAM device হিসেবে চিহ্নিত করেছে। '
           'এই device-এ বড় local AI model নিরাপদভাবে চালানো যাবে না।';
     }
@@ -489,7 +1050,8 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // 6. CAMERA
     // -------------------------------------------------------------------------
 
-    if (!capability.cameraAvailable) {
+    if (!capability
+        .cameraAvailable) {
       return 'এই ফোনে ব্যবহারযোগ্য camera পাওয়া যায়নি। '
           'ReWoo Vision-এর visual assistant feature চালানো যাবে না।';
     }
@@ -498,9 +1060,14 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     // OTHER HARD BLOCKER
     // -------------------------------------------------------------------------
 
-    if (!capability.localGemmaSupported &&
-        capability.blockers.isNotEmpty) {
-      return capability.blockers.first;
+    if (!capability
+            .localGemmaSupported &&
+        capability
+            .blockers
+            .isNotEmpty) {
+      return capability
+          .blockers
+          .first;
     }
 
     return null;
@@ -510,13 +1077,24 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // CAPABILITY ERROR
   // ===========================================================================
 
-  void _setCapabilityError(String message) {
-    if (!mounted || _disposed) return;
+  void _setCapabilityError(
+    String message,
+  ) {
+    if (!mounted ||
+        _disposed) {
+      return;
+    }
 
     setState(() {
-      _downloadStatus = DownloadStatus.failed;
-      _capabilityMessage = message;
-      _errorMessages = [message];
+      _downloadStatus =
+          DownloadStatus.failed;
+
+      _capabilityMessage =
+          message;
+
+      _errorMessages = [
+        message,
+      ];
     });
   }
 
@@ -524,19 +1102,25 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // RESUME
   // ===========================================================================
 
-  Future<void> _resumeDownload() async {
-    if (_disposed) return;
+  Future<void>
+      _resumeDownload() async {
+    if (_disposed) {
+      return;
+    }
 
-    // Resume is not a fresh download, therefore we do not require another
-    // completely unused 6GB before attempting recovery.
+    // Resume is not a fresh download.
+    //
+    // Do not require another completely unused 6GB before attempting recovery.
 
     if (mounted) {
       setState(() {
-        _capabilityMessage = null;
+        _capabilityMessage =
+            null;
       });
     }
 
-    await _logic.resumeDownload();
+    await _logic
+        .resumeDownload();
   }
 
   // ===========================================================================
@@ -547,19 +1131,35 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
     Object error,
   ) {
     final text =
-        error.toString().toLowerCase();
+        error
+            .toString()
+            .toLowerCase();
 
-    if (text.contains('no space') ||
-        text.contains('not enough space') ||
-        text.contains('insufficient space') ||
-        text.contains('enospc')) {
+    if (text.contains(
+          'no space',
+        ) ||
+        text.contains(
+          'not enough space',
+        ) ||
+        text.contains(
+          'insufficient space',
+        ) ||
+        text.contains(
+          'enospc',
+        )) {
       return 'ফোনে পর্যাপ্ত খালি storage নেই। '
           'Model download-এর জন্য অন্তত ৬ জিবি খালি জায়গা রাখুন।';
     }
 
-    if (text.contains('network') ||
-        text.contains('connection') ||
-        text.contains('socket')) {
+    if (text.contains(
+          'network',
+        ) ||
+        text.contains(
+          'connection',
+        ) ||
+        text.contains(
+          'socket',
+        )) {
       return 'ইন্টারনেট সংযোগে সমস্যা হয়েছে। '
           'আগের partial download থাকলে সেটি মুছে ফেলা হয়নি।';
     }
@@ -574,9 +1174,11 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
 
   @override
   void dispose() {
-    _disposed = true;
+    _disposed =
+        true;
 
-    _logSubscription?.cancel();
+    _logSubscription
+        ?.cancel();
 
     _logic.dispose();
 
@@ -592,19 +1194,30 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
   // ===========================================================================
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(
+    BuildContext context,
+  ) {
     final controlsDisabled =
         _checkingCapability ||
-        _startingDownload;
+            _startingDownload ||
+            _redirectingToChat;
 
     return Scaffold(
-      backgroundColor: Colors.grey[50],
-      body: SafeArea(
-        child: Stack(
+      backgroundColor:
+          Colors.grey[50],
+
+      body:
+          SafeArea(
+        child:
+            Stack(
           children: [
             Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
+              padding:
+                  const EdgeInsets.all(
+                24,
+              ),
+              child:
+                  Column(
                 children: [
                   const Spacer(),
 
@@ -617,55 +1230,81 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                       // =======================================================
 
                       Center(
-                        child: Container(
-                          width: 104,
-                          height: 104,
-                          decoration: BoxDecoration(
+                        child:
+                            Container(
+                          width:
+                              104,
+                          height:
+                              104,
+                          decoration:
+                              BoxDecoration(
                             borderRadius:
-                                BorderRadius.circular(26),
-                            border: Border.all(
-                              color: Colors.grey.shade200,
+                                BorderRadius.circular(
+                              26,
+                            ),
+                            border:
+                                Border.all(
+                              color:
+                                  Colors.grey.shade200,
                             ),
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withOpacity(
+                                color:
+                                    Colors.black.withOpacity(
                                   0.06,
                                 ),
-                                blurRadius: 14,
-                                offset: const Offset(0, 5),
+                                blurRadius:
+                                    14,
+                                offset:
+                                    const Offset(
+                                  0,
+                                  5,
+                                ),
                               ),
                             ],
                           ),
-                          child: ClipRRect(
+                          child:
+                              ClipRRect(
                             borderRadius:
-                                BorderRadius.circular(25),
-                            child: Image.asset(
+                                BorderRadius.circular(
+                              25,
+                            ),
+                            child:
+                                Image.asset(
                               'assets/logo.png',
-                              fit: BoxFit.cover,
-                              excludeFromSemantics: true,
+                              fit:
+                                  BoxFit.cover,
+                              excludeFromSemantics:
+                                  true,
                             ),
                           ),
                         ),
                       ),
 
-                      const SizedBox(height: 28),
+                      const SizedBox(
+                        height: 28,
+                      ),
 
                       // =======================================================
                       // DOWNLOAD ICON
                       // =======================================================
 
-                      ModernUIWidgets.buildDownloadIcon(
+                      ModernUIWidgets
+                          .buildDownloadIcon(
                         _downloadStatus,
                         _progress,
                       ),
 
-                      const SizedBox(height: 32),
+                      const SizedBox(
+                        height: 32,
+                      ),
 
                       // =======================================================
                       // STATUS
                       // =======================================================
 
-                      ModernUIWidgets.buildStatusMessage(
+                      ModernUIWidgets
+                          .buildStatusMessage(
                         _downloadStatus,
                         _progress,
                         _errorMessages,
@@ -675,39 +1314,66 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                       // DEVICE / STORAGE WARNING
                       // =======================================================
 
-                      if (_capabilityMessage != null) ...[
-                        const SizedBox(height: 20),
+                      if (_capabilityMessage !=
+                          null) ...[
+                        const SizedBox(
+                          height:
+                              20,
+                        ),
 
                         Semantics(
-                          liveRegion: true,
-                          label: _capabilityMessage,
-                          child: Container(
-                            width: double.infinity,
+                          liveRegion:
+                              true,
+                          label:
+                              _capabilityMessage,
+                          child:
+                              Container(
+                            width:
+                                double.infinity,
                             padding:
-                                const EdgeInsets.all(16),
-                            decoration: BoxDecoration(
-                              color: Colors.orange[50],
+                                const EdgeInsets.all(
+                              16,
+                            ),
+                            decoration:
+                                BoxDecoration(
+                              color:
+                                  Colors.orange[50],
                               borderRadius:
-                                  BorderRadius.circular(14),
-                              border: Border.all(
-                                color: Colors.orange[300]!,
+                                  BorderRadius.circular(
+                                14,
+                              ),
+                              border:
+                                  Border.all(
+                                color:
+                                    Colors.orange[300]!,
                               ),
                             ),
-                            child: Row(
+                            child:
+                                Row(
                               crossAxisAlignment:
                                   CrossAxisAlignment.start,
                               children: [
                                 Icon(
                                   Icons.warning_amber_rounded,
-                                  color: Colors.orange[800],
+                                  color:
+                                      Colors.orange[800],
                                 ),
-                                const SizedBox(width: 12),
+
+                                const SizedBox(
+                                  width:
+                                      12,
+                                ),
+
                                 Expanded(
-                                  child: Text(
+                                  child:
+                                      Text(
                                     _capabilityMessage!,
-                                    style: TextStyle(
-                                      fontSize: 15,
-                                      height: 1.4,
+                                    style:
+                                        TextStyle(
+                                      fontSize:
+                                          15,
+                                      height:
+                                          1.4,
                                       fontWeight:
                                           FontWeight.w600,
                                       color:
@@ -721,18 +1387,23 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                         ),
                       ],
 
-                      const SizedBox(height: 24),
+                      const SizedBox(
+                        height: 24,
+                      ),
 
                       // =======================================================
                       // PROGRESS
                       // =======================================================
 
-                      ModernUIWidgets.buildProgressBar(
+                      ModernUIWidgets
+                          .buildProgressBar(
                         _progress,
                         _downloadStatus,
                       ),
 
-                      const SizedBox(height: 32),
+                      const SizedBox(
+                        height: 32,
+                      ),
 
                       // =======================================================
                       // CAPABILITY CHECK
@@ -740,31 +1411,46 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
 
                       if (_checkingCapability) ...[
                         Semantics(
-                          liveRegion: true,
+                          liveRegion:
+                              true,
                           label:
                               'ফোনের storage এবং AI capability পরীক্ষা করা হচ্ছে',
-                          child: const Row(
+                          child:
+                              const Row(
                             mainAxisAlignment:
                                 MainAxisAlignment.center,
                             children: [
                               SizedBox(
-                                width: 20,
-                                height: 20,
+                                width:
+                                    20,
+                                height:
+                                    20,
                                 child:
                                     CircularProgressIndicator(
-                                  strokeWidth: 2.5,
+                                  strokeWidth:
+                                      2.5,
                                 ),
                               ),
-                              SizedBox(width: 12),
+
+                              SizedBox(
+                                width:
+                                    12,
+                              ),
+
                               Flexible(
-                                child: Text(
+                                child:
+                                    Text(
                                   'ফোনের storage ও AI capability পরীক্ষা করা হচ্ছে...',
                                 ),
                               ),
                             ],
                           ),
                         ),
-                        const SizedBox(height: 20),
+
+                        const SizedBox(
+                          height:
+                              20,
+                        ),
                       ],
 
                       // =======================================================
@@ -772,12 +1458,17 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                       // =======================================================
 
                       IgnorePointer(
-                        ignoring: controlsDisabled,
-                        child: Opacity(
+                        ignoring:
+                            controlsDisabled,
+                        child:
+                            Opacity(
                           opacity:
-                              controlsDisabled ? 0.55 : 1.0,
+                              controlsDisabled
+                                  ? 0.55
+                                  : 1.0,
                           child:
-                              ModernUIWidgets.buildActionButtons(
+                              ModernUIWidgets
+                                  .buildActionButtons(
                             _downloadStatus,
 
                             // START
@@ -812,11 +1503,13 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
 
                             // CONTINUE
                             () {
-                              Navigator.of(context)
-                                  .pushReplacement(
+                              Navigator.of(
+                                context,
+                              ).pushReplacement(
                                 MaterialPageRoute(
-                                  builder: (_) =>
-                                      const ChatPage(),
+                                  builder:
+                                      (_) =>
+                                          const ChatPage(),
                                 ),
                               );
                             },
@@ -832,39 +1525,60 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
                   // ERROR DETAILS
                   // ===========================================================
 
-                  if (_errorMessages.isNotEmpty &&
+                  if (_errorMessages
+                          .isNotEmpty &&
                       _downloadStatus ==
-                          DownloadStatus.failed) ...[
+                          DownloadStatus
+                              .failed) ...[
                     Container(
-                      width: double.infinity,
-                      decoration: BoxDecoration(
-                        color: Colors.red[50],
+                      width:
+                          double.infinity,
+                      decoration:
+                          BoxDecoration(
+                        color:
+                            Colors.red[50],
                         borderRadius:
-                            BorderRadius.circular(12),
-                        border: Border.all(
-                          color: Colors.red[200]!,
+                            BorderRadius.circular(
+                          12,
+                        ),
+                        border:
+                            Border.all(
+                          color:
+                              Colors.red[200]!,
                         ),
                       ),
-                      child: TextButton.icon(
-                        onPressed: () {
-                          UIHelpers.showErrorDialog(
+                      child:
+                          TextButton.icon(
+                        onPressed:
+                            () {
+                          UIHelpers
+                              .showErrorDialog(
                             context,
                             _errorMessages,
                           );
                         },
-                        icon: Icon(
+                        icon:
+                            Icon(
                           Icons.error_outline,
-                          color: Colors.red[600],
+                          color:
+                              Colors.red[600],
                         ),
-                        label: Text(
+                        label:
+                            Text(
                           'সমস্যার বিস্তারিত দেখুন',
-                          style: TextStyle(
-                            color: Colors.red[600],
+                          style:
+                              TextStyle(
+                            color:
+                                Colors.red[600],
                           ),
                         ),
                       ),
                     ),
-                    const SizedBox(height: 16),
+
+                    const SizedBox(
+                      height:
+                          16,
+                    ),
                   ],
                 ],
               ),
@@ -874,10 +1588,14 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
             // LOGS
             // ===============================================================
 
-            ModernUIWidgets.buildLogsButton(
+            ModernUIWidgets
+                .buildLogsButton(
               context,
               () {
-                UIHelpers.showLogsDialog(context);
+                UIHelpers
+                    .showLogsDialog(
+                  context,
+                );
               },
             ),
           ],
@@ -888,19 +1606,23 @@ class _ModelDownloadPageState extends State<ModelDownloadPage> {
       // LICENSE
       // =========================================================================
 
-      bottomSheet: _showAgreementSheet
-          ? ModernUIWidgets.buildLicenseBottomSheet(
-              context,
-              () {
-                _logic.cancelLicenseAgreement();
-              },
-              () {
-                unawaited(
-                  _logic.openLicenseAgreement(),
-                );
-              },
-            )
-          : null,
+      bottomSheet:
+          _showAgreementSheet
+              ? ModernUIWidgets
+                  .buildLicenseBottomSheet(
+                  context,
+                  () {
+                    _logic
+                        .cancelLicenseAgreement();
+                  },
+                  () {
+                    unawaited(
+                      _logic
+                          .openLicenseAgreement(),
+                    );
+                  },
+                )
+              : null,
     );
   }
 }
