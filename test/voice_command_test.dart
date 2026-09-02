@@ -44,11 +44,19 @@ void main() {
       });
 
       test(
-        'accepts configured কি / কী recognition variants',
+        'accepts configured recognition aliases',
         () {
           expect(
             BengaliVoiceCommands.matchTriggerCommand(
               'সামনে কি আছে দেখো',
+            ),
+            VoiceIntent.describeFront,
+          );
+
+          // Short front-command alias.
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              'সামনে দেখো',
             ),
             VoiceIntent.describeFront,
           );
@@ -95,6 +103,13 @@ void main() {
 
           expect(
             BengaliVoiceCommands.matchTriggerCommand(
+              ' সামনে দেখো! ',
+            ),
+            VoiceIntent.describeFront,
+          );
+
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
               'এটা কী!',
             ),
             VoiceIntent.identifyObject,
@@ -115,6 +130,13 @@ void main() {
           expect(
             BengaliVoiceCommands.isTriggerCommand(
               'সামনে কী আছে দেখো',
+            ),
+            isTrue,
+          );
+
+          expect(
+            BengaliVoiceCommands.isTriggerCommand(
+              'সামনে দেখো',
             ),
             isTrue,
           );
@@ -204,6 +226,13 @@ void main() {
           expect(
             BengaliVoiceCommands.matchTriggerCommand(
               'রিউ সামনে কী আছে দেখো',
+            ),
+            isNull,
+          );
+
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              'রিউ সামনে দেখো',
             ),
             isNull,
           );
@@ -301,6 +330,14 @@ void main() {
             isNull,
           );
 
+          // Short alias must still remain exact-only.
+          expect(
+            BengaliVoiceCommands.matchTriggerCommand(
+              'সামনে দেখো তারপর আমাকে বলো',
+            ),
+            isNull,
+          );
+
           expect(
             BengaliVoiceCommands.matchTriggerCommand(
               'লেখাটা পড়ে শোনাও তারপর বন্ধ করো',
@@ -370,6 +407,16 @@ void main() {
               VoiceIntent.describeRight,
               VoiceIntent.describeLeft,
             }),
+          );
+
+          // Alias is part of the FRONT family, not a sixth intent.
+          expect(
+            BengaliVoiceCommands.triggerCommands[
+              VoiceIntent.describeFront
+            ],
+            contains(
+              'সামনে দেখো',
+            ),
           );
         },
       );
