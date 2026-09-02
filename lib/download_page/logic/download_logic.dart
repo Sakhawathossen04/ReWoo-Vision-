@@ -38,6 +38,7 @@ import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:gemma_chat/chat_page/gemma_vision_chat.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../config/constants.dart';
@@ -83,6 +84,14 @@ class DownloadPageLogic {
 
   double _downloadRate = 0;
 
+
+  /// Set when a complete verified model exists in a legacy location but could
+  /// not yet be promoted to the canonical ApplicationDocuments path.
+  ///
+  /// This blocks ALL fresh downloads while still allowing the UI to show a
+  /// migration/recovery error instead of pretending the canonical model is ready.
+  bool _verifiedModelFoundButNotCanonical = false;
+
   // ===========================================================================
   // OPTIONAL MODEL SHA-256
   // ===========================================================================
@@ -92,6 +101,35 @@ class DownloadPageLogic {
     'MODEL_SHA256',
     defaultValue: '',
   );
+
+
+  // ===========================================================================
+  // INSTALLED MODEL REGISTRATION / PATH RECOVERY
+  // ===========================================================================
+
+  /// flutter_gemma 0.10.6 stores the active model filename in this
+  /// SharedPreferences key.
+  ///
+  /// IMPORTANT:
+  ///
+  /// In flutter_gemma 0.10.6, the first isModelInstalled check performs an
+  /// orphan cleanup. A valid .task file that is not registered under this key
+  /// and is older than 30 minutes can be treated as an orphan.
+  ///
+  /// Our downloader owns the network transfer, so once WE verify the model we
+  /// also register its filename here before Gemma gets a chance to run cleanup.
+  static const String _flutterGemmaInstalledModelFileNameKey =
+      'installed_model_file_name';
+
+  /// Stores the last physically verified model path.
+  ///
+  /// Normally this is the canonical ApplicationDocuments/modelName path.
+  /// During migration it may temporarily point to a valid legacy location.
+  ///
+  /// GemmaService can use the same key as a final fallback while the migration
+  /// period is still active.
+  static const String _resolvedModelPathKey =
+      'rewoo_verified_model_path_v1';
 
   // ===========================================================================
   // CONSTRUCTOR
@@ -433,12 +471,711 @@ class DownloadPageLogic {
   ///
   /// A final file may be deleted only when we can prove it belongs to a
   /// completed result and verification fails.
-  Future<bool> checkIfModelExists() async {
+  // ===========================================================================
+  // MODEL PATH DISCOVERY / MIGRATION
+  // ===========================================================================
+
+  String _basename(
+    String path,
+  ) {
+    final normalized =
+        path.replaceAll(
+      r'\',
+      '/',
+    );
+
+    final index =
+        normalized.lastIndexOf('/');
+
+    if (index < 0) {
+      return normalized;
+    }
+
+    return normalized.substring(
+      index + 1,
+    );
+  }
+
+  void _addCandidatePath(
+    List<String> ordered,
+    Set<String> seen,
+    String? path,
+  ) {
+    if (path == null) {
+      return;
+    }
+
+    final clean =
+        path.trim();
+
+    if (clean.isEmpty) {
+      return;
+    }
+
+    if (seen.add(clean)) {
+      ordered.add(clean);
+    }
+  }
+
+  Future<void> _scanForExactModelFile(
+    Directory root,
+    List<String> ordered,
+    Set<String> seen, {
+    required int maxDepth,
+    Set<String>? visited,
+  }) async {
+    if (maxDepth < 0) {
+      return;
+    }
+
+    final visitedDirs =
+        visited ?? <String>{};
+
+    final rootPath =
+        root.absolute.path;
+
+    if (!visitedDirs.add(rootPath)) {
+      return;
+    }
+
+    if (!await root.exists()) {
+      return;
+    }
+
     try {
-      // Calling getAllTasks() also gives DownloadManager an opportunity to
-      // finish a completed background task's:
+      await for (final entity
+          in root.list(
+        followLinks: false,
+      )) {
+        if (entity is File) {
+          if (_basename(
+                entity.path,
+              ) ==
+              modelName) {
+            _addCandidatePath(
+              ordered,
+              seen,
+              entity.path,
+            );
+          }
+
+          continue;
+        }
+
+        if (entity is Directory &&
+            maxDepth > 0) {
+          await _scanForExactModelFile(
+            entity,
+            ordered,
+            seen,
+            maxDepth:
+                maxDepth - 1,
+            visited:
+                visitedDirs,
+          );
+        }
+      }
+    } catch (e) {
+      Logger.debug(
+        'Could not scan model directory '
+        '$rootPath: $e',
+      );
+    }
+  }
+
+  /// Builds an ordered list of possible FINAL model locations.
+  ///
+  /// Order:
+  ///
+  /// 1. canonical ApplicationDocuments path
+  /// 2. downloader task-derived final paths
+  /// 3. last previously verified path
+  /// 4. known app-owned legacy/cache/support/external locations
+  ///
+  /// .part files are deliberately NOT accepted here. Completed .part files are
+  /// finalized by DownloadManager before this method scans for final models.
+  Future<List<String>> _discoverFinalModelPaths(
+    List<DownloadTask> tasks,
+  ) async {
+    final ordered =
+        <String>[];
+
+    final seen =
+        <String>{};
+
+    final documents =
+        await getApplicationDocumentsDirectory();
+
+    _addCandidatePath(
+      ordered,
+      seen,
+      '${documents.path}/$modelName',
+    );
+
+    // -----------------------------------------------------------------------
+    // Downloader-record locations.
+    // -----------------------------------------------------------------------
+
+    for (final task in tasks) {
+      if (!_isModelTask(
+        task,
+      )) {
+        continue;
+      }
+
+      _addCandidatePath(
+        ordered,
+        seen,
+        _taskFinalFilePath(
+          task,
+        ),
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Last path that this app physically verified.
+    // -----------------------------------------------------------------------
+
+    try {
+      final prefs =
+          await SharedPreferences.getInstance();
+
+      _addCandidatePath(
+        ordered,
+        seen,
+        prefs.getString(
+          _resolvedModelPathKey,
+        ),
+      );
+    } catch (e) {
+      Logger.debug(
+        'Could not read remembered model path: $e',
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // Known app-owned directories.
+    //
+    // We intentionally do NOT scan arbitrary public storage.
+    // -----------------------------------------------------------------------
+
+    final roots =
+        <Directory>[];
+
+    void addRoot(
+      Directory? directory,
+    ) {
+      if (directory == null) {
+        return;
+      }
+
+      final path =
+          directory.absolute.path;
+
+      for (final existing
+          in roots) {
+        if (existing.absolute.path ==
+            path) {
+          return;
+        }
+      }
+
+      roots.add(
+        directory,
+      );
+    }
+
+    addRoot(
+      documents,
+    );
+
+    // App data root catches older app-owned files under sibling directories
+    // such as files/cache/app_flutter without scanning outside our sandbox.
+    addRoot(
+      documents.parent,
+    );
+
+    try {
+      addRoot(
+        await getApplicationSupportDirectory(),
+      );
+    } catch (e) {
+      Logger.debug(
+        'ApplicationSupport lookup unavailable: $e',
+      );
+    }
+
+    try {
+      addRoot(
+        await getTemporaryDirectory(),
+      );
+    } catch (e) {
+      Logger.debug(
+        'TemporaryDirectory lookup unavailable: $e',
+      );
+    }
+
+    if (Platform.isAndroid) {
+      try {
+        addRoot(
+          await getExternalStorageDirectory(),
+        );
+      } catch (e) {
+        Logger.debug(
+          'ExternalStorage lookup unavailable: $e',
+        );
+      }
+    }
+
+    final visited =
+        <String>{};
+
+    for (final root
+        in roots) {
+      await _scanForExactModelFile(
+        root,
+        ordered,
+        seen,
+        maxDepth: 3,
+        visited:
+            visited,
+      );
+    }
+
+    Logger.info(
+      'Model discovery found '
+      '${ordered.length} candidate final path(s).',
+    );
+
+    return ordered;
+  }
+
+  bool _isTaskActivelyWriting(
+    DownloadTask task,
+  ) {
+    return task.status ==
+            DownloadTaskStatus.running ||
+        task.status ==
+            DownloadTaskStatus.enqueued ||
+        task.status ==
+            DownloadTaskStatus.paused;
+  }
+
+  DownloadTask? _associatedTaskForPath(
+    List<DownloadTask> tasks,
+    String path,
+  ) {
+    DownloadTask? selected;
+
+    for (final task
+        in tasks) {
+      if (!_isModelTask(
+        task,
+      )) {
+        continue;
+      }
+
+      if (_taskFinalFilePath(
+            task,
+          ) !=
+          path) {
+        continue;
+      }
+
+      if (selected == null ||
+          task.timeCreated >
+              selected.timeCreated) {
+        selected =
+            task;
+      }
+    }
+
+    return selected;
+  }
+
+  /// Attempts to move a verified legacy final model into the canonical
+  /// ApplicationDocuments/modelName path.
+  ///
+  /// Strategy:
+  ///
+  /// rename first
+  ///   -> cheap / atomic on the same filesystem
+  ///
+  /// if rename is not possible
+  ///   -> streaming copy to .migration
+  ///   -> verify copied bytes
+  ///   -> rename .migration to canonical
+  ///   -> only then remove the old duplicate
+  ///
+  /// The original verified source is preserved on every failure path.
+  Future<File> _promoteVerifiedModelToCanonical(
+    File source,
+  ) async {
+    final documents =
+        await getApplicationDocumentsDirectory();
+
+    final canonical =
+        File(
+      '${documents.path}/$modelName',
+    );
+
+    final sourcePath =
+        source.absolute.path;
+
+    final canonicalPath =
+        canonical.absolute.path;
+
+    if (sourcePath ==
+        canonicalPath) {
+      return canonical;
+    }
+
+    // If canonical appeared in the meantime, use it only if it is valid.
+    if (await canonical.exists()) {
+      final existingVerification =
+          await _verifyFinalFile(
+        canonical,
+        verifyChecksum: false,
+      );
+
+      if (existingVerification.valid) {
+        Logger.info(
+          'Canonical model became available during recovery: '
+          '$canonicalPath',
+        );
+
+        return canonical;
+      }
+
+      // Do not overwrite or delete an unknown canonical artifact here.
+      Logger.warning(
+        'A non-valid canonical model artifact already exists at '
+        '$canonicalPath. '
+        'Verified legacy source is being preserved at $sourcePath.',
+      );
+
+      return source;
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. Same-filesystem atomic rename.
+    // -----------------------------------------------------------------------
+
+    try {
+      await canonical.parent.create(
+        recursive: true,
+      );
+
+      final renamed =
+          await source.rename(
+        canonicalPath,
+      );
+
+      final verification =
+          await _verifyFinalFile(
+        renamed,
+        verifyChecksum: false,
+      );
+
+      if (verification.valid) {
+        Logger.info(
+          'Migrated verified model by rename: '
+          '$sourcePath -> $canonicalPath',
+        );
+
+        return renamed;
+      }
+
+      Logger.error(
+        'Renamed model failed verification. '
+        'Attempting to restore original path.',
+      );
+
+      try {
+        if (await renamed.exists() &&
+            !await source.exists()) {
+          await renamed.rename(
+            sourcePath,
+          );
+        }
+      } catch (restoreError) {
+        Logger.error(
+          'Could not restore model after failed rename verification: '
+          '$restoreError',
+        );
+      }
+
+      return source;
+    } catch (e) {
+      Logger.info(
+        'Direct model rename unavailable: $e. '
+        'Trying safe streaming migration.',
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Cross-filesystem safe copy.
+    // -----------------------------------------------------------------------
+
+    final migrationFile =
+        File(
+      '$canonicalPath.migration',
+    );
+
+    try {
+      // This is our own migration scratch file, not network partial data.
+      if (await migrationFile.exists()) {
+        await migrationFile.delete();
+      }
+
+      await source
+          .openRead()
+          .pipe(
+        migrationFile.openWrite(),
+      );
+
+      final copyVerification =
+          await _verifyFinalFile(
+        migrationFile,
+        verifyChecksum: false,
+      );
+
+      if (!copyVerification.valid) {
+        Logger.error(
+          'Migrated model copy failed verification: '
+          '${copyVerification.reason}',
+        );
+
+        try {
+          await migrationFile.delete();
+        } catch (_) {}
+
+        return source;
+      }
+
+      // Race safety: never overwrite a file that appeared while copying.
+      if (await canonical.exists()) {
+        final existingVerification =
+            await _verifyFinalFile(
+          canonical,
+          verifyChecksum: false,
+        );
+
+        if (existingVerification.valid) {
+          try {
+            await migrationFile.delete();
+          } catch (_) {}
+
+          return canonical;
+        }
+
+        Logger.warning(
+          'Canonical artifact appeared during migration but is not valid. '
+          'Keeping verified source and removing only migration scratch file.',
+        );
+
+        try {
+          await migrationFile.delete();
+        } catch (_) {}
+
+        return source;
+      }
+
+      final promoted =
+          await migrationFile.rename(
+        canonicalPath,
+      );
+
+      final finalVerification =
+          await _verifyFinalFile(
+        promoted,
+        verifyChecksum: false,
+      );
+
+      if (!finalVerification.valid) {
+        Logger.error(
+          'Canonical model failed verification after migration.',
+        );
+
+        // Preserve the original verified source.
+        try {
+          if (await promoted.exists()) {
+            await promoted.delete();
+          }
+        } catch (_) {}
+
+        return source;
+      }
+
+      // We now have a proven-good canonical copy. Remove only the old duplicate.
+      try {
+        if (await source.exists()) {
+          await source.delete();
+        }
+      } catch (e) {
+        Logger.warning(
+          'Canonical migration succeeded but old duplicate '
+          'could not be removed: $e',
+        );
+      }
+
+      Logger.info(
+        'Migrated verified model by streaming copy: '
+        '$sourcePath -> $canonicalPath',
+      );
+
+      return promoted;
+    } catch (e, st) {
+      Logger.error(
+        'Safe model migration failed: $e',
+      );
+
+      Logger.error(
+        '$st',
+      );
+
+      // Never remove the verified source on migration failure.
+      try {
+        if (await migrationFile.exists()) {
+          await migrationFile.delete();
+        }
+      } catch (_) {}
+
+      return source;
+    }
+  }
+
+  /// Repairs BOTH ReWoo's download state and flutter_gemma 0.10.6's model
+  /// registration after a physical model has been verified.
+  Future<bool> _registerVerifiedModel(
+    File verifiedFile,
+  ) async {
+    final size =
+        await verifiedFile.length();
+
+    final documents =
+        await getApplicationDocumentsDirectory();
+
+    final canonical =
+        File(
+      '${documents.path}/$modelName',
+    );
+
+    final verifiedPath =
+        verifiedFile.absolute.path;
+
+    bool canonicalReady =
+        false;
+
+    try {
+      final prefs =
+          await SharedPreferences.getInstance();
+
+      // Always remember the actual verified path.
+      await prefs.setString(
+        _resolvedModelPathKey,
+        verifiedPath,
+      );
+
+      // flutter_gemma 0.10.6 resolves this filename inside
+      // getApplicationDocumentsDirectory().
       //
-      // model.task.part -> model.task
+      // Register only after the canonical physical file is proven valid.
+      if (await canonical.exists()) {
+        final canonicalVerification =
+            await _verifyFinalFile(
+          canonical,
+          verifyChecksum: false,
+        );
+
+        if (canonicalVerification.valid) {
+          await prefs.setString(
+            _flutterGemmaInstalledModelFileNameKey,
+            modelName,
+          );
+
+          canonicalReady =
+              true;
+
+          Logger.info(
+            'Registered verified model for flutter_gemma: '
+            '$modelName',
+          );
+        }
+      }
+    } catch (e) {
+      Logger.warning(
+        'Could not repair flutter_gemma model registration: $e',
+      );
+    }
+
+    if (canonicalReady) {
+      // Physical canonical model is the source of truth.
+      //
+      // Repair stale/lost app metadata so restart never triggers a fresh
+      // 3+ GB download merely because SharedPreferences was out of sync.
+      try {
+        await DownloadStateManager
+            .saveDownloadCompleted(
+          downloadedBytes:
+              size,
+          expectedBytes:
+              expectedModelFileSize,
+          verified:
+              true,
+        );
+      } catch (e) {
+        Logger.warning(
+          'Could not repair completed download state: $e',
+        );
+      }
+
+      setDownloadStatus(
+        DownloadStatus.completed,
+      );
+
+      setErrorMessages([]);
+
+      return true;
+    }
+
+    // A valid legacy file exists but could not be promoted to the canonical
+    // path. Preserve it and block fresh download, but do not pretend the
+    // current Gemma runtime can already open the canonical path.
+    setDownloadStatus(
+      DownloadStatus.failed,
+    );
+
+    setErrorMessages([
+      'আগের সম্পূর্ণ AI model file পাওয়া গেছে এবং নিরাপদ রাখা হয়েছে। '
+          'কিন্তু সেটিকে app-এর canonical model path-এ migrate করা যায়নি। '
+          'Fresh Hugging Face download শুরু করা হবে না।',
+    ]);
+
+    return false;
+  }
+
+  /// Verifies whether a usable final model already exists.
+  ///
+  /// Physical verified model bytes are the primary source of truth.
+  ///
+  /// Recovery priority:
+  ///
+  /// 1. canonical ApplicationDocuments/modelName
+  /// 2. completed downloader task locations
+  /// 3. previously verified/legacy app-owned locations
+  /// 4. app cache/support/external app directory scan
+  ///
+  /// A valid legacy model is migrated to the canonical location when possible.
+  ///
+  /// Recoverable .part data is NEVER deleted here.
+  Future<bool> checkIfModelExists() async {
+    _verifiedModelFoundButNotCanonical = false;
+
+    try {
+      // getAllTasks() also allows DownloadManager to finalize completed:
+      //
+      // modelName.part -> modelName
       final tasks =
           await DownloadManager
               .getAllTasks();
@@ -447,78 +1184,40 @@ class DownloadPageLogic {
           await DownloadStateManager
               .getRecoveryState();
 
-      final documents =
-          await getApplicationDocumentsDirectory();
-
       final candidatePaths =
-          <String>{
-        '${documents.path}/$modelName',
-      };
+          await _discoverFinalModelPaths(
+        tasks,
+      );
 
-      for (final task in tasks) {
-        if (!_isModelTask(
-          task,
-        )) {
-          continue;
-        }
-
-        final path =
-            _taskFinalFilePath(
-          task,
-        );
-
-        if (path != null) {
-          candidatePaths.add(
-            path,
-          );
-        }
-      }
-
-      for (final path in candidatePaths) {
+      for (final path
+          in candidatePaths) {
         final file =
-            File(path);
+            File(
+          path,
+        );
 
         if (!await file.exists()) {
           continue;
         }
 
-        DownloadTask?
-            associatedTask;
-
-        for (final task in tasks) {
-          if (!_isModelTask(
-            task,
-          )) {
-            continue;
-          }
-
-          if (_taskFinalFilePath(
-                task,
-              ) ==
-              path) {
-            associatedTask =
-                task;
-
-            if (_isRecoverableStatus(
-              task.status,
-            )) {
-              break;
-            }
-          }
-        }
+        final associatedTask =
+            _associatedTaskForPath(
+          tasks,
+          path,
+        );
 
         // -------------------------------------------------------------------
-        // Legacy active downloader may write directly to modelName.
+        // An active legacy downloader may write directly to modelName.
         //
-        // Never mistake that active partial file for a corrupt final file.
+        // Never treat 98-99% of an active transfer as a finished model.
         // -------------------------------------------------------------------
 
         if (associatedTask != null &&
-            _isRecoverableStatus(
-              associatedTask.status,
+            _isTaskActivelyWriting(
+              associatedTask,
             )) {
           Logger.info(
-            'Keeping recoverable model artifact: '
+            'Preserving active model artifact without final validation: '
             '$path, '
             'task=${associatedTask.taskId}, '
             'status=${associatedTask.status}',
@@ -527,10 +1226,29 @@ class DownloadPageLogic {
           continue;
         }
 
-        // If the state was already hash-verified previously, startup only
-        // performs the cheap size check.
-        //
-        // Hash verification happens again on a newly completed download.
+        // A failed legacy task can occasionally have a stale status even when
+        // the full file landed. To avoid accepting a 98-99% file, require the
+        // exact published size before overriding a FAILED task status.
+        if (associatedTask?.status ==
+            DownloadTaskStatus.failed) {
+          final size =
+              await file.length();
+
+          if (size <
+              expectedModelFileSize) {
+            Logger.info(
+              'Failed task artifact is not full size; '
+              'preserving for recovery: '
+              '$path ($size bytes)',
+            );
+
+            continue;
+          }
+        }
+
+        // If app state already says verified, avoid an expensive repeated hash
+        // on every launch. Newly discovered/unverified files still get the
+        // configured SHA-256 check when MODEL_SHA256 is provided.
         final verifyChecksum =
             !recovery.verified;
 
@@ -543,35 +1261,99 @@ class DownloadPageLogic {
 
         if (verification.valid) {
           Logger.info(
-            'Verified model found: '
+            'Verified physical model found: '
             '$path '
             '(${verification.size} bytes)',
           );
 
-          setDownloadStatus(
-            DownloadStatus.completed,
+          // Promote old/cache/task locations into the canonical model path.
+          final resolved =
+              await _promoteVerifiedModelToCanonical(
+            file,
+          );
+
+          final resolvedVerification =
+              await _verifyFinalFile(
+            resolved,
+            verifyChecksum: false,
+          );
+
+          if (!resolvedVerification.valid) {
+            // This should be extremely rare because the source was already
+            // verified. Preserve everything and block fresh-download logic.
+            Logger.error(
+              'Verified model became unreadable during path recovery. '
+              'No fresh download will be started from this check.',
+            );
+
+            try {
+              final prefs =
+                  await SharedPreferences.getInstance();
+
+              await prefs.setString(
+                _resolvedModelPathKey,
+                path,
+              );
+            } catch (_) {}
+
+            _verifiedModelFoundButNotCanonical = true;
+
+            setDownloadStatus(
+              DownloadStatus.failed,
+            );
+
+            setErrorMessages([
+              'আগের সম্পূর্ণ model file পাওয়া গেছে, কিন্তু canonical storage '
+                  'path-এ recover করা যায়নি। File delete করা হয়নি এবং fresh '
+                  'download শুরু করা হবে না।',
+            ]);
+
+            return true;
+          }
+
+          final canonicalReady =
+              await _registerVerifiedModel(
+            resolved,
+          );
+
+          _verifiedModelFoundButNotCanonical =
+              !canonicalReady;
+
+          Logger.info(
+            canonicalReady
+                ? 'Existing canonical model accepted. '
+                    'Fresh Hugging Face download is blocked.'
+                : 'Verified legacy model found but canonical migration is '
+                    'not complete. Fresh Hugging Face download is blocked.',
           );
 
           return true;
         }
 
         // -------------------------------------------------------------------
-        // Only delete an invalid FINAL file when it is provably a completed
-        // output.
+        // INVALID FINAL FILE DELETION POLICY
+        //
+        // Delete only when completion is provable.
+        // Unknown legacy/cache artifacts are preserved.
         // -------------------------------------------------------------------
+
+        final pathIsCanonical =
+            path ==
+                '${(await getApplicationDocumentsDirectory()).path}/$modelName';
 
         final finalWasSupposedToBeComplete =
             associatedTask?.status ==
                     DownloadTaskStatus
                         .complete ||
-                recovery.completed ||
-                recovery.status ==
-                    DownloadStateManager
-                        .verifying;
+                (pathIsCanonical &&
+                    (recovery.completed ||
+                        recovery.status ==
+                            DownloadStateManager
+                                .verifying));
 
         if (finalWasSupposedToBeComplete) {
           Logger.error(
-            'Completed final model failed verification: '
+            'Provably completed final model failed verification: '
             '$path '
             'reason=${verification.reason}',
           );
@@ -580,39 +1362,36 @@ class DownloadPageLogic {
             await file.delete();
 
             Logger.info(
-              'Deleted verified corrupt final model: '
+              'Deleted verified corrupt completed final model: '
               '$path',
             );
           } catch (e) {
             Logger.error(
-              'Could not delete corrupt final model: $e',
+              'Could not delete corrupt completed final model: $e',
             );
           }
 
           continue;
         }
 
-        // Unknown/orphan file:
-        //
-        // preserve it rather than destroying potentially useful data.
         Logger.warning(
-          'Unverified model artifact found at '
-          '$path. '
-          'It is being preserved because completion '
-          'cannot be proven.',
+          'Non-valid but unproven model artifact preserved: '
+          '$path '
+          'reason=${verification.reason}',
         );
       }
 
       return false;
     } catch (e, st) {
       Logger.error(
-        'Model verification failed: $e',
+        'Model discovery/verification failed: $e',
       );
 
       Logger.error(
         '$st',
       );
 
+      // A failed verification pass is NOT permission to delete anything.
       return false;
     }
   }
@@ -1137,6 +1916,120 @@ class DownloadPageLogic {
   Future<void> checkForOngoingDownloads(
     BuildContext context,
   ) async {
+
+    // =======================================================================
+    // PHYSICAL MODEL WINS OVER STALE METADATA
+    // =======================================================================
+    //
+    // This MUST run before interpreting old SharedPreferences state.
+    //
+    // Example:
+    //
+    // final 3.14 GB model exists
+    // + saved state still says failed/downloading
+    //
+    // OLD behavior:
+    //   recover/start download flow
+    //
+    // NEW behavior:
+    //   verify physical model
+    //   repair completed state
+    //   go directly to ChatPage
+    //
+    try {
+      if (await checkIfModelExists()) {
+        final documents =
+            await getApplicationDocumentsDirectory();
+
+        final canonical =
+            File(
+          '${documents.path}/$modelName',
+        );
+
+        bool canonicalReady =
+            false;
+
+        int canonicalSize =
+            0;
+
+        if (await canonical.exists()) {
+          final verification =
+              await _verifyFinalFile(
+            canonical,
+            verifyChecksum: false,
+          );
+
+          canonicalReady =
+              verification.valid;
+
+          canonicalSize =
+              verification.size;
+        }
+
+        if (!canonicalReady) {
+          // A valid legacy model may have been discovered but migration could
+          // not complete. Do not auto-download another copy and do not enter
+          // ChatPage until Gemma has a canonical usable model.
+          setDownloadStatus(
+            DownloadStatus.failed,
+          );
+
+          setErrorMessages([
+            'আগের সম্পূর্ণ AI model file পাওয়া গেছে, কিন্তু canonical '
+                'storage path-এ migrate করা যায়নি। File delete করা হয়নি এবং '
+                'নতুন Hugging Face download স্বয়ংক্রিয়ভাবে শুরু হবে না।',
+          ]);
+
+          return;
+        }
+
+        setDownloadStatus(
+          DownloadStatus.completed,
+        );
+
+        setErrorMessages([]);
+
+        await DownloadStateManager
+            .saveDownloadCompleted(
+          downloadedBytes:
+              canonicalSize,
+          expectedBytes:
+              expectedModelFileSize,
+          verified:
+              true,
+        );
+
+        WidgetsBinding.instance
+            .addPostFrameCallback(
+          (_) {
+            if (!context.mounted) {
+              return;
+            }
+
+            Navigator.of(context)
+                .pushReplacement(
+              MaterialPageRoute(
+                builder: (_) =>
+                    const ChatPage(),
+              ),
+            );
+          },
+        );
+
+        return;
+      }
+    } catch (e, st) {
+      Logger.warning(
+        'Physical-model startup guard could not complete: $e',
+      );
+
+      Logger.debug(
+        '$st',
+      );
+
+      // Continue into non-destructive recovery logic below.
+    }
+
     try {
       final recovery =
           await DownloadStateManager
@@ -1718,6 +2611,26 @@ class DownloadPageLogic {
   Future<void> startDownload({
     bool autoStart = false,
   }) async {
+
+    // HARD DUPLICATE-DOWNLOAD GUARD.
+    //
+    // A verified physical model always wins over auth/token/download flow.
+    if (await checkIfModelExists()) {
+      Logger.info(
+        'startDownload() blocked because a verified model already exists.',
+      );
+
+      if (!_verifiedModelFoundButNotCanonical) {
+        setDownloadStatus(
+          DownloadStatus.completed,
+        );
+
+        setErrorMessages([]);
+      }
+
+      return;
+    }
+
     setDownloadStatus(
       DownloadStatus.checkingAccess,
     );
@@ -2147,6 +3060,27 @@ class DownloadPageLogic {
   Future<void> downloadModel(
     String? accessToken,
   ) async {
+
+    // FINAL SAFETY GATE:
+    //
+    // Even if an auth callback reaches this method, never enqueue a new
+    // multi-GB task when verified model bytes already exist.
+    if (await checkIfModelExists()) {
+      Logger.info(
+        'downloadModel() blocked because a verified model already exists.',
+      );
+
+      if (!_verifiedModelFoundButNotCanonical) {
+        setDownloadStatus(
+          DownloadStatus.completed,
+        );
+
+        setErrorMessages([]);
+      }
+
+      return;
+    }
+
     setDownloadStatus(
       DownloadStatus.downloading,
     );
