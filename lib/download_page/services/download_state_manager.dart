@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/constants.dart';
@@ -5,27 +8,13 @@ import 'logger.dart';
 
 /// Persistent download-state manager.
 ///
-/// This survives:
+/// Core rules:
 ///
-/// - app restart
-/// - process kill
-/// - phone reboot
-/// - temporary network failure
-/// - paused download
-/// - recoverable failed download
-///
-/// IMPORTANT RULE:
-///
-/// failed != delete
-///
-/// A failed download is stored as [failedRecoverable].
-/// Its task ID, partial file path and progress remain persisted so the
-/// application can attempt to resume it later.
-///
-/// Download state is fully cleared ONLY after:
-///
-/// 1. explicit user cancel/delete, or
-/// 2. an intentional full reset.
+/// 1. failed != delete
+/// 2. recoverable task metadata survives restart
+/// 3. valid physical final model is stronger evidence than stale/missing prefs
+/// 4. physical model repair NEVER deletes model/partial files
+/// 5. destructive state clearing happens only on explicit reset/cancel
 class DownloadStateManager {
   DownloadStateManager._();
 
@@ -55,14 +44,6 @@ class DownloadStateManager {
   // LEGACY STATE VALUES
   // ===========================================================================
 
-  /// Current DownloadLogic still checks:
-  ///
-  /// savedState == 'in_progress'
-  ///
-  /// During migration we keep writing that legacy value into
-  /// [downloadStateKey] whenever the task remains recoverable.
-  ///
-  /// The new detailed state is stored separately.
   static const String _legacyInProgress =
       'in_progress';
 
@@ -70,10 +51,9 @@ class DownloadStateManager {
       'completed';
 
   // ===========================================================================
-  // SHARED-PREFERENCES KEYS
+  // SHARED PREFERENCES KEYS
   // ===========================================================================
 
-  /// New canonical state.
   static const String _statusKey =
       'model_download_status_v2';
 
@@ -105,16 +85,238 @@ class DownloadStateManager {
       'model_download_updated_at_v2';
 
   // ===========================================================================
+  // PHYSICAL MODEL SELF-REPAIR
+  // ===========================================================================
+
+  /// Public startup repair hook.
+  ///
+  /// If SharedPreferences was:
+  ///
+  /// - lost
+  /// - cleared
+  /// - stale
+  /// - still marked downloading/failed
+  ///
+  /// BUT the canonical final model physically exists and passes the same
+  /// size-validation rule used by the rest of the application, rebuild the
+  /// persistent state as:
+  ///
+  /// completed
+  /// verified = true
+  /// progress = 100
+  ///
+  /// This method NEVER deletes any file and NEVER starts a download.
+  static Future<bool>
+      repairCompletedStateFromPhysicalModelIfValid() async {
+    final prefs =
+        await SharedPreferences.getInstance();
+
+    return _repairFromPhysicalModel(
+      prefs,
+    );
+  }
+
+  /// Internal physical-source-of-truth repair.
+  static Future<bool> _repairFromPhysicalModel(
+    SharedPreferences prefs,
+  ) async {
+    try {
+      final documents =
+          await getApplicationDocumentsDirectory();
+
+      final modelPath =
+          '${documents.path}/$modelName';
+
+      final modelFile =
+          File(modelPath);
+
+      if (!await modelFile.exists()) {
+        return false;
+      }
+
+      final size =
+          await modelFile.length();
+
+      final minimumValidSize =
+          (expectedModelFileSize *
+                  modelSizeTolerance)
+              .round();
+
+      if (size <
+          minimumValidSize) {
+        Logger.warning(
+          'Physical model exists but is too small for '
+          'persistent-state repair: '
+          '$modelPath, '
+          'size=$size, '
+          'minimum=$minimumValidSize',
+        );
+
+        // IMPORTANT:
+        //
+        // Do not delete it here.
+        //
+        // DownloadLogic / DownloadManager owns corruption and recovery.
+        return false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Check whether state is already completely correct.
+      // -----------------------------------------------------------------------
+
+      final currentStatus =
+          prefs.getString(
+        _statusKey,
+      );
+
+      final legacyStatus =
+          prefs.getString(
+        downloadStateKey,
+      );
+
+      final progress =
+          prefs.getInt(
+                _progressPercentKey,
+              ) ??
+              0;
+
+      final downloadedBytes =
+          prefs.getInt(
+                _downloadedBytesKey,
+              ) ??
+              0;
+
+      final expectedBytes =
+          prefs.getInt(
+                _expectedBytesKey,
+              ) ??
+              0;
+
+      final completedFlag =
+          prefs.getBool(
+                _completedKey,
+              ) ??
+              false;
+
+      final verifiedFlag =
+          prefs.getBool(
+                _verifiedKey,
+              ) ??
+              false;
+
+      final pausedFlag =
+          prefs.getBool(
+                _pausedKey,
+              ) ??
+              false;
+
+      final failedFlag =
+          prefs.getBool(
+                _failedKey,
+              ) ??
+              false;
+
+      final taskId =
+          prefs.getString(
+        downloadTaskIdKey,
+      );
+
+      final partialPath =
+          prefs.getString(
+        _partialFilePathKey,
+      );
+
+      final stateAlreadyHealthy =
+          currentStatus ==
+                  completed &&
+              legacyStatus ==
+                  _legacyCompleted &&
+              progress ==
+                  100 &&
+              completedFlag &&
+              verifiedFlag &&
+              !pausedFlag &&
+              !failedFlag &&
+              downloadedBytes >=
+                  minimumValidSize &&
+              expectedBytes >
+                  0 &&
+              (taskId == null ||
+                  taskId
+                      .trim()
+                      .isEmpty) &&
+              (partialPath == null ||
+                  partialPath
+                      .trim()
+                      .isEmpty);
+
+      if (stateAlreadyHealthy) {
+        return true;
+      }
+
+      // -----------------------------------------------------------------------
+      // REPAIR STALE / LOST PREFS
+      // -----------------------------------------------------------------------
+
+      Logger.warning(
+        'Valid physical model found but persistent '
+        'download state is stale/missing. '
+        'Repairing state to completed + verified. '
+        'path=$modelPath, '
+        'size=$size',
+      );
+
+      await _writeCompletedState(
+        prefs,
+        downloadedBytes:
+            size,
+        expectedBytes:
+            expectedModelFileSize,
+        verified:
+            true,
+      );
+
+      Logger.info(
+        'Persistent model state repaired successfully: '
+        'completed=true, '
+        'verified=true, '
+        'progress=100, '
+        'size=$size',
+      );
+
+      return true;
+    } catch (e, st) {
+      Logger.warning(
+        'Physical model state repair could not run: $e',
+      );
+
+      Logger.debug(
+        '$st',
+      );
+
+      // State-repair failure must never trigger deletion.
+      return false;
+    }
+  }
+
+  /// Every important read first gives the physical final model an opportunity
+  /// to repair stale SharedPreferences.
+  static Future<SharedPreferences>
+      _prefsForRead() async {
+    final prefs =
+        await SharedPreferences.getInstance();
+
+    await _repairFromPhysicalModel(
+      prefs,
+    );
+
+    return prefs;
+  }
+
+  // ===========================================================================
   // SAVE: DOWNLOAD STARTED / ACTIVE
   // ===========================================================================
 
-  /// Saves a newly-created or resumed task.
-  ///
-  /// Existing call sites can continue using:
-  ///
-  /// saveDownloadInProgress(taskId)
-  ///
-  /// without modification.
   static Future<void> saveDownloadInProgress(
     String taskId, {
     int? progressPercent,
@@ -125,10 +327,6 @@ class DownloadStateManager {
     final prefs =
         await SharedPreferences.getInstance();
 
-    // -------------------------------------------------------------------------
-    // Migration compatibility.
-    // -------------------------------------------------------------------------
-
     await prefs.setString(
       downloadStateKey,
       _legacyInProgress,
@@ -138,10 +336,6 @@ class DownloadStateManager {
       downloadTaskIdKey,
       taskId,
     );
-
-    // -------------------------------------------------------------------------
-    // New canonical state.
-    // -------------------------------------------------------------------------
 
     await prefs.setString(
       _statusKey,
@@ -168,40 +362,17 @@ class DownloadStateManager {
       false,
     );
 
-    if (progressPercent != null) {
-      await prefs.setInt(
-        _progressPercentKey,
-        _normalizePercent(
+    await _saveOptionalProgressFields(
+      prefs,
+      progressPercent:
           progressPercent,
-        ),
-      );
-    }
-
-    if (downloadedBytes != null) {
-      await prefs.setInt(
-        _downloadedBytesKey,
-        _normalizeBytes(
+      downloadedBytes:
           downloadedBytes,
-        ),
-      );
-    }
-
-    if (expectedBytes != null) {
-      await prefs.setInt(
-        _expectedBytesKey,
-        _normalizeBytes(
+      expectedBytes:
           expectedBytes,
-        ),
-      );
-    }
-
-    if (partialFilePath != null &&
-        partialFilePath.trim().isNotEmpty) {
-      await prefs.setString(
-        _partialFilePathKey,
-        partialFilePath.trim(),
-      );
-    }
+      partialFilePath:
+          partialFilePath,
+    );
 
     await _touch(
       prefs,
@@ -222,9 +393,6 @@ class DownloadStateManager {
   // SAVE: PROGRESS
   // ===========================================================================
 
-  /// Updates byte/progress state while preserving the current task.
-  ///
-  /// This method should be called periodically by DownloadLogic.
   static Future<void> saveProgress({
     required int progressPercent,
     required int downloadedBytes,
@@ -236,7 +404,9 @@ class DownloadStateManager {
         await SharedPreferences.getInstance();
 
     if (taskId != null &&
-        taskId.trim().isNotEmpty) {
+        taskId
+            .trim()
+            .isNotEmpty) {
       await prefs.setString(
         downloadTaskIdKey,
         taskId.trim(),
@@ -265,7 +435,9 @@ class DownloadStateManager {
     );
 
     if (partialFilePath != null &&
-        partialFilePath.trim().isNotEmpty) {
+        partialFilePath
+            .trim()
+            .isNotEmpty) {
       await prefs.setString(
         _partialFilePathKey,
         partialFilePath.trim(),
@@ -274,13 +446,14 @@ class DownloadStateManager {
 
     final currentStatus =
         prefs.getString(
-          _statusKey,
-        ) ??
-        downloading;
+      _statusKey,
+    );
 
-    // A normal progress callback must not accidentally turn paused,
-    // failed-recoverable, verifying or completed back into downloading.
-    if (currentStatus == notStarted) {
+    // Normal progress callbacks must not turn paused / failed /
+    // verifying / completed back into downloading.
+    if (currentStatus == null ||
+        currentStatus ==
+            notStarted) {
       await prefs.setString(
         _statusKey,
         downloading,
@@ -332,9 +505,6 @@ class DownloadStateManager {
   // SAVE: PAUSED
   // ===========================================================================
 
-  /// Paused means recoverable.
-  ///
-  /// Task ID and downloaded bytes are deliberately retained.
   static Future<void> saveDownloadPaused({
     String? taskId,
     int? progressPercent,
@@ -346,14 +516,15 @@ class DownloadStateManager {
         await SharedPreferences.getInstance();
 
     if (taskId != null &&
-        taskId.trim().isNotEmpty) {
+        taskId
+            .trim()
+            .isNotEmpty) {
       await prefs.setString(
         downloadTaskIdKey,
         taskId.trim(),
       );
     }
 
-    // Legacy DownloadLogic must still consider this recoverable.
     await prefs.setString(
       downloadStateKey,
       _legacyInProgress,
@@ -401,7 +572,8 @@ class DownloadStateManager {
     );
 
     Logger.info(
-      'Saved download state: $paused '
+      'Saved download state: '
+      '$paused '
       '(partial progress preserved)',
     );
   }
@@ -410,18 +582,6 @@ class DownloadStateManager {
   // SAVE: FAILED BUT RECOVERABLE
   // ===========================================================================
 
-  /// Stores a temporary/recoverable failure.
-  ///
-  /// CRITICAL:
-  ///
-  /// This method DOES NOT:
-  ///
-  /// - remove taskId
-  /// - remove partialFilePath
-  /// - zero progress
-  /// - delete any file
-  ///
-  /// failed != delete.
   static Future<void>
       saveDownloadFailedRecoverable({
     String? taskId,
@@ -434,14 +594,15 @@ class DownloadStateManager {
         await SharedPreferences.getInstance();
 
     if (taskId != null &&
-        taskId.trim().isNotEmpty) {
+        taskId
+            .trim()
+            .isNotEmpty) {
       await prefs.setString(
         downloadTaskIdKey,
         taskId.trim(),
       );
     }
 
-    // Keep legacy recovery enabled.
     await prefs.setString(
       downloadStateKey,
       _legacyInProgress,
@@ -499,20 +660,6 @@ class DownloadStateManager {
   // SAVE: VERIFYING
   // ===========================================================================
 
-  /// Called after native download reaches 100% but BEFORE the application
-  /// declares the model usable.
-  ///
-  /// Flow:
-  ///
-  /// 100%
-  /// ↓
-  /// verifying
-  /// ↓
-  /// expected size / checksum
-  /// ↓
-  /// .part -> final
-  /// ↓
-  /// completed + verified
   static Future<void> saveDownloadVerifying({
     String? taskId,
     int? downloadedBytes,
@@ -523,15 +670,15 @@ class DownloadStateManager {
         await SharedPreferences.getInstance();
 
     if (taskId != null &&
-        taskId.trim().isNotEmpty) {
+        taskId
+            .trim()
+            .isNotEmpty) {
       await prefs.setString(
         downloadTaskIdKey,
         taskId.trim(),
       );
     }
 
-    // During verification the task is not yet safely complete.
-    // Keep legacy recovery state as in-progress.
     await prefs.setString(
       downloadStateKey,
       _legacyInProgress,
@@ -569,7 +716,8 @@ class DownloadStateManager {
 
     await _saveOptionalProgressFields(
       prefs,
-      progressPercent: 100,
+      progressPercent:
+          100,
       downloadedBytes:
           downloadedBytes,
       expectedBytes:
@@ -591,13 +739,6 @@ class DownloadStateManager {
   // SAVE: COMPLETED
   // ===========================================================================
 
-  /// Marks the model as fully downloaded AND verified.
-  ///
-  /// Existing callers can still use:
-  ///
-  /// saveDownloadCompleted()
-  ///
-  /// without arguments.
   static Future<void> saveDownloadCompleted({
     int? downloadedBytes,
     int? expectedBytes,
@@ -606,6 +747,27 @@ class DownloadStateManager {
     final prefs =
         await SharedPreferences.getInstance();
 
+    await _writeCompletedState(
+      prefs,
+      downloadedBytes:
+          downloadedBytes,
+      expectedBytes:
+          expectedBytes,
+      verified:
+          verified,
+    );
+  }
+
+  /// Single completed-state writer shared by:
+  ///
+  /// - normal successful download
+  /// - physical-model startup repair
+  static Future<void> _writeCompletedState(
+    SharedPreferences prefs, {
+    int? downloadedBytes,
+    int? expectedBytes,
+    required bool verified,
+  }) async {
     await prefs.setString(
       downloadStateKey,
       _legacyCompleted,
@@ -621,23 +783,47 @@ class DownloadStateManager {
       100,
     );
 
-    if (downloadedBytes != null) {
-      await prefs.setInt(
-        _downloadedBytesKey,
-        _normalizeBytes(
-          downloadedBytes,
-        ),
-      );
-    }
+    final oldDownloadedBytes =
+        prefs.getInt(
+              _downloadedBytesKey,
+            ) ??
+            0;
 
-    if (expectedBytes != null) {
-      await prefs.setInt(
-        _expectedBytesKey,
-        _normalizeBytes(
-          expectedBytes,
-        ),
-      );
-    }
+    final oldExpectedBytes =
+        prefs.getInt(
+              _expectedBytesKey,
+            ) ??
+            0;
+
+    final resolvedDownloadedBytes =
+        downloadedBytes != null
+            ? _normalizeBytes(
+                downloadedBytes,
+              )
+            : oldDownloadedBytes >
+                    0
+                ? oldDownloadedBytes
+                : expectedModelFileSize;
+
+    final resolvedExpectedBytes =
+        expectedBytes != null
+            ? _normalizeBytes(
+                expectedBytes,
+              )
+            : oldExpectedBytes >
+                    0
+                ? oldExpectedBytes
+                : expectedModelFileSize;
+
+    await prefs.setInt(
+      _downloadedBytesKey,
+      resolvedDownloadedBytes,
+    );
+
+    await prefs.setInt(
+      _expectedBytesKey,
+      resolvedExpectedBytes,
+    );
 
     await prefs.setBool(
       _pausedKey,
@@ -659,13 +845,14 @@ class DownloadStateManager {
       verified,
     );
 
-    // Once final verification succeeds, the native task ID is no longer
-    // necessary for normal startup recovery.
+    // Final verified model exists.
+    //
+    // Native task ID is no longer required for normal startup routing.
     await prefs.remove(
       downloadTaskIdKey,
     );
 
-    // .part has become the real model file.
+    // Final file has replaced the logical .part recovery path.
     await prefs.remove(
       _partialFilePathKey,
     );
@@ -676,7 +863,10 @@ class DownloadStateManager {
 
     Logger.info(
       'Saved download state: '
-      '$completed, verified=$verified',
+      '$completed, '
+      'verified=$verified, '
+      'downloadedBytes=$resolvedDownloadedBytes, '
+      'expectedBytes=$resolvedExpectedBytes',
     );
   }
 
@@ -731,19 +921,18 @@ class DownloadStateManager {
   // CLEAR STATE
   // ===========================================================================
 
-  /// FULL destructive state reset.
+  /// Full destructive metadata reset.
   ///
-  /// Call only when:
+  /// IMPORTANT:
   ///
-  /// - user explicitly canceled/deleted the download
-  /// - application intentionally performs a clean reset
+  /// This method deletes SharedPreferences state only.
   ///
-  /// Do NOT call this merely because a network download failed.
+  /// Physical file destruction remains DownloadManager's responsibility and
+  /// must happen only after explicit user confirmation / intentional reset.
   static Future<void> clearDownloadState() async {
     final prefs =
         await SharedPreferences.getInstance();
 
-    // Legacy keys.
     await prefs.remove(
       downloadStateKey,
     );
@@ -752,7 +941,6 @@ class DownloadStateManager {
       downloadTaskIdKey,
     );
 
-    // New detailed state.
     await prefs.remove(
       _statusKey,
     );
@@ -802,19 +990,10 @@ class DownloadStateManager {
   // LEGACY GETTERS
   // ===========================================================================
 
-  /// Existing DownloadLogic compatibility.
-  ///
-  /// Returns:
-  ///
-  /// in_progress
-  /// completed
-  /// null
-  ///
-  /// New code should prefer [getDetailedStatus].
   static Future<String?>
       getDownloadState() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     final legacy =
         prefs.getString(
@@ -825,27 +1004,24 @@ class DownloadStateManager {
       return legacy;
     }
 
-    // -----------------------------------------------------------------------
-    // Migration recovery:
-    //
-    // If v2 data exists but legacy key disappeared, reconstruct a value that
-    // older DownloadLogic understands.
-    // -----------------------------------------------------------------------
-
     final detailed =
-        prefs.getString(
-      _statusKey,
+        _readDetailedStatus(
+      prefs,
     );
 
-    if (detailed == completed) {
+    if (detailed ==
+        completed) {
       return _legacyCompleted;
     }
 
-    if (detailed == downloading ||
-        detailed == paused ||
+    if (detailed ==
+            downloading ||
+        detailed ==
+            paused ||
         detailed ==
             failedRecoverable ||
-        detailed == verifying) {
+        detailed ==
+            verifying) {
       return _legacyInProgress;
     }
 
@@ -855,7 +1031,7 @@ class DownloadStateManager {
   static Future<String?>
       getDownloadTaskId() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     return prefs.getString(
       downloadTaskIdKey,
@@ -863,27 +1039,33 @@ class DownloadStateManager {
   }
 
   // ===========================================================================
-  // NEW DETAILED GETTERS
+  // DETAILED GETTERS
   // ===========================================================================
 
   static Future<String>
       getDetailedStatus() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
+    return _readDetailedStatus(
+      prefs,
+    );
+  }
+
+  static String _readDetailedStatus(
+    SharedPreferences prefs,
+  ) {
     final state =
         prefs.getString(
       _statusKey,
     );
 
     if (state != null &&
-        _isKnownState(state)) {
+        _isKnownState(
+          state,
+        )) {
       return state;
     }
-
-    // -----------------------------------------------------------------------
-    // Migrate legacy state if necessary.
-    // -----------------------------------------------------------------------
 
     final legacy =
         prefs.getString(
@@ -906,7 +1088,7 @@ class DownloadStateManager {
   static Future<int>
       getProgressPercent() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     return _normalizePercent(
       prefs.getInt(
@@ -919,7 +1101,7 @@ class DownloadStateManager {
   static Future<int>
       getDownloadedBytes() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     return _normalizeBytes(
       prefs.getInt(
@@ -932,7 +1114,7 @@ class DownloadStateManager {
   static Future<int>
       getExpectedBytes() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     return _normalizeBytes(
       prefs.getInt(
@@ -945,7 +1127,7 @@ class DownloadStateManager {
   static Future<String?>
       getPartialFilePath() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     final path =
         prefs.getString(
@@ -953,7 +1135,9 @@ class DownloadStateManager {
     );
 
     if (path == null ||
-        path.trim().isEmpty) {
+        path
+            .trim()
+            .isEmpty) {
       return null;
     }
 
@@ -963,7 +1147,7 @@ class DownloadStateManager {
   static Future<bool>
       isPaused() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     return prefs.getBool(
           _pausedKey,
@@ -974,10 +1158,12 @@ class DownloadStateManager {
   static Future<bool>
       isFailedRecoverable() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     final state =
-        await getDetailedStatus();
+        _readDetailedStatus(
+      prefs,
+    );
 
     return state ==
             failedRecoverable ||
@@ -990,13 +1176,15 @@ class DownloadStateManager {
   static Future<bool>
       isCompleted() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     final state =
-        await getDetailedStatus();
+        _readDetailedStatus(
+      prefs,
+    );
 
     return state ==
-            completed ||
+            completed &&
         (prefs.getBool(
               _completedKey,
             ) ??
@@ -1006,7 +1194,7 @@ class DownloadStateManager {
   static Future<bool>
       isVerified() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     return prefs.getBool(
           _verifiedKey,
@@ -1017,7 +1205,7 @@ class DownloadStateManager {
   static Future<DateTime?>
       getLastUpdatedAt() async {
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     final value =
         prefs.getInt(
@@ -1025,7 +1213,8 @@ class DownloadStateManager {
     );
 
     if (value == null ||
-        value <= 0) {
+        value <=
+            0) {
       return null;
     }
 
@@ -1036,19 +1225,24 @@ class DownloadStateManager {
   }
 
   // ===========================================================================
-  // FULL SNAPSHOT
+  // FULL RECOVERY SNAPSHOT
   // ===========================================================================
 
-  /// Returns every recovery-related field in one object.
-  ///
-  /// This will be useful when DownloadLogic is fully migrated.
   static Future<DownloadRecoveryState>
       getRecoveryState() async {
+    // IMPORTANT:
+    //
+    // This one call is the normal startup entry point.
+    //
+    // _prefsForRead() first checks whether the physical final model can repair
+    // stale/missing preference state.
     final prefs =
-        await SharedPreferences.getInstance();
+        await _prefsForRead();
 
     final status =
-        await getDetailedStatus();
+        _readDetailedStatus(
+      prefs,
+    );
 
     final taskId =
         prefs.getString(
@@ -1079,34 +1273,43 @@ class DownloadStateManager {
           0,
     );
 
-    final partialPath =
+    final rawPartialPath =
         prefs.getString(
       _partialFilePathKey,
     );
 
+    final partialPath =
+        rawPartialPath != null &&
+                rawPartialPath
+                    .trim()
+                    .isNotEmpty
+            ? rawPartialPath
+                .trim()
+            : null;
+
     final pausedValue =
         prefs.getBool(
-          _pausedKey,
-        ) ??
-        false;
+              _pausedKey,
+            ) ??
+            false;
 
     final failedValue =
         prefs.getBool(
-          _failedKey,
-        ) ??
-        false;
+              _failedKey,
+            ) ??
+            false;
 
     final completedValue =
         prefs.getBool(
-          _completedKey,
-        ) ??
-        false;
+              _completedKey,
+            ) ??
+            false;
 
     final verifiedValue =
         prefs.getBool(
-          _verifiedKey,
-        ) ??
-        false;
+              _verifiedKey,
+            ) ??
+            false;
 
     final updatedAtMillis =
         prefs.getInt(
@@ -1114,8 +1317,10 @@ class DownloadStateManager {
     );
 
     return DownloadRecoveryState(
-      taskId: taskId,
-      status: status,
+      taskId:
+          taskId,
+      status:
+          status,
       progressPercent:
           progress,
       downloadedBytes:
@@ -1133,7 +1338,8 @@ class DownloadStateManager {
       verified:
           verifiedValue,
       updatedAt:
-          updatedAtMillis != null
+          updatedAtMillis !=
+                  null
               ? DateTime
                   .fromMillisecondsSinceEpoch(
                   updatedAtMillis,
@@ -1154,7 +1360,8 @@ class DownloadStateManager {
     int? expectedBytes,
     String? partialFilePath,
   }) async {
-    if (progressPercent != null) {
+    if (progressPercent !=
+        null) {
       await prefs.setInt(
         _progressPercentKey,
         _normalizePercent(
@@ -1163,7 +1370,8 @@ class DownloadStateManager {
       );
     }
 
-    if (downloadedBytes != null) {
+    if (downloadedBytes !=
+        null) {
       await prefs.setInt(
         _downloadedBytesKey,
         _normalizeBytes(
@@ -1172,7 +1380,8 @@ class DownloadStateManager {
       );
     }
 
-    if (expectedBytes != null) {
+    if (expectedBytes !=
+        null) {
       await prefs.setInt(
         _expectedBytesKey,
         _normalizeBytes(
@@ -1182,7 +1391,9 @@ class DownloadStateManager {
     }
 
     if (partialFilePath != null &&
-        partialFilePath.trim().isNotEmpty) {
+        partialFilePath
+            .trim()
+            .isNotEmpty) {
       await prefs.setString(
         _partialFilePathKey,
         partialFilePath.trim(),
@@ -1203,11 +1414,13 @@ class DownloadStateManager {
   static int _normalizePercent(
     int value,
   ) {
-    if (value < 0) {
+    if (value <
+        0) {
       return 0;
     }
 
-    if (value > 100) {
+    if (value >
+        100) {
       return 100;
     }
 
@@ -1217,7 +1430,8 @@ class DownloadStateManager {
   static int _normalizeBytes(
     int value,
   ) {
-    return value < 0
+    return value <
+            0
         ? 0
         : value;
   }
@@ -1244,7 +1458,6 @@ class DownloadStateManager {
 // DOWNLOAD RECOVERY SNAPSHOT
 // =============================================================================
 
-/// Immutable snapshot of persistent model-download state.
 class DownloadRecoveryState {
   final String? taskId;
 
@@ -1287,18 +1500,24 @@ class DownloadRecoveryState {
   // ===========================================================================
 
   bool get hasTask =>
-      taskId != null &&
-      taskId!.trim().isNotEmpty;
+      taskId !=
+          null &&
+      taskId!
+          .trim()
+          .isNotEmpty;
 
   bool get hasPartialFile =>
-      partialFilePath != null &&
+      partialFilePath !=
+          null &&
       partialFilePath!
           .trim()
           .isNotEmpty;
 
   bool get hasProgress =>
-      progressPercent > 0 ||
-      downloadedBytes > 0;
+      progressPercent >
+          0 ||
+      downloadedBytes >
+          0;
 
   bool get isRecoverable =>
       status ==
@@ -1322,7 +1541,8 @@ class DownloadRecoveryState {
       verified;
 
   double get progressFraction =>
-      progressPercent / 100.0;
+      progressPercent /
+      100.0;
 
   @override
   String toString() {
