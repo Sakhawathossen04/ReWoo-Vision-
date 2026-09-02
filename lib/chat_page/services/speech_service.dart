@@ -6,73 +6,36 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
+import '../../download_page/config/constants.dart';
 import '../voice/bengali_voice_commands.dart';
 import '../voice/voice_intent.dart';
-import '../../download_page/config/constants.dart';
 import 'sound_manager.dart';
 import 'tts_engine_service.dart';
 
-/// Bengali-first voice control service.
+/// Bengali-first, always-armed voice command service.
 ///
-/// Voice lifecycle:
+/// Intended lifecycle:
 ///
-/// Waiting for one of the 5 trigger commands
-///        ↓
-/// Final speech result arrives
-///        ↓
-/// Exact 5-command matcher
-///        ↓
-/// Trigger detected
-///        ↓
-/// _commandInProgress = true
-///        ↓
-/// Speech recognizer STOP
-///        ↓
-/// Camera / OCR / AI
-///        ↓
-/// TTS
-///        ↓
-/// Task completely finished
-///        ↓
-/// _commandInProgress = false
-///        ↓
-/// Trigger listener starts again
+/// app ready
+///   -> microphone permission
+///   -> SpeechToText ready
+///   -> command mode armed
+///   -> Bengali listening session
+///   -> exact FINAL trigger result
+///   -> command lock
+///   -> stop STT
+///   -> camera/OCR/Gemma/TTS
+///   -> command unlock
+///   -> automatically re-arm STT
 ///
-/// Important safety rules:
+/// Important:
 ///
-/// 1. Microphone permission must be granted before SpeechToText initializes.
-///
-/// 2. If no Android speech recognizer is available, automatic restart is
-///    disabled.
-///
-/// 3. If Bengali recognition is confirmed unsupported, automatic restart is
-///    disabled instead of creating an infinite error/restart loop.
-///
-/// 4. While a command is running, no callback/timer/watchdog is allowed to
-///    reopen the recognizer.
-///
-/// 5. Partial speech-recognition results NEVER trigger commands.
-///    Only final recognition results are checked against the five trigger
-///    phrases.
-///
-/// Example:
-///
-/// User actually says:
-/// "এটা কী সুন্দর জিনিস"
-///
-/// Android may produce:
-///
-/// partial -> "এটা"
-/// partial -> "এটা কী"
-/// final   -> "এটা কী সুন্দর জিনিস"
-///
-/// The partial "এটা কী" MUST NOT trigger identifyObject.
-///
-/// But:
-///
-/// final -> "এটা কী"
-///
-/// WILL trigger identifyObject.
+/// - Partial STT results never trigger a command.
+/// - Camera / AI / TTS can never restart STT while they are active.
+/// - Normal recognizer errors such as no-match, timeout, busy, network/client
+///   errors do not permanently disable command mode.
+/// - Only real hard failures such as permission denial, unsupported Bengali,
+///   or unavailable recognizer disable automatic command listening.
 class SpeechService {
   final SpeechToText _speech = SpeechToText();
 
@@ -80,26 +43,33 @@ class SpeechService {
   final VoidCallback _onStateChanged;
 
   // ===========================================================================
-  // CORE SPEECH STATE
+  // CORE STATE
   // ===========================================================================
 
-  /// True only after SpeechToText.initialize() succeeds.
   bool _speechEnabled = false;
 
-  /// True while automatic trigger-listening mode is enabled.
+  /// Desired always-on command mode.
+  ///
+  /// This is set BEFORE starting an actual recognition session so a temporary
+  /// pause, lifecycle transition, recognizer timeout, or TTS cannot lose the
+  /// user's intended listening state.
   bool _commandModeEnabled = false;
 
-  /// True while the Android recognizer currently has an active session.
+  /// True only while Android currently has an active recognition session.
   bool _commandListening = false;
 
   bool _disposed = false;
   bool _startingSession = false;
   bool _pausedForMedia = false;
 
-  /// True from trigger detection until the complete command + TTS Future ends.
-  ///
-  /// No microphone restart is allowed while this is true.
+  /// True from trigger detection until camera/OCR/Gemma/TTS is completely done.
   bool _commandInProgress = false;
+
+  /// Blocks status/error/watchdog restart while SpeechService-owned TTS is
+  /// speaking.
+  bool _ttsInProgress = false;
+
+  Future<void>? _initializationFuture;
 
   // ===========================================================================
   // DEVICE / PERMISSION STATE
@@ -108,13 +78,8 @@ class SpeechService {
   bool _microphonePermissionGranted = false;
   bool _microphonePermissionPermanentlyDenied = false;
 
-  /// True when Android exposes a speech recognition service.
   bool _speechRecognizerAvailable = false;
 
-  /// Becomes true only after Android explicitly reports that the requested
-  /// Bengali recognition language is unsupported/unavailable.
-  ///
-  /// Once this becomes true, automatic retries STOP.
   bool _bengaliLanguageUnsupported = false;
 
   // ===========================================================================
@@ -129,20 +94,18 @@ class SpeechService {
   // ===========================================================================
 
   String _bengaliLocaleId = 'bn-BD';
-
-  /// Bengali recognition availability.
   bool _bengaliLocaleAvailable = true;
 
   String _lastHeard = '';
   String _lastError = '';
 
   // ===========================================================================
-  // LEGACY WAKE WORD SETTING
+  // LEGACY WAKE-WORD SETTING
   // ===========================================================================
 
-  /// Retained because SettingsPage / SharedPreferences may still use it.
+  /// Kept only for Settings/SharedPreferences compatibility.
   ///
-  /// Direct trigger mode does not depend on this property.
+  /// The five direct Bengali trigger phrases do not require a wake word.
   bool _wakeWordMode = false;
 
   // ===========================================================================
@@ -157,7 +120,7 @@ class SpeechService {
   bool Function()? _canAcceptCommand;
 
   // ===========================================================================
-  // DUPLICATE COMMAND PROTECTION
+  // DUPLICATE FINAL-RESULT PROTECTION
   // ===========================================================================
 
   VoiceIntent? _lastIntent;
@@ -218,33 +181,79 @@ class SpeechService {
   // INITIALIZATION
   // ===========================================================================
 
+  /// Idempotent and single-flight.
+  ///
+  /// Calling this twice cannot create two concurrent recognizer initializations.
   Future<void> initialize() async {
+    if (_disposed) {
+      return;
+    }
+
+    final running = _initializationFuture;
+
+    if (running != null) {
+      await running;
+      return;
+    }
+
+    if (_microphonePermissionGranted &&
+        _speechEnabled &&
+        _speechRecognizerAvailable) {
+      await _loadWakeWordMode();
+      _onStateChanged();
+      return;
+    }
+
+    final future = _initializeInternal();
+
+    _initializationFuture = future;
+
+    try {
+      await future;
+    } finally {
+      if (identical(
+        _initializationFuture,
+        future,
+      )) {
+        _initializationFuture = null;
+      }
+    }
+  }
+
+  Future<void> _initializeInternal() async {
     if (_disposed) {
       return;
     }
 
     try {
       // -----------------------------------------------------------------------
-      // 1. Configure TTS
+      // 1. TTS
       // -----------------------------------------------------------------------
 
       try {
-        await TtsEngineService.configure(_tts);
+        await TtsEngineService.configure(
+          _tts,
+        );
       } catch (e) {
-        // TTS failure must not prevent microphone/speech initialization.
         debugPrint(
           '[SpeechService] TTS configuration warning: $e',
         );
       }
 
+      if (_disposed) {
+        return;
+      }
+
       // -----------------------------------------------------------------------
       // 2. MICROPHONE PERMISSION
-      //
-      // Do NOT initialize SpeechToText if permission is denied.
       // -----------------------------------------------------------------------
 
       final micStatus =
           await Permission.microphone.request();
+
+      if (_disposed) {
+        return;
+      }
 
       debugPrint(
         '[SpeechService] microphone permission: $micStatus',
@@ -259,9 +268,10 @@ class SpeechService {
       if (!micStatus.isGranted) {
         _speechEnabled = false;
         _speechRecognizerAvailable = false;
-
-        _commandModeEnabled = false;
         _commandListening = false;
+
+        // Permission failure is a real hard blocker.
+        _commandModeEnabled = false;
 
         _restartTimer?.cancel();
         _watchdogTimer?.cancel();
@@ -292,9 +302,7 @@ class SpeechService {
       _microphonePermissionPermanentlyDenied = false;
 
       // -----------------------------------------------------------------------
-      // 3. INITIALIZE ANDROID SPEECH RECOGNIZER
-      //
-      // initialize() returning false means there is no usable recognizer.
+      // 3. SPEECH RECOGNIZER
       // -----------------------------------------------------------------------
 
       final recognizerInitialized =
@@ -303,12 +311,17 @@ class SpeechService {
         onError: _handleSpeechError,
       );
 
+      if (_disposed) {
+        return;
+      }
+
       if (!recognizerInitialized) {
         _speechEnabled = false;
         _speechRecognizerAvailable = false;
-
-        _commandModeEnabled = false;
         _commandListening = false;
+
+        // No recognizer is a hard blocker.
+        _commandModeEnabled = false;
 
         _restartTimer?.cancel();
         _watchdogTimer?.cancel();
@@ -328,11 +341,12 @@ class SpeechService {
       _speechEnabled = true;
       _speechRecognizerAvailable = true;
 
-      // New initialization gets one fresh Bengali-language attempt.
+      // A successful fresh initialization gets a new Bengali attempt.
       _bengaliLanguageUnsupported = false;
+      _bengaliLocaleAvailable = true;
 
       // -----------------------------------------------------------------------
-      // 4. FIND BENGALI LOCALE
+      // 4. BENGALI LOCALE
       // -----------------------------------------------------------------------
 
       await _resolveBengaliLocale();
@@ -345,9 +359,8 @@ class SpeechService {
     } catch (e, st) {
       _speechEnabled = false;
       _speechRecognizerAvailable = false;
-
-      _commandModeEnabled = false;
       _commandListening = false;
+      _commandModeEnabled = false;
 
       _restartTimer?.cancel();
       _watchdogTimer?.cancel();
@@ -359,11 +372,15 @@ class SpeechService {
         '[SpeechService] initialization error: $e',
       );
 
-      debugPrint('$st');
+      debugPrint(
+        '$st',
+      );
     } finally {
       await _loadWakeWordMode();
 
-      _onStateChanged();
+      if (!_disposed) {
+        _onStateChanged();
+      }
     }
   }
 
@@ -391,19 +408,23 @@ class SpeechService {
     );
 
     // -------------------------------------------------------------------------
-    // BENGALI LANGUAGE UNSUPPORTED
+    // HARD FAILURE: BENGALI UNSUPPORTED
     // -------------------------------------------------------------------------
 
-    if (_isLanguageError(errorCode)) {
+    if (_isLanguageError(
+      errorCode,
+    )) {
       _disableForUnsupportedBengali();
       return;
     }
 
     // -------------------------------------------------------------------------
-    // PERMISSION ERROR
+    // HARD FAILURE: PERMISSION
     // -------------------------------------------------------------------------
 
-    if (_isPermissionError(errorCode)) {
+    if (_isPermissionError(
+      errorCode,
+    )) {
       _speechEnabled = false;
       _commandModeEnabled = false;
       _commandListening = false;
@@ -422,10 +443,12 @@ class SpeechService {
     }
 
     // -------------------------------------------------------------------------
-    // RECOGNIZER / SERVICE UNAVAILABLE
+    // HARD FAILURE: RECOGNIZER/SERVICE REALLY UNAVAILABLE
     // -------------------------------------------------------------------------
 
-    if (_isRecognizerUnavailableError(errorCode)) {
+    if (_isRecognizerUnavailableError(
+      errorCode,
+    )) {
       _speechRecognizerAvailable = false;
       _speechEnabled = false;
 
@@ -445,38 +468,47 @@ class SpeechService {
     }
 
     // -------------------------------------------------------------------------
-    // OTHER PERMANENT ERROR
+    // RECOVERABLE / IDLE ERRORS
+    // -------------------------------------------------------------------------
+    //
+    // speech_to_text / Android may mark errors such as:
+    //
+    // error_no_match
+    // error_speech_timeout
+    // error_busy
+    // error_network
+    // error_client
+    //
+    // as permanent=true for a single recognition session.
+    //
+    // That does NOT mean the app's always-on command mode should be disabled.
+    //
+    // Old behavior disabled _commandModeEnabled for every permanent error.
+    // That is exactly the failure mode where auto-listening silently dies and
+    // tapping the microphone manually makes it work again.
     // -------------------------------------------------------------------------
 
-    final bool permanent =
+    final permanent =
         error.permanent == true;
 
-    if (permanent) {
-      _commandModeEnabled = false;
+    _lastError =
+        _friendlyTransientError(
+      errorCode,
+      rawError,
+    );
 
-      _restartTimer?.cancel();
-      _watchdogTimer?.cancel();
-
-      _lastError =
-          'Speech recognition বন্ধ হয়েছে: $rawError';
-
-      _onStateChanged();
-
-      return;
-    }
-
-    // -------------------------------------------------------------------------
-    // TRANSIENT ERROR
-    // -------------------------------------------------------------------------
-
-    _lastError = rawError;
+    debugPrint(
+      '[SpeechService] recoverable recognition error '
+      '(permanent=$permanent): $rawError',
+    );
 
     _onStateChanged();
 
-    // Never restart during Camera / AI / TTS.
     if (_canRestartRecognition) {
       _scheduleRestart(
-        const Duration(milliseconds: 900),
+        _restartDelayForError(
+          errorCode,
+        ),
       );
     }
   }
@@ -498,6 +530,9 @@ class SpeechService {
     String error,
   ) {
     return error.contains(
+          'error_permission',
+        ) ||
+        error.contains(
           'permission',
         ) ||
         error.contains(
@@ -523,6 +558,84 @@ class SpeechService {
         error.contains(
           'service unavailable',
         );
+  }
+
+  static String _friendlyTransientError(
+    String errorCode,
+    String rawError,
+  ) {
+    if (errorCode.contains(
+          'no_match',
+        ) ||
+        errorCode.contains(
+          'speech_timeout',
+        )) {
+      return '';
+    }
+
+    if (errorCode.contains(
+      'busy',
+    )) {
+      return 'Speech recognizer ব্যস্ত ছিল। আবার শোনা হচ্ছে।';
+    }
+
+    if (errorCode.contains(
+          'network',
+        ) ||
+        errorCode.contains(
+          'server',
+        )) {
+      return 'Speech recognition network সাময়িকভাবে unavailable। আবার চেষ্টা করা হচ্ছে।';
+    }
+
+    if (errorCode.contains(
+      'client',
+    )) {
+      return 'Speech recognition session পুনরায় চালু করা হচ্ছে।';
+    }
+
+    return rawError;
+  }
+
+  static Duration _restartDelayForError(
+    String errorCode,
+  ) {
+    if (errorCode.contains(
+          'no_match',
+        ) ||
+        errorCode.contains(
+          'speech_timeout',
+        )) {
+      return const Duration(
+        milliseconds: 350,
+      );
+    }
+
+    if (errorCode.contains(
+          'busy',
+        ) ||
+        errorCode.contains(
+          'client',
+        )) {
+      return const Duration(
+        milliseconds: 1200,
+      );
+    }
+
+    if (errorCode.contains(
+          'network',
+        ) ||
+        errorCode.contains(
+          'server',
+        )) {
+      return const Duration(
+        milliseconds: 1800,
+      );
+    }
+
+    return const Duration(
+      milliseconds: 900,
+    );
   }
 
   void _disableForUnsupportedBengali() {
@@ -564,7 +677,7 @@ class SpeechService {
   }
 
   // ===========================================================================
-  // LEGACY WAKE WORD SETTING
+  // LEGACY WAKE-WORD SETTING
   // ===========================================================================
 
   Future<void> _loadWakeWordMode() async {
@@ -573,7 +686,9 @@ class SpeechService {
           await SharedPreferences.getInstance();
 
       _wakeWordMode =
-          prefs.getBool(wakeWordModeKey) ??
+          prefs.getBool(
+                wakeWordModeKey,
+              ) ??
               false;
     } catch (_) {
       _wakeWordMode = false;
@@ -595,7 +710,9 @@ class SpeechService {
       );
     } catch (_) {}
 
-    _onStateChanged();
+    if (!_disposed) {
+      _onStateChanged();
+    }
   }
 
   // ===========================================================================
@@ -615,10 +732,7 @@ class SpeechService {
           .trim();
     }
 
-    // -------------------------------------------------------------------------
-    // First choice: Bangla — Bangladesh
-    // -------------------------------------------------------------------------
-
+    // First choice: Bengali — Bangladesh.
     for (final locale in locales) {
       if (normalize(
             locale.localeId,
@@ -628,10 +742,7 @@ class SpeechService {
       }
     }
 
-    // -------------------------------------------------------------------------
-    // Second choice: any Bengali locale
-    // -------------------------------------------------------------------------
-
+    // Second choice: any Bengali locale.
     for (final locale in locales) {
       final id =
           normalize(
@@ -656,8 +767,7 @@ class SpeechService {
       return;
     }
 
-    // Some Android recognizers do not advertise all supported languages.
-    // Use bn-BD as the explicit fallback.
+    // Some OEM recognizers do not advertise every supported locale.
     _bengaliLocaleId = 'bn-BD';
 
     try {
@@ -665,7 +775,9 @@ class SpeechService {
           await _speech
               .locales()
               .timeout(
-        const Duration(seconds: 5),
+        const Duration(
+          seconds: 5,
+        ),
       );
 
       final selected =
@@ -687,24 +799,17 @@ class SpeechService {
         return;
       }
 
-      // Do not immediately mark Bengali as unsupported.
-      //
-      // Some OEM recognizers do not correctly advertise available locales.
-      // We try bn-BD once. If Android rejects it, _handleSpeechError()
-      // disables automatic retries.
       debugPrint(
         '[SpeechService] Bengali locale was not advertised; '
-        'trying bn-BD once.',
+        'trying bn-BD.',
       );
     } on TimeoutException {
       debugPrint(
-        '[SpeechService] locale lookup timed out; '
-        'trying bn-BD once.',
+        '[SpeechService] locale lookup timed out; trying bn-BD.',
       );
     } catch (e) {
       debugPrint(
-        '[SpeechService] locale lookup failed: $e; '
-        'trying bn-BD once.',
+        '[SpeechService] locale lookup failed: $e; trying bn-BD.',
       );
     }
   }
@@ -729,16 +834,46 @@ class SpeechService {
   // START COMMAND MODE
   // ===========================================================================
 
+  /// Arms command mode and starts the microphone when possible.
+  ///
+  /// Critical difference from the old version:
+  ///
+  /// `_commandModeEnabled = true` is recorded BEFORE checking temporary pause
+  /// or command/TTS state. Therefore a lifecycle/media pause cannot cause the
+  /// desired always-on mode to be silently lost.
   Future<void> startCommandListening() async {
     if (_disposed) {
       return;
     }
 
+    // Record user/app intent FIRST.
+    _commandModeEnabled = true;
+
+    _restartTimer?.cancel();
+
+    _onStateChanged();
+
     // -------------------------------------------------------------------------
-    // Permission safety
+    // Self-heal if the page asks us to start before initialization is ready.
+    // -------------------------------------------------------------------------
+
+    if (!_microphonePermissionGranted ||
+        !_speechEnabled ||
+        !_speechRecognizerAvailable) {
+      await initialize();
+
+      if (_disposed) {
+        return;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // HARD BLOCKERS
     // -------------------------------------------------------------------------
 
     if (!_microphonePermissionGranted) {
+      _commandModeEnabled = false;
+
       if (_microphonePermissionPermanentlyDenied) {
         _lastError =
             'Microphone permission বন্ধ আছে। '
@@ -753,12 +888,10 @@ class SpeechService {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // Recognizer safety
-    // -------------------------------------------------------------------------
-
     if (!_speechEnabled ||
         !_speechRecognizerAvailable) {
+      _commandModeEnabled = false;
+
       if (_lastError.isEmpty) {
         _lastError =
             'এই ফোনে Speech Recognition service পাওয়া যাচ্ছে না।';
@@ -769,11 +902,9 @@ class SpeechService {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // Bengali-language safety
-    // -------------------------------------------------------------------------
-
     if (_bengaliLanguageUnsupported) {
+      _commandModeEnabled = false;
+
       _lastError =
           'বাংলা Speech Recognition পাওয়া যাচ্ছে না। '
           'Google Speech Services-এ বাংলা চালু করে অ্যাপটি পুনরায় খুলুন।';
@@ -783,14 +914,28 @@ class SpeechService {
       return;
     }
 
-    if (_pausedForMedia ||
-        _commandInProgress) {
-      return;
-    }
-
+    // Successful readiness check. Keep desired mode armed.
     _commandModeEnabled = true;
 
+    // Watchdog belongs to command mode, not to one recognition session.
     _startWatchdog();
+
+    // Temporary blockers do NOT disable command mode.
+    //
+    // resumeLoop() / command finally / TTS finally will start the session.
+    if (_pausedForMedia ||
+        _commandInProgress ||
+        _ttsInProgress) {
+      debugPrint(
+        '[SpeechService] command mode armed; '
+        'waiting for temporary blocker to clear '
+        '(paused=$_pausedForMedia, '
+        'command=$_commandInProgress, '
+        'tts=$_ttsInProgress).',
+      );
+
+      return;
+    }
 
     await _startCommandSession();
   }
@@ -819,9 +964,10 @@ class SpeechService {
   }
 
   // ===========================================================================
-  // MEDIA PAUSE / RESUME
+  // MEDIA / LIFECYCLE PAUSE
   // ===========================================================================
 
+  /// Temporarily pauses the microphone WITHOUT disabling desired command mode.
   Future<void> pauseLoop() async {
     _pausedForMedia = true;
 
@@ -841,21 +987,43 @@ class SpeechService {
     }
   }
 
+  /// Clears the temporary pause and restores listening if command mode was
+  /// previously armed.
   Future<void> resumeLoop() async {
     _pausedForMedia = false;
 
     _onStateChanged();
 
-    if (_commandModeEnabled &&
-        !_disposed &&
-        !_commandInProgress &&
-        _speechEnabled &&
-        _speechRecognizerAvailable &&
-        !_bengaliLanguageUnsupported) {
-      _startWatchdog();
-
-      await _startCommandSession();
+    if (_disposed ||
+        !_commandModeEnabled) {
+      return;
     }
+
+    // Foreground resume can happen after Android reclaimed/restarted speech
+    // services. Re-check readiness instead of requiring a manual tap.
+    if (!_microphonePermissionGranted ||
+        !_speechEnabled ||
+        !_speechRecognizerAvailable) {
+      await initialize();
+
+      if (_disposed ||
+          !_commandModeEnabled) {
+        return;
+      }
+    }
+
+    if (!_microphonePermissionGranted ||
+        !_speechEnabled ||
+        !_speechRecognizerAvailable ||
+        _bengaliLanguageUnsupported ||
+        _commandInProgress ||
+        _ttsInProgress) {
+      return;
+    }
+
+    _startWatchdog();
+
+    await _startCommandSession();
   }
 
   // ===========================================================================
@@ -876,13 +1044,17 @@ class SpeechService {
 
   void scheduleRestartSoon([
     Duration delay =
-        const Duration(milliseconds: 400),
+        const Duration(
+          milliseconds: 400,
+        ),
   ]) {
     if (!_canRestartRecognition) {
       return;
     }
 
-    _scheduleRestart(delay);
+    _scheduleRestart(
+      delay,
+    );
   }
 
   // ===========================================================================
@@ -897,6 +1069,7 @@ class SpeechService {
         _commandModeEnabled &&
         !_pausedForMedia &&
         !_commandInProgress &&
+        !_ttsInProgress &&
         !_bengaliLanguageUnsupported;
   }
 
@@ -917,7 +1090,7 @@ class SpeechService {
 
     try {
       // -----------------------------------------------------------------------
-      // Stop stale Android recognizer session
+      // Stop any stale native session before opening a new one.
       // -----------------------------------------------------------------------
 
       if (_speech.isListening) {
@@ -926,11 +1099,12 @@ class SpeechService {
         } catch (_) {}
 
         await Future.delayed(
-          const Duration(milliseconds: 120),
+          const Duration(
+            milliseconds: 140,
+          ),
         );
       }
 
-      // Re-check all guards after await.
       if (!_canRestartRecognition) {
         return;
       }
@@ -939,16 +1113,15 @@ class SpeechService {
 
       _onStateChanged();
 
-      // -----------------------------------------------------------------------
-      // Start Bengali listener
-      // -----------------------------------------------------------------------
-
       await _speech.listen(
-        onResult: (result) {
+        onResult: (
+          result,
+        ) {
           if (_disposed ||
               !_commandModeEnabled ||
               _pausedForMedia ||
               _commandInProgress ||
+              _ttsInProgress ||
               _bengaliLanguageUnsupported) {
             return;
           }
@@ -957,36 +1130,15 @@ class SpeechService {
               result.recognizedWords.trim();
 
           if (heard.isNotEmpty) {
-            _lastHeard = heard;
+            _lastHeard =
+                heard;
 
             _onStateChanged();
           }
 
-          // ===================================================================
-          // CRITICAL FALSE-TRIGGER PROTECTION
-          // ===================================================================
-          //
-          // speech_to_text sends partial results while the user is speaking.
-          //
-          // Example:
-          //
-          // User says:
-          //
-          //   "এটা কী সুন্দর জিনিস"
-          //
-          // Android may send:
-          //
-          //   partial -> "এটা"
-          //   partial -> "এটা কী"
-          //   final   -> "এটা কী সুন্দর জিনিস"
-          //
-          // If we matched partial results, "এটা কী" would incorrectly trigger
-          // identifyObject before the user finished speaking.
-          //
-          // Therefore:
-          //
-          // ONLY FINAL RESULTS ARE ALLOWED TO TRIGGER COMMANDS.
-          // ===================================================================
+          // ===============================================================
+          // FINAL-ONLY COMMAND GATE
+          // ===============================================================
 
           if (!result.finalResult) {
             return;
@@ -996,16 +1148,13 @@ class SpeechService {
             return;
           }
 
-          // ===================================================================
-          // STRICT FIVE-COMMAND MATCH
-          // ===================================================================
-
           final intent =
               _extractIntent(
             heard,
           );
 
-          if (intent == null) {
+          if (intent ==
+              null) {
             return;
           }
 
@@ -1019,27 +1168,28 @@ class SpeechService {
             _bengaliLocaleId,
 
         listenFor:
-            const Duration(minutes: 5),
+            const Duration(
+          minutes: 5,
+        ),
 
         pauseFor:
-            const Duration(seconds: 5),
+            const Duration(
+          seconds: 5,
+        ),
 
         listenOptions:
             SpeechListenOptions(
-          // Keep partial results enabled so the UI can display what the device
-          // is hearing.
-          //
-          // They are NEVER used for triggering commands.
-          partialResults: true,
+          partialResults:
+              true,
 
-          cancelOnError: false,
+          cancelOnError:
+              false,
 
-          // Uses the Android/system recognizer.
-          //
-          // This avoids requiring the device to have offline Bengali speech
-          // recognition installed.
-          onDevice: false,
+          onDevice:
+              false,
 
+          // Keep confirmation mode for short command phrases.
+          // Session continuity is handled by restart/watchdog logic.
           listenMode:
               ListenMode.confirmation,
         ),
@@ -1048,24 +1198,39 @@ class SpeechService {
       _commandListening = false;
 
       final errorText =
-          e.toString().toLowerCase();
+          e
+              .toString()
+              .toLowerCase();
 
       debugPrint(
         '[SpeechService] command listen start failed: $e',
       );
 
-      if (_isLanguageError(errorText)) {
+      if (_isLanguageError(
+        errorText,
+      )) {
         _disableForUnsupportedBengali();
+      } else if (_isPermissionError(
+        errorText,
+      )) {
+        _speechEnabled = false;
+        _commandModeEnabled = false;
+
+        _lastError =
+            'মাইক্রোফোন অনুমতি পাওয়া যায়নি।';
+
+        _onStateChanged();
       } else {
         _lastError =
             e.toString();
 
         _onStateChanged();
 
-        // Never retry during Camera / AI / TTS.
         if (_canRestartRecognition) {
           _scheduleRestart(
-            const Duration(milliseconds: 900),
+            _restartDelayForError(
+              errorText,
+            ),
           );
         }
       }
@@ -1095,23 +1260,24 @@ class SpeechService {
     VoiceIntent intent,
     String heardText,
   ) {
-    // Never accept another command during Camera / AI / TTS.
-    if (_commandInProgress) {
+    if (_commandInProgress ||
+        _ttsInProgress ||
+        _pausedForMedia ||
+        !_commandModeEnabled) {
       return;
     }
 
     final now =
         DateTime.now();
 
-    // -------------------------------------------------------------------------
-    // Duplicate final result protection
-    // -------------------------------------------------------------------------
-
-    if (_lastIntent == intent &&
+    if (_lastIntent ==
+            intent &&
         now.difference(
               _lastIntentAt,
             ) <
-            const Duration(seconds: 2)) {
+            const Duration(
+              seconds: 2,
+            )) {
       return;
     }
 
@@ -1123,15 +1289,14 @@ class SpeechService {
       return;
     }
 
-    _lastIntent = intent;
-    _lastIntentAt = now;
+    _lastIntent =
+        intent;
+
+    _lastIntentAt =
+        now;
 
     // -------------------------------------------------------------------------
-    // CRITICAL LOCK
-    //
-    // Lock BEFORE calling _speech.stop().
-    //
-    // stop() may generate notListening/done callbacks immediately.
+    // CRITICAL LOCK BEFORE stop().
     // -------------------------------------------------------------------------
 
     _commandInProgress = true;
@@ -1146,7 +1311,9 @@ class SpeechService {
 
       if (_canRestartRecognition) {
         _scheduleRestart(
-          const Duration(milliseconds: 450),
+          const Duration(
+            milliseconds: 450,
+          ),
         );
       }
 
@@ -1175,12 +1342,11 @@ class SpeechService {
     String heardText,
   ) async {
     try {
-      // =======================================================================
-      // PHASE 1
-      // STOP SPEECH RECOGNITION
-      // =======================================================================
-
       _restartTimer?.cancel();
+
+      // -----------------------------------------------------------------------
+      // STOP STT WHILE COMMAND EXECUTES
+      // -----------------------------------------------------------------------
 
       try {
         await _speech.stop();
@@ -1195,12 +1361,14 @@ class SpeechService {
       _onStateChanged();
 
       await Future.delayed(
-        const Duration(milliseconds: 80),
+        const Duration(
+          milliseconds: 80,
+        ),
       );
 
-      // =======================================================================
+      // -----------------------------------------------------------------------
       // COMMAND CONFIRMATION SOUND
-      // =======================================================================
+      // -----------------------------------------------------------------------
 
       try {
         await SoundManager.instance
@@ -1211,16 +1379,9 @@ class SpeechService {
         );
       }
 
-      // =======================================================================
-      // PHASE 2
-      //
-      // Camera
-      // -> OCR / Vision
-      // -> Gemma
-      // -> TTS
-      //
-      // The microphone stays locked throughout this Future.
-      // =======================================================================
+      // -----------------------------------------------------------------------
+      // CAMERA / OCR / GEMMA / TTS
+      // -----------------------------------------------------------------------
 
       await handler(
         intent,
@@ -1231,26 +1392,21 @@ class SpeechService {
         '[SpeechService] triggered command failed: $e',
       );
 
-      debugPrint('$st');
+      debugPrint(
+        '$st',
+      );
     } finally {
-      // =======================================================================
-      // PHASE 3
-      // TASK + TTS COMPLETE
-      // =======================================================================
-
       _commandInProgress = false;
       _commandListening = false;
 
       _onStateChanged();
 
-      // =======================================================================
-      // PHASE 4
-      // RE-ARM FIVE-COMMAND TRIGGER LISTENER
-      // =======================================================================
-
+      // SpeechService is the single restart owner.
       if (_canRestartRecognition) {
         _scheduleRestart(
-          const Duration(milliseconds: 450),
+          const Duration(
+            milliseconds: 450,
+          ),
         );
       }
     }
@@ -1271,15 +1427,14 @@ class SpeechService {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // LISTENING
-    // -------------------------------------------------------------------------
-
-    if (status == 'listening') {
-      // Android may send a stale listening callback just after stop().
-      //
-      // Never allow that session to remain active during Camera / AI / TTS.
-      if (_commandInProgress ||
+    if (status ==
+        'listening') {
+      // A stale listening callback must never leave STT open while command,
+      // TTS, media pause, or manual command-mode disable is active.
+      if (!_commandModeEnabled ||
+          _pausedForMedia ||
+          _commandInProgress ||
+          _ttsInProgress ||
           _bengaliLanguageUnsupported) {
         _commandListening = false;
 
@@ -1295,9 +1450,9 @@ class SpeechService {
       }
 
       _commandListening = true;
-
       _bengaliLocaleAvailable = true;
 
+      // Clear harmless no-match/timeout text as soon as listening recovers.
       _lastError = '';
 
       _onStateChanged();
@@ -1305,22 +1460,19 @@ class SpeechService {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // SESSION ENDED
-    // -------------------------------------------------------------------------
-
-    if (status == 'notListening' ||
-        status == 'done') {
+    if (status ==
+            'notListening' ||
+        status ==
+            'done') {
       _commandListening = false;
 
       _onStateChanged();
 
-      // Never restart during Camera / AI / TTS.
-      //
-      // Never restart if Bengali is unsupported.
       if (_canRestartRecognition) {
         _scheduleRestart(
-          const Duration(milliseconds: 500),
+          const Duration(
+            milliseconds: 500,
+          ),
         );
       }
     }
@@ -1333,18 +1485,17 @@ class SpeechService {
   void _startWatchdog() {
     _watchdogTimer?.cancel();
 
+    if (!_commandModeEnabled ||
+        _disposed) {
+      return;
+    }
+
     _watchdogTimer =
         Timer.periodic(
-      const Duration(seconds: 8),
+      const Duration(
+        seconds: 8,
+      ),
       (_) {
-        // _canRestartRecognition includes:
-        //
-        // permission
-        // recognizer availability
-        // command mode
-        // media pause
-        // command-in-progress lock
-        // Bengali support
         if (!_canRestartRecognition) {
           return;
         }
@@ -1352,6 +1503,10 @@ class SpeechService {
         if (!_commandListening &&
             !_startingSession &&
             !_speech.isListening) {
+          debugPrint(
+            '[SpeechService] watchdog re-arming recognizer.',
+          );
+
           unawaited(
             _startCommandSession(),
           );
@@ -1377,7 +1532,6 @@ class SpeechService {
         Timer(
       delay,
       () {
-        // Re-check everything when the timer actually fires.
         if (!_canRestartRecognition) {
           return;
         }
@@ -1418,23 +1572,6 @@ class SpeechService {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    // Standalone TTS:
-    //
-    // recognizer stop
-    // -> TTS
-    // -> recognizer restart
-    //
-    //
-    // Trigger-command TTS:
-    //
-    // _commandInProgress == true
-    // -> recognizer already stopped
-    // -> TTS
-    // -> NO restart here
-    // -> _runTriggeredCommand finally block owns restart
-    // -------------------------------------------------------------------------
-
     final shouldPauseRecognizer =
         _commandModeEnabled &&
         !_commandInProgress &&
@@ -1443,9 +1580,21 @@ class SpeechService {
         _speechRecognizerAvailable &&
         !_bengaliLanguageUnsupported;
 
-    if (shouldPauseRecognizer) {
-      _restartTimer?.cancel();
+    // -------------------------------------------------------------------------
+    // CRITICAL TTS LOCK
+    //
+    // Set this BEFORE stopping STT.
+    //
+    // stop() can synchronously/asynchronously emit done/notListening. Those
+    // callbacks now see _ttsInProgress=true and cannot reopen the microphone
+    // while TTS is speaking.
+    // -------------------------------------------------------------------------
 
+    _ttsInProgress = true;
+
+    _restartTimer?.cancel();
+
+    if (shouldPauseRecognizer) {
       try {
         await _speech.stop();
       } catch (e) {
@@ -1470,11 +1619,21 @@ class SpeechService {
         '[SpeechService] TTS error: $e',
       );
     } finally {
-      // Trigger-command TTS cannot restart from here.
-      if (shouldPauseRecognizer &&
-          _canRestartRecognition) {
+      _ttsInProgress = false;
+
+      if (!_disposed) {
+        _onStateChanged();
+      }
+
+      // During triggered commands, _commandInProgress is still true here, so
+      // _canRestartRecognition is false. The command-finally block owns restart.
+      //
+      // For standalone TTS, restart happens here.
+      if (_canRestartRecognition) {
         _scheduleRestart(
-          const Duration(milliseconds: 350),
+          const Duration(
+            milliseconds: 350,
+          ),
         );
       }
     }
@@ -1498,12 +1657,25 @@ class SpeechService {
       await _tts.stop();
 
       await Future.delayed(
-        const Duration(milliseconds: 40),
+        const Duration(
+          milliseconds: 40,
+        ),
       );
     } catch (e) {
       debugPrint(
         '[SpeechService] stop TTS error: $e',
       );
+    } finally {
+      _ttsInProgress = false;
+
+      if (!_disposed &&
+          _canRestartRecognition) {
+        _scheduleRestart(
+          const Duration(
+            milliseconds: 250,
+          ),
+        );
+      }
     }
   }
 
@@ -1522,6 +1694,8 @@ class SpeechService {
     _commandListening = false;
     _commandInProgress = false;
     _startingSession = false;
+    _pausedForMedia = false;
+    _ttsInProgress = false;
 
     _restartTimer?.cancel();
     _watchdogTimer?.cancel();
