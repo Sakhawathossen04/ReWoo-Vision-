@@ -6,7 +6,7 @@ import 'voice_intent.dart';
 ///
 /// 1. [matchTriggerCommand]
 ///    Strict matcher used by SpeechService while waiting for one of the
-///    five direct activation commands.
+///    five direct activation command families.
 ///
 /// 2. [match]
 ///    Broader legacy/general-purpose matcher retained for existing UI and
@@ -14,7 +14,7 @@ import 'voice_intent.dart';
 ///
 /// IMPORTANT:
 ///
-/// The five direct trigger commands themselves act as both:
+/// The five direct trigger command families themselves act as both:
 ///
 /// wake phrase + task command
 ///
@@ -23,7 +23,7 @@ class BengaliVoiceCommands {
   BengaliVoiceCommands._();
 
   // ===========================================================================
-  // STRICT FIVE-COMMAND TRIGGER MODE
+  // STRICT FIVE-COMMAND-FAMILY TRIGGER MODE
   // ===========================================================================
 
   /// These are the ONLY five command families that may directly activate
@@ -31,6 +31,12 @@ class BengaliVoiceCommands {
   ///
   /// Bengali speech recognition frequently alternates between "কী" and "কি",
   /// therefore both forms are explicitly accepted where required.
+  ///
+  /// FRONT also accepts the short exact alias:
+  ///
+  /// "সামনে দেখো"
+  ///
+  /// Exact matching is still preserved.
   static const Map<VoiceIntent, List<String>> triggerCommands = {
     // -------------------------------------------------------------------------
     // 1. FRONT
@@ -39,6 +45,7 @@ class BengaliVoiceCommands {
     VoiceIntent.describeFront: [
       'সামনে কী আছে দেখো',
       'সামনে কি আছে দেখো',
+      'সামনে দেখো',
     ],
 
     // -------------------------------------------------------------------------
@@ -78,7 +85,7 @@ class BengaliVoiceCommands {
     ],
   };
 
-  /// Matches ONLY the five direct trigger commands.
+  /// Matches ONLY the five direct trigger command families.
   ///
   /// Matching is exact after harmless text normalization.
   ///
@@ -99,13 +106,22 @@ class BengaliVoiceCommands {
   /// "সামনে কী আছে দেখো?"
   /// -> describeFront
   ///
+  /// "সামনে দেখো"
+  /// -> describeFront
+  ///
+  /// "সামনে দেখো!"
+  /// -> describeFront
+  ///
   /// "এটা কী"
   /// -> identifyObject
   ///
   /// "এটা কী সুন্দর জিনিস"
   /// -> null
   ///
-  /// "রিউ সামনে কী আছে দেখো"
+  /// "সামনে দেখো তারপর বলো"
+  /// -> null
+  ///
+  /// "রিউ সামনে দেখো"
   /// -> null
   ///
   /// "ছবি তোলো"
@@ -121,17 +137,13 @@ class BengaliVoiceCommands {
       return null;
     }
 
-    for (final entry
-        in triggerCommands.entries) {
-      for (final phrase
-          in entry.value) {
-        final expected =
-            _normalize(
+    for (final entry in triggerCommands.entries) {
+      for (final phrase in entry.value) {
+        final expected = _normalize(
           phrase,
         );
 
-        if (heard ==
-            expected) {
+        if (heard == expected) {
           return entry.key;
         }
       }
@@ -153,22 +165,25 @@ class BengaliVoiceCommands {
 
   /// Primary human-readable five trigger phrases.
   ///
+  /// The first phrase of each family is intentionally used as the help phrase.
+  ///
+  /// Therefore adding "সামনে দেখো" as an alias does NOT create a sixth
+  /// help command.
+  ///
   /// Use this for:
   ///
   /// - startup TTS
   /// - trigger-mode help
   /// - onboarding
   /// - tests
-  static List<String>
-      get triggerHelpCommands =>
-          triggerCommands.values
-              .map(
-                (phrases) =>
-                    phrases.first,
-              )
-              .toList(
-                growable: false,
-              );
+  static List<String> get triggerHelpCommands =>
+      triggerCommands.values
+          .map(
+            (phrases) => phrases.first,
+          )
+          .toList(
+            growable: false,
+          );
 
   // ===========================================================================
   // GENERAL / LEGACY COMMAND MATCHER
@@ -179,9 +194,9 @@ class BengaliVoiceCommands {
   /// IMPORTANT:
   ///
   /// SpeechService trigger-listening mode must NOT use this map.
+  ///
   /// It must use [matchTriggerCommand].
-  static const Map<VoiceIntent, List<String>>
-      _phrases = {
+  static const Map<VoiceIntent, List<String>> _phrases = {
     // -------------------------------------------------------------------------
     // READ TEXT
     // -------------------------------------------------------------------------
@@ -262,6 +277,9 @@ class BengaliVoiceCommands {
       'সামনের দৃশ্য বলো',
       'সামনে কী আছে দেখো',
       'সামনে কি আছে দেখো',
+
+      // Short direct/legacy-friendly alias.
+      'সামনে দেখো',
     ],
 
     // -------------------------------------------------------------------------
@@ -397,8 +415,7 @@ class BengaliVoiceCommands {
     'আরে ',
   ];
 
-  static const List<String>
-      _trailingVerbs = [
+  static const List<String> _trailingVerbs = [
     'দেখো',
     'দেখুন',
     'দেখাও',
@@ -423,13 +440,10 @@ class BengaliVoiceCommands {
   /// Trigger-listening mode must use [matchTriggerCommand] instead.
   static VoiceIntent? match(
     String rawText, {
-    bool requireWakeWord =
-        false,
-    bool wakePrimed =
-        true,
+    bool requireWakeWord = false,
+    bool wakePrimed = true,
   }) {
-    final normalized =
-        _normalize(
+    final normalized = _normalize(
       rawText,
     );
 
@@ -443,13 +457,11 @@ class BengaliVoiceCommands {
 
     if (requireWakeWord &&
         !wakePrimed) {
-      final stripped =
-          stripWakeWord(
+      final stripped = stripWakeWord(
         normalized,
       );
 
-      if (stripped ==
-          null) {
+      if (stripped == null) {
         return null;
       }
 
@@ -471,13 +483,11 @@ class BengaliVoiceCommands {
   static VoiceIntent? _matchText(
     String normalized,
   ) {
-    final direct =
-        _exactOrContainment(
+    final direct = _exactOrContainment(
       normalized,
     );
 
-    if (direct !=
-        null) {
+    if (direct != null) {
       return direct;
     }
 
@@ -490,8 +500,7 @@ class BengaliVoiceCommands {
   // GENERAL EXACT / CONTAINMENT MATCHING
   // ===========================================================================
 
-  static VoiceIntent?
-      _exactOrContainment(
+  static VoiceIntent? _exactOrContainment(
     String heard,
   ) {
     // -------------------------------------------------------------------------
@@ -499,17 +508,13 @@ class BengaliVoiceCommands {
     // Exact + polite variants.
     // -------------------------------------------------------------------------
 
-    for (final entry
-        in _phrases.entries) {
-      for (final phrase
-          in entry.value) {
-        final command =
-            _normalize(
+    for (final entry in _phrases.entries) {
+      for (final phrase in entry.value) {
+        final command = _normalize(
           phrase,
         );
 
-        if (heard ==
-            command) {
+        if (heard == command) {
           return entry.key;
         }
 
@@ -529,12 +534,9 @@ class BengaliVoiceCommands {
     // GENERAL MATCHER ONLY.
     // -------------------------------------------------------------------------
 
-    for (final entry
-        in _phrases.entries) {
-      for (final phrase
-          in entry.value) {
-        final command =
-            _normalize(
+    for (final entry in _phrases.entries) {
+      for (final phrase in entry.value) {
+        final command = _normalize(
           phrase,
         );
 
@@ -552,24 +554,18 @@ class BengaliVoiceCommands {
     // Trailing verb tolerance.
     // -------------------------------------------------------------------------
 
-    final stripped =
-        _stripTrailingVerbs(
+    final stripped = _stripTrailingVerbs(
       heard,
     );
 
-    if (stripped !=
-        heard) {
-      for (final entry
-          in _phrases.entries) {
-        for (final phrase
-            in entry.value) {
-          final command =
-              _normalize(
+    if (stripped != heard) {
+      for (final entry in _phrases.entries) {
+        for (final phrase in entry.value) {
+          final command = _normalize(
             phrase,
           );
 
-          if (stripped ==
-              command) {
+          if (stripped == command) {
             return entry.key;
           }
 
@@ -597,13 +593,11 @@ class BengaliVoiceCommands {
     String heard,
     String command,
   ) {
-    if (heard ==
-        command) {
+    if (heard == command) {
       return true;
     }
 
-    for (final prefix
-        in _prefixes) {
+    for (final prefix in _prefixes) {
       if (heard ==
           '$prefix$command') {
         return true;
@@ -612,22 +606,19 @@ class BengaliVoiceCommands {
       if (heard.startsWith(
         prefix,
       )) {
-        final withoutPrefix =
-            heard
-                .substring(
-                  prefix.length,
-                )
-                .trim();
+        final withoutPrefix = heard
+            .substring(
+              prefix.length,
+            )
+            .trim();
 
-        if (withoutPrefix ==
-            command) {
+        if (withoutPrefix == command) {
           return true;
         }
       }
     }
 
-    for (final suffix
-        in const [
+    for (final suffix in const [
       ' প্লিজ',
       ' একটু',
     ]) {
@@ -648,34 +639,29 @@ class BengaliVoiceCommands {
       return false;
     }
 
-    var index =
-        heard.indexOf(
+    var index = heard.indexOf(
       command,
     );
 
     while (index != -1) {
       final beforeOk =
           index == 0 ||
-              heard[index - 1] ==
-                  ' ';
+          heard[index - 1] == ' ';
 
       final end =
           index +
-              command.length;
+          command.length;
 
       final afterOk =
-          end ==
-                  heard.length ||
-              heard[end] ==
-                  ' ';
+          end == heard.length ||
+          heard[end] == ' ';
 
       if (beforeOk &&
           afterOk) {
         return true;
       }
 
-      index =
-          heard.indexOf(
+      index = heard.indexOf(
         command,
         index + 1,
       );
@@ -691,23 +677,18 @@ class BengaliVoiceCommands {
   static String _stripTrailingVerbs(
     String heard,
   ) {
-    var text =
-        heard.trim();
+    var text = heard.trim();
 
-    var changed =
-        true;
+    var changed = true;
 
-    var strips =
-        0;
+    var strips = 0;
 
     while (changed &&
         strips < 3) {
       changed = false;
 
-      for (final verb
-          in _trailingVerbs) {
-        if (text ==
-            verb) {
+      for (final verb in _trailingVerbs) {
+        if (text == verb) {
           return '';
         }
 
@@ -747,12 +728,9 @@ class BengaliVoiceCommands {
   static VoiceIntent? _fuzzyMatch(
     String heard,
   ) {
-    for (final entry
-        in _phrases.entries) {
-      for (final phrase
-          in entry.value) {
-        final command =
-            _normalize(
+    for (final entry in _phrases.entries) {
+      for (final phrase in entry.value) {
+        final command = _normalize(
           phrase,
         );
 
@@ -785,15 +763,13 @@ class BengaliVoiceCommands {
       return 0;
     }
 
-    final distance =
-        _levenshtein(
+    final distance = _levenshtein(
       a,
       b,
     );
 
     final maxLength =
-        a.length >
-                b.length
+        a.length > b.length
             ? a.length
             : b.length;
 
@@ -806,11 +782,8 @@ class BengaliVoiceCommands {
     String a,
     String b,
   ) {
-    final m =
-        a.length;
-
-    final n =
-        b.length;
+    final m = a.length;
+    final n = b.length;
 
     if (m == 0) {
       return n;
@@ -823,8 +796,7 @@ class BengaliVoiceCommands {
     final previous =
         List<int>.generate(
       n + 1,
-      (index) =>
-          index,
+      (index) => index,
     );
 
     final current =
@@ -836,8 +808,7 @@ class BengaliVoiceCommands {
     for (var i = 1;
         i <= m;
         i++) {
-      current[0] =
-          i;
+      current[0] = i;
 
       for (var j = 1;
           j <= n;
@@ -853,34 +824,26 @@ class BengaliVoiceCommands {
                 : 1;
 
         final deletion =
-            previous[j] +
-                1;
+            previous[j] + 1;
 
         final insertion =
-            current[j - 1] +
-                1;
+            current[j - 1] + 1;
 
         final substitution =
             previous[j - 1] +
-                cost;
+            cost;
 
-        var best =
-            deletion;
+        var best = deletion;
 
-        if (insertion <
-            best) {
-          best =
-              insertion;
+        if (insertion < best) {
+          best = insertion;
         }
 
-        if (substitution <
-            best) {
-          best =
-              substitution;
+        if (substitution < best) {
+          best = substitution;
         }
 
-        current[j] =
-            best;
+        current[j] = best;
       }
 
       for (var j = 0;
@@ -959,8 +922,7 @@ class BengaliVoiceCommands {
   static String? stripWakeWord(
     String rawText,
   ) {
-    final heard =
-        _normalize(
+    final heard = _normalize(
       rawText,
     );
 
@@ -983,15 +945,12 @@ class BengaliVoiceCommands {
             ),
           );
 
-    for (final wake
-        in sortedWakeWords) {
-      final normalizedWake =
-          _normalize(
+    for (final wake in sortedWakeWords) {
+      final normalizedWake = _normalize(
         wake,
       );
 
-      if (normalizedWake
-          .isEmpty) {
+      if (normalizedWake.isEmpty) {
         continue;
       }
 
@@ -1050,20 +1009,19 @@ class BengaliVoiceCommands {
   ///
   /// Trigger-mode UI should use [triggerHelpCommands] when only the five
   /// activation phrases should be displayed.
-  static List<String>
-      get primaryHelpCommands =>
-          const [
-            'সামনে কী আছে',
-            'এটা কী',
-            'এদিকে দেখো',
-            'ডান পাশে কী আছে',
-            'বাম পাশে কী আছে',
-            'লেখাটা পড়ে শোনাও',
-            'ছবি তোলো',
-            'ভিডিও রেকর্ড করো',
-            'ভিডিও বন্ধ করো',
-            'আবার বলো',
-            'চুপ করো',
-            'নতুন আলাপ',
-          ];
+  static List<String> get primaryHelpCommands =>
+      const [
+        'সামনে কী আছে',
+        'এটা কী',
+        'এদিকে দেখো',
+        'ডান পাশে কী আছে',
+        'বাম পাশে কী আছে',
+        'লেখাটা পড়ে শোনাও',
+        'ছবি তোলো',
+        'ভিডিও রেকর্ড করো',
+        'ভিডিও বন্ধ করো',
+        'আবার বলো',
+        'চুপ করো',
+        'নতুন আলাপ',
+      ];
 }
