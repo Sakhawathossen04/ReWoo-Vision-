@@ -9,6 +9,7 @@ import 'package:flutter_gemma/pigeon.g.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../../download_page/config/constants.dart';
+import '../../download_page/services/download_state_manager.dart';
 import '../models/message_models.dart';
 
 /// Reasons why the local Gemma runtime can fail.
@@ -63,15 +64,31 @@ class GemmaServiceException implements Exception {
 
 /// Singleton service for the local Gemma vision model.
 ///
+/// Canonical model architecture:
+///
+/// DownloadManager
+///      ↓
+/// <ApplicationDocumentsDirectory>/<modelName>
+///      ↓
+/// DownloadStateManager
+///      ↓
+/// GemmaService
+///      ↓
+/// flutter_gemma
+///
+/// Every layer uses the exact same final model file.
+///
 /// Initialization strategy:
 ///
 /// Requested GPU
 ///      ↓
-/// validate local model
+/// validate canonical model
 ///      ↓
-/// create GPU model
+/// repair persistent completed state
 ///      ↓
-/// create GPU chat
+/// register canonical model with flutter_gemma
+///      ↓
+/// create GPU model + chat
 ///      ↓
 /// SUCCESS
 ///
@@ -86,21 +103,6 @@ class GemmaServiceException implements Exception {
 /// CPU createChat
 ///      ↓
 /// SUCCESS
-///
-/// If CPU also fails:
-///
-/// GemmaServiceException(
-///   reason: cpuFallbackFailed,
-/// )
-///
-///
-/// Requested CPU:
-///
-/// validate model
-///      ↓
-/// CPU model + chat
-///      ↓
-/// success / classified failure
 class GemmaService {
   GemmaService._internal();
 
@@ -116,17 +118,10 @@ class GemmaService {
 
   bool _initialised = false;
 
-  /// Actual backend used by this service.
+  /// Actual backend currently in use.
   PreferredBackend? _currentBackend;
 
-  /// Backend requested by Settings/Bootstrap.
-  ///
-  /// Example:
-  ///
-  /// requested = GPU
-  /// actual    = CPU
-  ///
-  /// means GPU failed and CPU fallback succeeded.
+  /// Backend requested by Settings / Bootstrap.
   PreferredBackend? _requestedBackend;
 
   bool _usedCpuFallback = false;
@@ -163,26 +158,15 @@ class GemmaService {
     PreferredBackend backend,
   ) async {
     // -------------------------------------------------------------------------
-    // Idempotent.
-    //
-    // Important:
-    //
-    // If GPU was requested but CPU fallback succeeded:
-    //
-    // requestedBackend = GPU
-    // currentBackend   = CPU
-    //
-    // Calling init(GPU) again in the same runtime should NOT endlessly retry
-    // the broken GPU.
+    // IDEMPOTENT INITIALIZATION
     // -------------------------------------------------------------------------
 
     if (_initialised &&
-        _requestedBackend ==
-            backend) {
+        _requestedBackend == backend) {
       return;
     }
 
-    // Backend/settings changed.
+    // Backend/settings changed or stale runtime exists.
     if (_initialised ||
         _model != null ||
         _chat != null) {
@@ -203,7 +187,7 @@ class GemmaService {
 
     // =======================================================================
     // PHASE 1
-    // MODEL FILE VALIDATION
+    // RESOLVE + VALIDATE CANONICAL MODEL
     // =======================================================================
 
     final modelFile =
@@ -211,42 +195,13 @@ class GemmaService {
 
     // =======================================================================
     // PHASE 2
-    // POINT FLUTTER GEMMA TO LOCAL MODEL
+    // REGISTER EXACT SAME CANONICAL MODEL WITH FLUTTER_GEMMA
     // =======================================================================
 
-    try {
-      final installed =
-          await _gemma
-              .modelManager
-              .isModelInstalled;
-
-      if (!installed) {
-        await _gemma
-            .modelManager
-            .setModelPath(
-          modelFile.path,
-        );
-      }
-    } catch (e, st) {
-      debugPrint(
-        '[GemmaService] '
-        'Model path registration failed: $e',
-      );
-
-      debugPrint('$st');
-
-      final failure =
-          _classifyInitializationError(
-        e,
-        backend:
-            backend,
-      );
-
-      _lastFailure =
-          failure;
-
-      throw failure;
-    }
+    await _registerCanonicalModel(
+      modelFile,
+      backend,
+    );
 
     // =======================================================================
     // PHASE 3
@@ -300,12 +255,6 @@ class GemmaService {
               PreferredBackend.gpu,
         );
 
-        // -------------------------------------------------------------------
-        // GPU failure does NOT immediately fail the application.
-        //
-        // Try CPU.
-        // -------------------------------------------------------------------
-
         debugPrint(
           '[GemmaService] '
           'GPU failure classified as '
@@ -313,8 +262,6 @@ class GemmaService {
           'Trying CPU fallback...',
         );
 
-        // _createRuntime() already closes its partially created model on
-        // failure, but reset our service state defensively as well.
         await _releaseRuntime(
           preserveRequestedBackend:
               true,
@@ -331,6 +278,7 @@ class GemmaService {
           _currentBackend =
               PreferredBackend.cpu;
 
+          // Original request remains GPU.
           _requestedBackend =
               PreferredBackend.gpu;
 
@@ -373,16 +321,12 @@ class GemmaService {
             reason:
                 GemmaFailureReason
                     .cpuFallbackFailed,
-
             backend:
                 PreferredBackend.cpu,
-
             gpuFailureReason:
                 gpuFailure.reason,
-
             originalError:
                 cpuError,
-
             userMessage:
                 _cpuFallbackFailureMessage(
               gpuFailure:
@@ -464,6 +408,138 @@ class GemmaService {
   }
 
   // ===========================================================================
+  // CANONICAL MODEL REGISTRATION
+  // ===========================================================================
+
+  /// Synchronizes flutter_gemma with the exact same canonical model that the
+  /// downloader and DownloadStateManager use.
+  ///
+  /// IMPORTANT:
+  ///
+  /// flutter_gemma 0.10.6 maintains its own installed-model filename.
+  /// We register [modelName] BEFORE asking [isModelInstalled].
+  ///
+  /// This prevents a valid old model from being treated as an unregistered
+  /// orphan by flutter_gemma's first model-manager access.
+  Future<void> _registerCanonicalModel(
+    File modelFile,
+    PreferredBackend backend,
+  ) async {
+    try {
+      // -----------------------------------------------------------------------
+      // DEFENSIVE CANONICAL-FILENAME CHECK
+      // -----------------------------------------------------------------------
+
+      final actualFileName =
+          Uri.file(
+        modelFile.path,
+      ).pathSegments.last;
+
+      if (actualFileName !=
+          modelName) {
+        throw StateError(
+          'Non-canonical Gemma model path received. '
+          'Expected filename=$modelName, '
+          'actual=${modelFile.path}',
+        );
+      }
+
+      // -----------------------------------------------------------------------
+      // REGISTER FILENAME FIRST
+      //
+      // This updates flutter_gemma's own installed_model_file_name state.
+      // -----------------------------------------------------------------------
+
+      await _gemma
+          .modelManager
+          .forceUpdateModelFilename(
+        modelName,
+      );
+
+      debugPrint(
+        '[GemmaService] '
+        'flutter_gemma canonical filename synchronized: '
+        '$modelName',
+      );
+
+      // -----------------------------------------------------------------------
+      // NOW it is safe to ask the plugin whether the model is installed.
+      // -----------------------------------------------------------------------
+
+      var installed =
+          await _gemma
+              .modelManager
+              .isModelInstalled;
+
+      // -----------------------------------------------------------------------
+      // ABSOLUTE-PATH FALLBACK
+      // -----------------------------------------------------------------------
+
+      if (!installed) {
+        debugPrint(
+          '[GemmaService] '
+          'Canonical model passed ReWoo validation but '
+          'flutter_gemma did not detect it. '
+          'Registering absolute model path.',
+        );
+
+        await _gemma
+            .modelManager
+            .setModelPath(
+          modelFile.path,
+        );
+
+        // Keep plugin filename cache aligned after explicit path registration.
+        await _gemma
+            .modelManager
+            .forceUpdateModelFilename(
+          modelName,
+        );
+
+        installed =
+            await _gemma
+                .modelManager
+                .isModelInstalled;
+      }
+
+      if (!installed) {
+        throw StateError(
+          'Canonical model exists and passed strict validation, '
+          'but flutter_gemma could not register it. '
+          'Path=${modelFile.path}',
+        );
+      }
+
+      debugPrint(
+        '[GemmaService] '
+        'Canonical model registered successfully: '
+        '${modelFile.path}',
+      );
+    } catch (e, st) {
+      debugPrint(
+        '[GemmaService] '
+        'Canonical model registration failed: $e',
+      );
+
+      debugPrint(
+        '$st',
+      );
+
+      final failure =
+          _classifyInitializationError(
+        e,
+        backend:
+            backend,
+      );
+
+      _lastFailure =
+          failure;
+
+      throw failure;
+    }
+  }
+
+  // ===========================================================================
   // CREATE COMPLETE RUNTIME
   // ===========================================================================
 
@@ -473,15 +549,11 @@ class GemmaService {
   ///
   /// for one backend.
   ///
-  /// This is important because GPU createModel() can succeed while
-  /// createChat() later fails due to driver/memory problems.
-  ///
-  /// We consider the backend successful only when both objects exist.
+  /// A backend counts as successful only when both objects are ready.
   Future<void> _createRuntime(
     PreferredBackend backend,
   ) async {
-    InferenceModel?
-        candidateModel;
+    InferenceModel? candidateModel;
 
     try {
       // -----------------------------------------------------------------------
@@ -489,24 +561,19 @@ class GemmaService {
       // -----------------------------------------------------------------------
 
       candidateModel =
-          await _gemma
-              .createModel(
+          await _gemma.createModel(
         preferredBackend:
             backend,
 
-        // Gemma 3 / Gemma 3n instruction-tuned family.
         modelType:
             ModelType.gemmaIt,
 
-        // Vision assistant.
         supportImage:
             true,
 
-        // Total model context / KV-cache budget.
         maxTokens:
             8192,
 
-        // ReWoo currently processes one camera image per user query.
         maxNumImages:
             1,
       );
@@ -537,20 +604,14 @@ class GemmaService {
             512,
       );
 
-      // -----------------------------------------------------------------------
-      // Publish runtime only AFTER complete success.
-      // -----------------------------------------------------------------------
-
+      // Publish only after full success.
       _model =
           candidateModel;
 
       _chat =
           candidateChat;
     } catch (e) {
-      // -----------------------------------------------------------------------
-      // Never leave a half-created GPU/CPU model alive.
-      // -----------------------------------------------------------------------
-
+      // Never leave a half-created runtime alive.
       if (candidateModel !=
           null) {
         try {
@@ -576,11 +637,49 @@ class GemmaService {
   }
 
   // ===========================================================================
-  // LOCAL MODEL FILE VALIDATION
+  // CANONICAL LOCAL MODEL VALIDATION
   // ===========================================================================
 
   Future<File>
       _getValidatedModelFile() async {
+    // -------------------------------------------------------------------------
+    // PHASE 1
+    // REPAIR LOST / STALE DOWNLOAD PREFS
+    // -------------------------------------------------------------------------
+    //
+    // If:
+    //
+    // SharedPreferences says missing / failed / downloading
+    //
+    // BUT:
+    //
+    // canonical physical model exists and is valid
+    //
+    // DownloadStateManager repairs:
+    //
+    // completed = true
+    // verified  = true
+    //
+    // It does not download or delete anything.
+    // -------------------------------------------------------------------------
+
+    try {
+      await DownloadStateManager
+          .repairCompletedStateFromPhysicalModelIfValid();
+    } catch (e) {
+      // Persistent-state repair failure must not invalidate a physically valid
+      // model. Strict filesystem validation below remains authoritative.
+      debugPrint(
+        '[GemmaService] '
+        'Download-state repair warning: $e',
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // PHASE 2
+    // EXACT CANONICAL PATH
+    // -------------------------------------------------------------------------
+
     final dir =
         await getApplicationDocumentsDirectory();
 
@@ -588,7 +687,15 @@ class GemmaService {
         '${dir.path}/$modelName';
 
     final file =
-        File(path);
+        File(
+      path,
+    );
+
+    debugPrint(
+      '[GemmaService] '
+      'Resolving canonical model: '
+      '$path',
+    );
 
     // -------------------------------------------------------------------------
     // MISSING
@@ -603,11 +710,11 @@ class GemmaService {
 
         userMessage:
             'Local AI model file ফোনে পাওয়া যায়নি। '
-            'Model download page থেকে model আবার download বা recovery করুন.',
+            'আগের model download বা recovery সম্পন্ন করুন.',
 
         originalError:
             FileSystemException(
-          'Model file missing',
+          'Canonical model file missing',
           path,
         ),
       );
@@ -619,7 +726,7 @@ class GemmaService {
     }
 
     // -------------------------------------------------------------------------
-    // SIZE VALIDATION
+    // READ SIZE
     // -------------------------------------------------------------------------
 
     int size;
@@ -636,7 +743,7 @@ class GemmaService {
 
         userMessage:
             'Local AI model file পড়া যাচ্ছে না। '
-            'File corrupt অথবা storage error হতে পারে.',
+            'Storage অথবা file-system problem হতে পারে.',
 
         originalError:
             e,
@@ -647,6 +754,10 @@ class GemmaService {
 
       throw failure;
     }
+
+    // -------------------------------------------------------------------------
+    // STRICT SIZE VALIDATION
+    // -------------------------------------------------------------------------
 
     final minimumValidSize =
         (expectedModelFileSize *
@@ -662,27 +773,57 @@ class GemmaService {
                 .modelFileCorrupt,
 
         userMessage:
-            'Local AI model file অসম্পূর্ণ বা corrupt। '
-            'Expected model-এর তুলনায় file size কম। '
-            'Download recovery/verification আবার চালান.',
+            'Local AI model file অসম্পূর্ণ অথবা corrupt। '
+            'Existing download recovery আবার চালাতে হবে.',
 
         originalError:
             StateError(
-          'Model file too small: '
+          'Canonical model too small: '
           '$size bytes, '
-          'minimum=$minimumValidSize',
+          'minimum=$minimumValidSize, '
+          'path=$path',
         ),
       );
 
       _lastFailure =
           failure;
 
+      // IMPORTANT:
+      //
+      // GemmaService does NOT delete an undersized model here.
+      //
+      // DownloadManager / DownloadLogic owns recovery and corruption cleanup.
       throw failure;
+    }
+
+    // -------------------------------------------------------------------------
+    // PHASE 3
+    // REPAIR COMPLETED STATE USING REAL FILE SIZE
+    // -------------------------------------------------------------------------
+
+    try {
+      await DownloadStateManager
+          .saveDownloadCompleted(
+        downloadedBytes:
+            size,
+        expectedBytes:
+            expectedModelFileSize,
+        verified:
+            true,
+      );
+    } catch (e) {
+      // Do not reject an otherwise valid physical model merely because prefs
+      // persistence failed.
+      debugPrint(
+        '[GemmaService] '
+        'Valid model found but completed-state persistence failed: $e',
+      );
     }
 
     debugPrint(
       '[GemmaService] '
-      'Model file validation passed: '
+      'Canonical model validation passed: '
+      '$path, '
       '$size bytes',
     );
 
@@ -719,6 +860,7 @@ class GemmaService {
         'no such file',
         'file not found',
         'model file missing',
+        'canonical model file missing',
         'does not exist',
         'path not found',
       ],
@@ -736,7 +878,7 @@ class GemmaService {
 
         userMessage:
             'Local AI model file পাওয়া যায়নি। '
-            'Model download সম্পূর্ণ হয়েছে কিনা পরীক্ষা করুন.',
+            'Model download বা recovery সম্পূর্ণ হয়েছে কিনা পরীক্ষা করুন.',
       );
     }
 
@@ -756,6 +898,7 @@ class GemmaService {
         'flatbuffer verification',
         'failed to parse model',
         'model verification failed',
+        'model too small',
       ],
     )) {
       return GemmaServiceException(
@@ -771,7 +914,7 @@ class GemmaService {
 
         userMessage:
             'Downloaded Local AI model file corrupt অথবা অসম্পূর্ণ। '
-            'Model verification/download recovery আবার চালাতে হবে.',
+            'Existing download recovery আবার চালাতে হবে.',
       );
     }
 
@@ -888,9 +1031,7 @@ class GemmaService {
     }
 
     // -------------------------------------------------------------------------
-    // GPU backend failed for an unknown reason.
-    //
-    // Still classify as GPU failure so CPU fallback is meaningful.
+    // UNKNOWN GPU FAILURE
     // -------------------------------------------------------------------------
 
     if (backend ==
@@ -941,21 +1082,16 @@ class GemmaService {
     required GemmaServiceException gpuFailure,
     required GemmaServiceException cpuFailure,
   }) {
-    // -------------------------------------------------------------------------
     // CPU specifically failed because of RAM.
-    // -------------------------------------------------------------------------
-
     if (cpuFailure.reason ==
-        GemmaFailureReason.outOfMemory) {
+        GemmaFailureReason
+            .outOfMemory) {
       return 'GPU backend চালু হয়নি এবং CPU fallback-এর সময়ও '
           'ফোনের memory শেষ হয়ে গেছে। '
           'এই device-এ Local AI model চালানোর জন্য পর্যাপ্ত RAM নেই.';
     }
 
-    // -------------------------------------------------------------------------
-    // Corruption detected while CPU tried to read the model.
-    // -------------------------------------------------------------------------
-
+    // Corruption detected.
     if (cpuFailure.reason ==
             GemmaFailureReason
                 .modelFileCorrupt ||
@@ -964,13 +1100,10 @@ class GemmaService {
                 .modelFileCorrupt) {
       return 'GPU এবং CPU কোনোটিতেই model চালু করা যায়নি কারণ '
           'local model file corrupt অথবা অসম্পূর্ণ মনে হচ্ছে। '
-          'Model আবার verify/download করুন.';
+          'Model recovery/verification আবার চালান.';
     }
 
-    // -------------------------------------------------------------------------
     // Device ABI/runtime unsupported.
-    // -------------------------------------------------------------------------
-
     if (cpuFailure.reason ==
         GemmaFailureReason
             .unsupportedDevice) {
@@ -978,10 +1111,6 @@ class GemmaService {
           'CPU/ABI/runtime support করছে না। '
           'এই device Local Gemma mode-এর সাথে compatible নয়.';
     }
-
-    // -------------------------------------------------------------------------
-    // Generic double failure.
-    // -------------------------------------------------------------------------
 
     return 'GPU backend দিয়ে Local AI চালু করা যায়নি এবং '
         'CPU fallback-ও সফল হয়নি। '
@@ -1027,7 +1156,7 @@ class GemmaService {
   // RUNTIME RELEASE
   // ===========================================================================
 
-  /// Releases only the inference runtime.
+  /// Releases only inference RAM / GPU / CPU resources.
   ///
   /// Downloaded multi-GB model remains on disk.
   Future<void> _releaseRuntime({
@@ -1036,8 +1165,8 @@ class GemmaService {
     final model =
         _model;
 
-    // Detach service references first so no new request can access a model
-    // that is currently closing.
+    // Detach service references first so nothing can use a runtime while it is
+    // being closed.
     _chat =
         null;
 
@@ -1115,8 +1244,7 @@ class GemmaService {
     final startTime =
         DateTime.now();
 
-    DateTime?
-        firstTokenTime;
+    DateTime? firstTokenTime;
 
     int tokenCount =
         0;
@@ -1268,8 +1396,7 @@ class GemmaService {
         } catch (e, st) {
           if (!completer
               .isCompleted) {
-            completer
-                .completeError(
+            completer.completeError(
               e,
               st,
             );
@@ -1287,8 +1414,7 @@ class GemmaService {
       ) {
         if (!completer
             .isCompleted) {
-          completer
-              .completeError(
+          completer.completeError(
             error,
             stackTrace,
           );
@@ -1330,9 +1456,9 @@ class GemmaService {
   // DISPOSE
   // ===========================================================================
 
-  /// Releases RAM/GPU/CPU inference resources.
+  /// Releases inference runtime.
   ///
-  /// The downloaded model file is intentionally preserved.
+  /// Downloaded model file is intentionally preserved.
   Future<void> dispose() async {
     await _releaseRuntime();
 
