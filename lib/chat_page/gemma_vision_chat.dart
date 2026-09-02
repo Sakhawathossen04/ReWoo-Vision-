@@ -19,6 +19,13 @@ import 'widgets/chat_ui_builder.dart';
 import 'widgets/prompt_bar.dart';
 
 /// Main Bengali, controller-free, voice-first chat page.
+///
+/// Voice ownership rule:
+///
+/// - ChatPage decides whether voice mode SHOULD be armed.
+/// - SpeechService exclusively owns STT session start/restart while armed.
+/// - ChatPage never restarts STT after an individual voice command.
+/// - Lifecycle pause is temporary and must never permanently disable voice.
 class ChatPage extends StatefulWidget {
   const ChatPage({super.key});
 
@@ -51,23 +58,21 @@ class _ChatPageState extends State<ChatPage>
   bool _redirectedOnError = false;
   bool _disposed = false;
 
-  /// True when voice listening should return after the application comes
-  /// back to the foreground.
-  bool _resumeVoiceOnForeground = true;
+  // ===========================================================================
+  // VOICE INTENT / LIFECYCLE STATE
+  // ===========================================================================
 
-  /// True when app lifecycle used SpeechService.pauseLoop().
+  /// Stable desired state.
   ///
-  /// This distinction matters because:
+  /// This is intentionally NOT derived from speech.commandModeEnabled during
+  /// lifecycle callbacks. A temporary recognizer error, app inactivity, TTS,
+  /// camera work, or Android callback must not permanently turn voice off.
   ///
-  /// pauseLoop()
-  ///   -> preserves commandModeEnabled
-  ///   -> sets pausedForMedia = true
-  ///   -> must be resumed using resumeLoop()
-  ///
-  /// stopCommandListening()
-  ///   -> disables commandModeEnabled
-  ///   -> must be resumed using startCommandListening()
-  bool _voicePausedByLifecycle = false;
+  /// Initial value is true because ReWoo Vision is voice-first.
+  bool _voiceShouldBeArmed = true;
+
+  /// Whether the app is currently in the foreground.
+  bool _appInForeground = true;
 
   final ScrollController _scrollController =
       ScrollController();
@@ -87,6 +92,13 @@ class _ChatPageState extends State<ChatPage>
 
     WidgetsBinding.instance.addObserver(this);
 
+    final lifecycleState =
+        WidgetsBinding.instance.lifecycleState;
+
+    _appInForeground =
+        lifecycleState == null ||
+        lifecycleState == AppLifecycleState.resumed;
+
     _fadeController = AnimationController(
       duration: const Duration(milliseconds: 450),
       vsync: this,
@@ -97,7 +109,9 @@ class _ChatPageState extends State<ChatPage>
       curve: Curves.easeInOut,
     );
 
-    _bootstrap();
+    unawaited(
+      _bootstrap(),
+    );
   }
 
   // ===========================================================================
@@ -129,6 +143,10 @@ class _ChatPageState extends State<ChatPage>
         });
       }
 
+      if (_disposed || !mounted) {
+        return;
+      }
+
       // -----------------------------------------------------------------------
       // Bootstrap application services
       // -----------------------------------------------------------------------
@@ -151,6 +169,10 @@ class _ChatPageState extends State<ChatPage>
         },
       );
 
+      if (_disposed || !mounted) {
+        return;
+      }
+
       // -----------------------------------------------------------------------
       // Release previous/dummy TTS wrapper
       // -----------------------------------------------------------------------
@@ -160,6 +182,10 @@ class _ChatPageState extends State<ChatPage>
       try {
         await _tts.stop();
       } catch (_) {}
+
+      if (_disposed || !mounted) {
+        return;
+      }
 
       // -----------------------------------------------------------------------
       // Store bootstrapped services
@@ -187,7 +213,7 @@ class _ChatPageState extends State<ChatPage>
           }
 
           // A second camera/model task must never begin while another task
-          // or TTS response is still active.
+          // or assistant speech is still active.
           return !helpers.isBusy &&
               !helpers.isSpeaking;
         },
@@ -236,11 +262,40 @@ class _ChatPageState extends State<ChatPage>
         }
       }
 
+      // =======================================================================
+      // ARM VOICE BEFORE STARTUP TTS
+      // =======================================================================
+      //
+      // Old flow:
+      //
+      //   speak startup message
+      //   -> later startCommandListening()
+      //
+      // New flow:
+      //
+      //   desired voice state = ON
+      //   -> arm SpeechService first
+      //   -> SpeechService.speak() temporarily pauses STT using its TTS lock
+      //   -> TTS ends
+      //   -> SpeechService can re-arm automatically
+      //
+      // This removes the startup gap where lifecycle changes could leave
+      // commandModeEnabled false and require a manual mic tap.
+      // =======================================================================
+
+      if (_voiceShouldBeArmed &&
+          _appInForeground &&
+          speech.microphonePermissionGranted &&
+          !_disposed) {
+        await speech.startCommandListening();
+      }
+
+      if (_disposed || !mounted) {
+        return;
+      }
+
       // -----------------------------------------------------------------------
       // STARTUP VOICE MESSAGE
-      //
-      // IMPORTANT:
-      // This exactly describes the five direct trigger commands.
       // -----------------------------------------------------------------------
 
       await speech.speak(
@@ -253,36 +308,21 @@ class _ChatPageState extends State<ChatPage>
         'অথবা বাম পাশে কী আছে।',
       );
 
+      if (_disposed || !mounted) {
+        return;
+      }
+
       // -----------------------------------------------------------------------
-      // START FIVE-COMMAND TRIGGER LISTENER
+      // FINAL STARTUP SELF-HEAL
       // -----------------------------------------------------------------------
       //
-      // From this point SpeechService owns the lifecycle:
-      //
-      // waiting
-      //      ↓
-      // final STT result
-      //      ↓
-      // exact five-command match
-      //      ↓
-      // commandInProgress = true
-      //      ↓
-      // recognizer stop
-      //      ↓
-      // camera / OCR / Gemma
-      //      ↓
-      // TTS
-      //      ↓
-      // command complete
-      //      ↓
-      // trigger listener re-arm
-      //
-      // ChatPage MUST NOT manually restart recognition after a command.
+      // If TTS/lifecycle/native recognizer callbacks ended the first session,
+      // restore the desired always-on command listener.
       // -----------------------------------------------------------------------
 
-      if (!_disposed) {
-        await speech.startCommandListening();
-      }
+      await _restoreVoiceListening(
+        reason: 'bootstrap complete',
+      );
     } catch (e, st) {
       debugPrint(
         '[ChatPage] initialization failed: $e',
@@ -303,6 +343,143 @@ class _ChatPageState extends State<ChatPage>
         );
       }
     }
+  }
+
+  // ===========================================================================
+  // CENTRAL VOICE RESTORE
+  // ===========================================================================
+
+  /// Restores the microphone only when the user/app still wants voice mode.
+  ///
+  /// IMPORTANT:
+  ///
+  /// This method is used for:
+  ///
+  /// - bootstrap completion
+  /// - foreground resume
+  /// - settings return
+  ///
+  /// It is NOT called after an individual voice command. SpeechService owns
+  /// command completion and restart.
+  Future<void> _restoreVoiceListening({
+    required String reason,
+  }) async {
+    if (_disposed ||
+        !mounted ||
+        !_voiceShouldBeArmed ||
+        !_appInForeground) {
+      return;
+    }
+
+    final speech = _speechService;
+    final helpers = _chatHelpers;
+
+    if (speech == null ||
+        helpers == null) {
+      return;
+    }
+
+    // Video recording intentionally owns microphone/media resources.
+    if (helpers.isRecording) {
+      debugPrint(
+        '[ChatPage] voice restore deferred during recording: $reason',
+      );
+
+      return;
+    }
+
+    try {
+      // Lifecycle pauseLoop() sets pausedForMedia=true while preserving the
+      // desired command mode. resumeLoop() MUST clear that temporary blocker.
+      if (speech.pausedForMedia) {
+        debugPrint(
+          '[ChatPage] resuming paused voice loop: $reason',
+        );
+
+        await speech.resumeLoop();
+
+        return;
+      }
+
+      // If command mode was genuinely disabled by Android/service state,
+      // startCommandListening() self-heals permission/recognizer readiness.
+      if (!speech.commandModeEnabled) {
+        debugPrint(
+          '[ChatPage] re-arming command mode: $reason',
+        );
+
+        await speech.startCommandListening();
+
+        return;
+      }
+
+      // Command mode is armed but no recognizer session is currently active.
+      //
+      // Do NOT interfere with an in-progress voice command. Its finally block
+      // inside SpeechService owns restart.
+      if (!speech.commandListening &&
+          !speech.commandInProgress) {
+        debugPrint(
+          '[ChatPage] command mode armed but idle; restoring session: $reason',
+        );
+
+        await speech.resumeLoop();
+      }
+    } catch (e) {
+      // Do not disable desired voice state because of one temporary failure.
+      // SpeechService watchdog/error recovery remains active when possible.
+      debugPrint(
+        '[ChatPage] voice restore warning ($reason): $e',
+      );
+    }
+  }
+
+  // ===========================================================================
+  // MANUAL VOICE TOGGLE
+  // ===========================================================================
+
+  /// Manual UI control changes the stable desired voice state.
+  ///
+  /// Temporary lifecycle/TTS/media pauses do NOT change this value.
+  Future<void> _toggleVoiceListening() async {
+    if (_disposed) {
+      return;
+    }
+
+    final speech = _speechService;
+
+    if (speech == null) {
+      return;
+    }
+
+    if (speech.commandModeEnabled) {
+      _voiceShouldBeArmed = false;
+
+      await speech.stopCommandListening();
+
+      return;
+    }
+
+    _voiceShouldBeArmed = true;
+
+    if (!_appInForeground) {
+      return;
+    }
+
+    if (speech.pausedForMedia) {
+      await speech.resumeLoop();
+
+      // resumeLoop() requires command mode to have been armed previously.
+      // If the mode was fully stopped, start it explicitly.
+      if (!speech.commandModeEnabled &&
+          !_disposed) {
+        await speech.startCommandListening();
+      }
+
+      return;
+    }
+
+    await speech.startCommandListening();
   }
 
   // ===========================================================================
@@ -349,35 +526,18 @@ class _ChatPageState extends State<ChatPage>
 
   /// Executes one voice intent.
   ///
-  /// IMPORTANT:
+  /// There is deliberately NO scheduleRestartSoon() here.
   ///
-  /// There is deliberately NO:
+  /// SpeechService is the single owner of microphone restart for a detected
+  /// voice command:
   ///
-  /// scheduleRestartSoon()
-  ///
-  /// here.
-  ///
-  /// SpeechService is the single owner of microphone restart.
-  ///
-  /// Correct flow:
-  ///
-  /// SpeechService
-  ///    ↓
-  /// trigger detected
-  ///    ↓
-  /// recognizer stopped
-  ///    ↓
-  /// this method awaited
-  ///    ↓
-  /// camera / OCR / AI
-  ///    ↓
-  /// TTS finishes
-  ///    ↓
-  /// this Future returns
-  ///    ↓
-  /// SpeechService unlocks
-  ///    ↓
-  /// trigger listener restarts
+  /// trigger
+  ///   -> commandInProgress=true
+  ///   -> STT stop
+  ///   -> camera/OCR/Gemma/TTS
+  ///   -> handler Future returns
+  ///   -> commandInProgress=false
+  ///   -> SpeechService re-arms STT
   Future<void> _handleVoiceIntent(
     VoiceIntent intent,
     String heardText,
@@ -398,14 +558,6 @@ class _ChatPageState extends State<ChatPage>
       _promptBarKey,
       commandText: heardText,
     );
-
-    // =======================================================================
-    // DO NOT ADD THIS:
-    //
-    // _speechService?.scheduleRestartSoon();
-    //
-    // SpeechService exclusively owns restart.
-    // =======================================================================
   }
 
   // ===========================================================================
@@ -498,15 +650,7 @@ class _ChatPageState extends State<ChatPage>
   ) {
     super.didChangeAppLifecycleState(state);
 
-    if (_disposed ||
-        _speechService == null) {
-      return;
-    }
-
-    final speech = _speechService!;
-    final helpers = _chatHelpers;
-
-    if (helpers == null) {
+    if (_disposed) {
       return;
     }
 
@@ -516,28 +660,18 @@ class _ChatPageState extends State<ChatPage>
 
     if (state ==
         AppLifecycleState.resumed) {
-      if (!_resumeVoiceOnForeground) {
-        return;
-      }
+      _appInForeground = true;
 
-      // ---------------------------------------------------------------------
-      // IMPORTANT FIX
+      // Stable desired state wins.
       //
-      // If background handling used pauseLoop(), we MUST call resumeLoop().
-      //
-      // startCommandListening() alone is not enough because pauseLoop()
-      // leaves SpeechService.pausedForMedia = true.
-      // ---------------------------------------------------------------------
-
-      if (_voicePausedByLifecycle) {
-        _voicePausedByLifecycle = false;
-
+      // We do NOT ask whether commandModeEnabled happened to be true during
+      // the previous inactive callback. That value may be temporarily false
+      // because of TTS, startup, Android recognizer recovery, or media work.
+      if (_voiceShouldBeArmed) {
         unawaited(
-          speech.resumeLoop(),
-        );
-      } else {
-        unawaited(
-          speech.startCommandListening(),
+          _restoreVoiceListening(
+            reason: 'app resumed',
+          ),
         );
       }
 
@@ -554,39 +688,45 @@ class _ChatPageState extends State<ChatPage>
             AppLifecycleState.inactive ||
         state ==
             AppLifecycleState.detached) {
-      // Remember whether voice should come back.
-      _resumeVoiceOnForeground =
-          speech.commandModeEnabled ||
-              helpers.isRecording;
+      _appInForeground = false;
 
-      // ---------------------------------------------------------------------
-      // Normal command-listening mode
-      //
-      // Preserve commandModeEnabled and temporarily pause recognition.
-      // ---------------------------------------------------------------------
+      final speech = _speechService;
+      final helpers = _chatHelpers;
 
-      if (!helpers.isRecording) {
-        _voicePausedByLifecycle =
-            speech.commandModeEnabled;
-
-        unawaited(
-          speech.pauseLoop(),
-        );
+      if (speech == null ||
+          helpers == null) {
+        return;
       }
 
-      // ---------------------------------------------------------------------
-      // Recording case
+      // CRITICAL:
       //
-      // Existing behavior intentionally stops command listening completely.
-      // startCommandListening() will recreate it after foreground resume.
-      // ---------------------------------------------------------------------
+      // NEVER overwrite _voiceShouldBeArmed here.
+      //
+      // Lifecycle is temporary. The user's desired always-on voice setting
+      // must survive inactive -> paused -> resumed sequences.
 
-      else {
-        _voicePausedByLifecycle = false;
-
-        unawaited(
-          speech.stopCommandListening(),
-        );
+      if (!helpers.isRecording) {
+        // pauseLoop() preserves commandModeEnabled and only adds a temporary
+        // media/lifecycle blocker.
+        //
+        // Only call it when command mode is actually armed. Calling pauseLoop()
+        // on an already-disabled mode would leave pausedForMedia=true and could
+        // make a later manual start unnecessarily complicated.
+        if (speech.commandModeEnabled &&
+            !speech.pausedForMedia) {
+          unawaited(
+            speech.pauseLoop(),
+          );
+        }
+      } else {
+        // Recording owns media resources. Stop the recognizer session.
+        //
+        // _voiceShouldBeArmed remains unchanged so voice can be restored later.
+        if (speech.commandModeEnabled) {
+          unawaited(
+            speech.stopCommandListening(),
+          );
+        }
       }
     }
   }
@@ -598,6 +738,8 @@ class _ChatPageState extends State<ChatPage>
   @override
   void dispose() {
     _disposed = true;
+    _voiceShouldBeArmed = false;
+    _appInForeground = false;
 
     WidgetsBinding.instance
         .removeObserver(this);
@@ -698,7 +840,7 @@ class _ChatPageState extends State<ChatPage>
                   speech.lastHeard,
 
               onToggleListening:
-                  speech.toggleDictation,
+                  _toggleVoiceListening,
             ),
 
             // ---------------------------------------------------------------
@@ -774,13 +916,20 @@ class _ChatPageState extends State<ChatPage>
             if (helpers.isRecording)
               ChatUIBuilder
                   .buildRecordingBanner(
-                onStop: () =>
-                    _handleVoiceIntent(
-                  VoiceIntent.stopVideo,
-                  VoiceIntent
-                      .stopVideo
-                      .banglaLabel,
-                ),
+                onStop: () async {
+                  await _handleVoiceIntent(
+                    VoiceIntent.stopVideo,
+                    VoiceIntent
+                        .stopVideo
+                        .banglaLabel,
+                  );
+
+                  // If recording was stopped from the UI (not through the
+                  // SpeechService command lifecycle), restore desired voice.
+                  await _restoreVoiceListening(
+                    reason: 'recording stopped',
+                  );
+                },
               ),
 
             // ---------------------------------------------------------------
@@ -825,7 +974,7 @@ class _ChatPageState extends State<ChatPage>
                   speech.commandListening,
 
               onToggleListening:
-                  speech.toggleDictation,
+                  _toggleVoiceListening,
 
               isGenerating:
                   helpers.isGenerating,
@@ -855,15 +1004,24 @@ class _ChatPageState extends State<ChatPage>
     final speech =
         _speechService;
 
-    final wasListening =
-        speech?.commandModeEnabled ??
-            false;
+    // IMPORTANT:
+    //
+    // Use the stable desired state, NOT commandModeEnabled.
+    //
+    // commandModeEnabled can be temporarily false because Android or media
+    // work. Settings navigation must not accidentally make that temporary
+    // state permanent.
+    final shouldRestoreVoice =
+        _voiceShouldBeArmed;
 
     // -------------------------------------------------------------------------
-    // Stop trigger listener while Settings is open
+    // Temporarily stop trigger listener while Settings is open.
+    //
+    // Do NOT change _voiceShouldBeArmed.
     // -------------------------------------------------------------------------
 
-    await speech?.stopCommandListening();
+    await speech
+        ?.stopCommandListening();
 
     final result =
         await Navigator.of(context)
@@ -885,9 +1043,12 @@ class _ChatPageState extends State<ChatPage>
       ),
     );
 
-    if (result != null &&
-        mounted &&
-        !_disposed) {
+    if (_disposed ||
+        !mounted) {
+      return;
+    }
+
+    if (result != null) {
       final newSystemContext =
           result['systemContext']
               as String?;
@@ -935,7 +1096,9 @@ class _ChatPageState extends State<ChatPage>
         });
 
         // -------------------------------------------------------------------
-        // Backend changed -> completely rebuild runtime
+        // Backend changed -> completely rebuild runtime.
+        //
+        // _voiceShouldBeArmed survives the rebuild.
         // -------------------------------------------------------------------
 
         if (backendChanged) {
@@ -961,14 +1124,16 @@ class _ChatPageState extends State<ChatPage>
     }
 
     // -------------------------------------------------------------------------
-    // Restore trigger listener after Settings closes
+    // Restore trigger listener after Settings closes.
     // -------------------------------------------------------------------------
 
-    if (wasListening &&
+    if (shouldRestoreVoice &&
+        _voiceShouldBeArmed &&
         mounted &&
         !_disposed) {
-      await _speechService
-          ?.startCommandListening();
+      await _restoreVoiceListening(
+        reason: 'settings closed',
+      );
     }
   }
 }
