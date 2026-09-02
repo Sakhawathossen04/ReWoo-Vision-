@@ -4,40 +4,38 @@ import 'dart:io';
 import 'package:background_downloader/background_downloader.dart' as bg;
 import 'package:flutter_downloader/flutter_downloader.dart' as legacy;
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../config/constants.dart';
+import 'download_state_manager.dart';
 import 'logger.dart';
 
 /// Reliable manager for the large ReWoo Vision model.
 ///
-/// NEW DOWNLOAD ENGINE:
+/// Canonical flow:
 ///
-/// background_downloader
-///
-/// TEMPORARY COMPATIBILITY:
-///
-/// flutter_downloader types are still exposed from [getAllTasks] so the
-/// current download_logic.dart can continue compiling during the migration.
-///
-/// Final architecture:
-///
-/// model.task
-///      ↑
-/// atomic rename after validation
-///      ↑
 /// model.task.part
-///      ↑
-/// background_downloader resumable temporary data
+///      ↓
+/// native COMPLETE
+///      ↓
+/// verify size
+///      ↓
+/// atomic rename
+///      ↓
+/// model.task
 ///
-/// IMPORTANT:
+/// Safety rules:
 ///
-/// Network/system failures NEVER delete partial download data.
-///
-/// Partial content is destroyed only when:
-///
-/// 1. user explicitly calls [cancelAndDeleteDownload], or
-/// 2. a task reports complete but its file is verified as truncated/corrupt.
+/// 1. Network/system failure NEVER deletes partial data.
+/// 2. Restart NEVER creates a second task while a recoverable task exists.
+/// 3. A valid final model always wins over downloader metadata.
+/// 4. Completed-task finalization is idempotent / single-flight.
+/// 5. Failed/paused tasks resume the SAME background task.
+/// 6. Legacy failed tasks are never blindly retried from zero.
+/// 7. Explicit user cancel/delete remains destructive.
+/// 8. A replacement task is permitted only for a PROVEN corrupt completed task,
+///    and only after another valid final/recoverable task is ruled out.
 class DownloadManager {
   DownloadManager._();
 
@@ -48,19 +46,9 @@ class DownloadManager {
   static const String _downloadGroup =
       'rewoo_vision_model';
 
-  /// Keep roughly 3 GB free AFTER the model has downloaded.
-  ///
-  /// The model itself is roughly 3.1 GB, so this creates an additional
-  /// low-storage guard roughly equivalent to requiring ~6 GB before download.
-  ///
-  /// DeviceCapabilityService will later perform the explicit pre-download
-  /// free-storage check too.
   static const int _minimumFreeAfterDownloadMb =
       3000;
 
-  /// Any download larger than this uses foreground mode on Android.
-  ///
-  /// Our 3.1 GB model will therefore always use the foreground path.
   static const int _foregroundThresholdMb =
       100;
 
@@ -73,6 +61,16 @@ class DownloadManager {
   static String? _currentTaskId;
 
   static Future<void>? _initializationFuture;
+
+  /// Prevents the same completed task from being finalized concurrently by:
+  ///
+  /// - background callback
+  /// - startup scan
+  /// - getAllTasks()
+  /// - retryDownload()
+  static final Map<String, Future<bool>>
+      _finalizationFutures =
+      <String, Future<bool>>{};
 
   // ===========================================================================
   // INITIALIZATION
@@ -88,80 +86,63 @@ class DownloadManager {
       'Initializing background_downloader for model downloads',
     );
 
-    // -----------------------------------------------------------------------
-    // Register callbacks BEFORE start().
-    //
-    // Group callbacks avoid taking ownership of the global updates stream.
-    // -----------------------------------------------------------------------
-
     _downloader.registerCallbacks(
-      group: _downloadGroup,
+      group:
+          _downloadGroup,
       taskStatusCallback:
           _handleStatusUpdate,
       taskProgressCallback:
           _handleProgressUpdate,
     );
 
-    // -----------------------------------------------------------------------
-    // Notifications
-    //
-    // A running notification is also necessary for Android foreground mode.
-    // -----------------------------------------------------------------------
-
     _downloader.configureNotificationForGroup(
       _downloadGroup,
-
-      running: const bg.TaskNotification(
+      running:
+          const bg.TaskNotification(
         'ReWoo Vision',
         'AI model ডাউনলোড হচ্ছে — {progress}%',
       ),
-
-      complete: const bg.TaskNotification(
+      complete:
+          const bg.TaskNotification(
         'ReWoo Vision',
         'AI model ডাউনলোড সম্পূর্ণ হয়েছে।',
       ),
-
-      error: const bg.TaskNotification(
+      error:
+          const bg.TaskNotification(
         'ReWoo Vision',
         'AI model ডাউনলোড সাময়িকভাবে বন্ধ হয়েছে।',
       ),
-
-      paused: const bg.TaskNotification(
+      paused:
+          const bg.TaskNotification(
         'ReWoo Vision',
         'AI model ডাউনলোড pause হয়েছে।',
       ),
-
-      canceled: const bg.TaskNotification(
+      canceled:
+          const bg.TaskNotification(
         'ReWoo Vision',
         'AI model ডাউনলোড বাতিল হয়েছে।',
       ),
-
-      progressBar: true,
-      tapOpensFile: false,
+      progressBar:
+          true,
+      tapOpensFile:
+          false,
     );
-
-    // -----------------------------------------------------------------------
-    // Global downloader configuration.
-    // -----------------------------------------------------------------------
 
     final configResult =
         await _downloader.configure(
       globalConfig: [
-        // Fail before exhausting storage.
         (
           bg.Config.checkAvailableSpace,
           _minimumFreeAfterDownloadMb,
         ),
-
-        // Give slow servers enough time to establish connections.
         (
           bg.Config.requestTimeout,
-          const Duration(seconds: 60),
+          const Duration(
+            seconds: 60,
+          ),
         ),
       ],
-
       androidConfig: [
-        // 3.1 GB model should use Android foreground mode.
         (
           bg.Config.runInForegroundIfFileLargerThan,
           _foregroundThresholdMb,
@@ -170,33 +151,37 @@ class DownloadManager {
     );
 
     if (configResult.isNotEmpty) {
-      for (final result in configResult) {
+      for (final result
+          in configResult) {
         Logger.warning(
           'Downloader configuration result: $result',
         );
       }
     }
 
-    // -----------------------------------------------------------------------
-    // Enable persistent database tracking.
-    //
-    // autoCleanDatabase is deliberately FALSE. We do not want useful failed
-    // task history disappearing automatically.
-    // -----------------------------------------------------------------------
-
     await _downloader.start(
-      doTrackTasks: true,
-      markDownloadedComplete: true,
-      doRescheduleKilledTasks: true,
-      autoCleanDatabase: false,
+      doTrackTasks:
+          true,
+      markDownloadedComplete:
+          true,
+      doRescheduleKilledTasks:
+          true,
+      autoCleanDatabase:
+          false,
     );
 
-    // Deliver any updates that happened while Dart was suspended.
-    await _downloader.resumeFromBackground();
+    // Deliver native updates that happened while Dart was suspended.
+    await _downloader
+        .resumeFromBackground();
 
-    // A download may have completed while the application was terminated.
-    // Finish .part -> final rename now.
+    // App may have died after native 100% but before .part -> final.
     await _finalizeCompletedTasksFromDatabase();
+
+    // If a recoverable task survived process death, attach to it immediately.
+    await _restoreLatestRecoverableTaskFromDatabase();
+
+    // Physical final model is stronger than stale SharedPreferences.
+    await _repairCompletedStateFromCanonicalModel();
 
     Logger.info(
       'background_downloader initialization completed',
@@ -220,9 +205,14 @@ class DownloadManager {
     }
 
     final percent =
-        update.progress >= 0
-            ? (update.progress * 100)
-                .clamp(0, 100)
+        update.progress >=
+                0
+            ? (update.progress *
+                    100)
+                .clamp(
+                  0,
+                  100,
+                )
                 .round()
             : 0;
 
@@ -246,6 +236,7 @@ class DownloadManager {
 
     if (update.status ==
         bg.TaskStatus.complete) {
+      // Single-flight finalizer prevents duplicate rename races.
       unawaited(
         _finalizeCompletedTask(
           update.task,
@@ -255,13 +246,14 @@ class DownloadManager {
   }
 
   // ===========================================================================
-  // ATTACH TO SAVED TASK
+  // ATTACH
   // ===========================================================================
 
   static void attachToTask(
     String taskId,
   ) {
-    _currentTaskId = taskId;
+    _currentTaskId =
+        taskId;
 
     Logger.info(
       'Attached DownloadManager to task: $taskId',
@@ -287,23 +279,33 @@ class DownloadManager {
       final request =
           http.Request(
         'HEAD',
-        Uri.parse(url),
+        Uri.parse(
+          url,
+        ),
       );
 
-      request.followRedirects = true;
+      request.followRedirects =
+          true;
 
       if (accessToken != null &&
-          accessToken.trim().isNotEmpty) {
+          accessToken
+              .trim()
+              .isNotEmpty) {
         request.headers[
-            'Authorization'] =
+                'Authorization'] =
             'Bearer $accessToken';
       }
 
       final response =
           await client
-              .send(request)
+              .send(
+                request,
+              )
               .timeout(
-        const Duration(seconds: 25),
+        const Duration(
+          seconds:
+              25,
+        ),
       );
 
       Logger.info(
@@ -341,17 +343,61 @@ class DownloadManager {
     try {
       await _ensureInitialized();
 
-      // ---------------------------------------------------------------------
-      // Android 13+ notification runtime permission.
+      // =====================================================================
+      // HARD DUPLICATE-DOWNLOAD GUARD
+      // =====================================================================
       //
-      // The download itself may continue without this permission, but
-      // foreground notification behavior can be degraded if denied.
+      // Before creating a new 3+ GB task:
+      //
+      // 1. reuse valid canonical final
+      // 2. finalize old COMPLETE .part
+      // 3. reuse existing active/paused/failed task
+      // 4. reuse legacy task when safe
+      //
+      // Only if NONE exist may a new task be enqueued.
+      // =====================================================================
+
+      final reconciliation =
+          await _reconcileBeforeNewDownload(
+        fileName,
+      );
+
+      if (reconciliation
+          .validFinalExists) {
+        Logger.info(
+          'New model download blocked: '
+          'a valid final model already exists.',
+        );
+
+        return null;
+      }
+
+      if (reconciliation
+              .existingTaskId !=
+          null) {
+        _currentTaskId =
+            reconciliation
+                .existingTaskId;
+
+        Logger.info(
+          'New model download blocked. '
+          'Reusing existing task '
+          '${reconciliation.existingTaskId}.',
+        );
+
+        return reconciliation
+            .existingTaskId;
+      }
+
+      // ---------------------------------------------------------------------
+      // Notification permission.
       // ---------------------------------------------------------------------
 
       if (Platform.isAndroid) {
         try {
           final notificationStatus =
-              await Permission.notification
+              await Permission
+                  .notification
                   .request();
 
           if (!notificationStatus
@@ -369,33 +415,20 @@ class DownloadManager {
       }
 
       // ---------------------------------------------------------------------
-      // Authentication headers
+      // Authentication
       // ---------------------------------------------------------------------
 
       final headers =
           <String, String>{};
 
       if (accessToken != null &&
-          accessToken.trim().isNotEmpty) {
-        headers['Authorization'] =
+          accessToken
+              .trim()
+              .isNotEmpty) {
+        headers[
+                'Authorization'] =
             'Bearer $accessToken';
       }
-
-      // ---------------------------------------------------------------------
-      // IMPORTANT:
-      //
-      // Never download directly into the final Gemma filename.
-      //
-      // Example:
-      //
-      // gemma.task
-      //
-      // becomes:
-      //
-      // gemma.task.part
-      //
-      // Only after completion + size validation do we atomically rename it.
-      // ---------------------------------------------------------------------
 
       final partFileName =
           _partFileName(
@@ -404,48 +437,32 @@ class DownloadManager {
 
       final task =
           bg.DownloadTask(
-        url: url,
-
+        url:
+            url,
         filename:
             partFileName,
-
         baseDirectory:
             bg.BaseDirectory
                 .applicationDocuments,
-
-        directory: '',
-
+        directory:
+            '',
         headers:
             headers,
-
         group:
             _downloadGroup,
-
         updates:
             bg.Updates
                 .statusAndProgress,
-
-        // Mobile data is allowed.
-        requiresWiFi: false,
-
-        // Native retry support.
+        requiresWiFi:
+            false,
         retries:
             _automaticRetries,
+        allowPause:
+            true,
+        priority:
+            5,
 
-        // CRITICAL for multi-GB Android downloads.
-        //
-        // Allows temporary failures / Android worker timeout to pause and
-        // resume when the server supports partial transfers.
-        allowPause: true,
-
-        // Do NOT use priority 0 here.
-        //
-        // Priority 0 activates Android UIDT behavior on newer Android and
-        // requires additional manifest/config work. Foreground mode above is
-        // our selected large-file path.
-        priority: 5,
-
-        // Store the REAL final filename persistently with the task.
+        // Persistent REAL final filename.
         metaData:
             fileName,
 
@@ -454,7 +471,7 @@ class DownloadManager {
       );
 
       Logger.info(
-        'Starting model download:\n'
+        'Starting NEW model download:\n'
         'URL: $url\n'
         'temporary destination: $partFileName\n'
         'final destination: $fileName\n'
@@ -462,7 +479,8 @@ class DownloadManager {
       );
 
       final enqueued =
-          await _downloader.enqueue(
+          await _downloader
+              .enqueue(
         task,
       );
 
@@ -488,10 +506,278 @@ class DownloadManager {
         'Failed to start model download: $e',
       );
 
-      Logger.error('$st');
+      Logger.error(
+        '$st',
+      );
 
       return null;
     }
+  }
+
+  // ===========================================================================
+  // PRE-DOWNLOAD RECONCILIATION
+  // ===========================================================================
+
+  static Future<_DownloadReconciliation>
+      _reconcileBeforeNewDownload(
+    String fileName,
+  ) async {
+    // -----------------------------------------------------------------------
+    // 1. Canonical final model already exists.
+    // -----------------------------------------------------------------------
+
+    if (await _canonicalFinalModelIsValid(
+      fileName,
+      repairState:
+          true,
+    )) {
+      return const _DownloadReconciliation(
+        validFinalExists:
+            true,
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Reconcile background_downloader records.
+    // -----------------------------------------------------------------------
+
+    try {
+      final records =
+          await _downloader
+              .database
+              .allRecords(
+        group:
+            _downloadGroup,
+      );
+
+      // -------------------------------------------------------------
+      // COMPLETE records first.
+      //
+      // App might have died at:
+      //
+      // model.task.part = 100%
+      //
+      // but before rename.
+      // -------------------------------------------------------------
+
+      for (final record
+          in records) {
+        if (record.task
+            is! bg.DownloadTask) {
+          continue;
+        }
+
+        final task =
+            record.task
+                as bg.DownloadTask;
+
+        if (_logicalFileName(
+              task,
+            ) !=
+            fileName) {
+          continue;
+        }
+
+        if (record.status !=
+            bg.TaskStatus.complete) {
+          continue;
+        }
+
+        final finalized =
+            await _finalizeCompletedTask(
+          task,
+        );
+
+        if (finalized &&
+            await _canonicalFinalModelIsValid(
+              fileName,
+              repairState:
+                  true,
+            )) {
+          Logger.info(
+            'Completed native task was reconciled '
+            'into an existing valid final model.',
+          );
+
+          return const _DownloadReconciliation(
+            validFinalExists:
+                true,
+          );
+        }
+      }
+
+      // -------------------------------------------------------------
+      // Find newest recoverable SAME task.
+      // -------------------------------------------------------------
+
+      bg.DownloadTask?
+          selected;
+
+      for (final record
+          in records) {
+        if (record.task
+            is! bg.DownloadTask) {
+          continue;
+        }
+
+        final task =
+            record.task
+                as bg.DownloadTask;
+
+        if (_logicalFileName(
+              task,
+            ) !=
+            fileName) {
+          continue;
+        }
+
+        if (!_isRecoverableBackgroundStatus(
+          record.status,
+        )) {
+          continue;
+        }
+
+        if (selected == null ||
+            task.creationTime
+                .isAfter(
+              selected
+                  .creationTime,
+            )) {
+          selected =
+              task;
+        }
+      }
+
+      if (selected != null) {
+        _currentTaskId =
+            selected.taskId;
+
+        Logger.info(
+          'Existing background task recovered instead of '
+          'starting fresh: ${selected.taskId}',
+        );
+
+        return _DownloadReconciliation(
+          existingTaskId:
+              selected.taskId,
+        );
+      }
+    } catch (e) {
+      Logger.warning(
+        'Background-task reconciliation warning: $e',
+      );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Legacy flutter_downloader reconciliation.
+    // -----------------------------------------------------------------------
+
+    try {
+      final oldTasks =
+          await legacy
+                  .FlutterDownloader
+              .loadTasks() ??
+              [];
+
+      legacy.DownloadTask?
+          newestRecoverable;
+
+      for (final task
+          in oldTasks) {
+        final filename =
+            task.filename;
+
+        if (filename == null) {
+          continue;
+        }
+
+        final matches =
+            filename ==
+                    fileName ||
+                filename ==
+                    _partFileName(
+                      fileName,
+                    );
+
+        if (!matches) {
+          continue;
+        }
+
+        // -------------------------------------------------------------
+        // Completed legacy final file.
+        // -------------------------------------------------------------
+
+        if (task.status ==
+            legacy
+                .DownloadTaskStatus
+                .complete) {
+          final candidate =
+              File(
+            '${task.savedDir}/$filename',
+          );
+
+          if (await _isValidCompletedFile(
+            candidate,
+          )) {
+            Logger.info(
+              'Valid completed legacy model found: '
+              '${candidate.path}. '
+              'Fresh download blocked.',
+            );
+
+            // If legacy file happens to be canonical, repair state too.
+            await _repairCompletedStateFromCanonicalModel();
+
+            return const _DownloadReconciliation(
+              validFinalExists:
+                  true,
+            );
+          }
+
+          continue;
+        }
+
+        if (!_isRecoverableLegacyStatus(
+          task.status,
+        )) {
+          continue;
+        }
+
+        if (newestRecoverable ==
+                null ||
+            task.timeCreated >
+                newestRecoverable
+                    .timeCreated) {
+          newestRecoverable =
+              task;
+        }
+      }
+
+      if (newestRecoverable !=
+          null) {
+        _currentTaskId =
+            newestRecoverable
+                .taskId;
+
+        Logger.info(
+          'Existing legacy task found. '
+          'Fresh download blocked: '
+          '${newestRecoverable.taskId}',
+        );
+
+        return _DownloadReconciliation(
+          existingTaskId:
+              newestRecoverable
+                  .taskId,
+        );
+      }
+    } catch (e) {
+      Logger.debug(
+        'Legacy reconciliation unavailable: $e',
+      );
+    }
+
+    return const _DownloadReconciliation();
   }
 
   // ===========================================================================
@@ -512,10 +798,6 @@ class DownloadManager {
       return;
     }
 
-    // -----------------------------------------------------------------------
-    // New background_downloader task
-    // -----------------------------------------------------------------------
-
     final task =
         await _backgroundTaskForId(
       taskId,
@@ -524,7 +806,8 @@ class DownloadManager {
     if (task != null) {
       try {
         final paused =
-            await _downloader.pause(
+            await _downloader
+                .pause(
           task,
         );
 
@@ -548,15 +831,12 @@ class DownloadManager {
       }
     }
 
-    // -----------------------------------------------------------------------
-    // Temporary migration compatibility:
-    // old flutter_downloader task from a previous app build.
-    // -----------------------------------------------------------------------
-
     try {
-      await legacy.FlutterDownloader
+      await legacy
+          .FlutterDownloader
           .pause(
-        taskId: taskId,
+        taskId:
+            taskId,
       );
 
       Logger.info(
@@ -573,17 +853,12 @@ class DownloadManager {
   // RESUME
   // ===========================================================================
 
-  /// Attempts to continue the existing partial transfer.
+  /// Resume means:
   ///
-  /// IMPORTANT:
+  /// SAME TASK
+  /// SAME partial transfer
   ///
-  /// If native resume fails, this method returns null.
-  ///
-  /// It DOES NOT:
-  ///
-  /// - delete the partial file
-  /// - create a fresh task
-  /// - restart from zero
+  /// It never creates a replacement.
   static Future<String?> resumeDownload() async {
     await _ensureInitialized();
 
@@ -591,6 +866,13 @@ class DownloadManager {
         _currentTaskId;
 
     if (taskId == null) {
+      await _restoreLatestRecoverableTaskFromDatabase();
+    }
+
+    final resolvedTaskId =
+        _currentTaskId;
+
+    if (resolvedTaskId == null) {
       Logger.warning(
         'No task available to resume',
       );
@@ -600,13 +882,35 @@ class DownloadManager {
 
     final task =
         await _backgroundTaskForId(
-      taskId,
+      resolvedTaskId,
     );
 
     if (task != null) {
       try {
+        final record =
+            await _downloader
+                .database
+                .recordForId(
+          resolvedTaskId,
+        );
+
+        // Already active.
+        if (record != null &&
+            (record.status ==
+                    bg.TaskStatus
+                        .running ||
+                record.status ==
+                    bg.TaskStatus
+                        .enqueued ||
+                record.status ==
+                    bg.TaskStatus
+                        .waitingToRetry)) {
+          return task.taskId;
+        }
+
         final resumed =
-            await _downloader.resume(
+            await _downloader
+                .resume(
           task,
         );
 
@@ -615,7 +919,7 @@ class DownloadManager {
               task.taskId;
 
           Logger.info(
-            'Model download resumed: '
+            'Model download resumed using SAME task: '
             '${task.taskId}',
           );
 
@@ -623,9 +927,10 @@ class DownloadManager {
         }
 
         Logger.warning(
-          'Native resume was not available for '
+          'Native resume unavailable for '
           '${task.taskId}. '
-          'Partial data was NOT deleted.',
+          'No fresh task created. '
+          'Partial data preserved.',
         );
 
         return null;
@@ -635,7 +940,8 @@ class DownloadManager {
         );
 
         Logger.warning(
-          'Partial model data is being preserved.',
+          'Partial model data preserved. '
+          'No fresh task created.',
         );
 
         return null;
@@ -643,28 +949,79 @@ class DownloadManager {
     }
 
     // -----------------------------------------------------------------------
-    // Legacy migration fallback
+    // Legacy paused task only.
+    //
+    // Do not use retry() here.
     // -----------------------------------------------------------------------
 
     try {
-      final newTaskId =
+      final oldTasks =
+          await legacy
+                  .FlutterDownloader
+              .loadTasks() ??
+              [];
+
+      legacy.DownloadTask?
+          oldTask;
+
+      for (final item
+          in oldTasks) {
+        if (item.taskId ==
+            resolvedTaskId) {
+          oldTask =
+              item;
+
+          break;
+        }
+      }
+
+      if (oldTask == null) {
+        return null;
+      }
+
+      if (oldTask.status ==
+              legacy
+                  .DownloadTaskStatus
+                  .running ||
+          oldTask.status ==
+              legacy
+                  .DownloadTaskStatus
+                  .enqueued) {
+        return oldTask.taskId;
+      }
+
+      if (oldTask.status !=
+          legacy
+              .DownloadTaskStatus
+              .paused) {
+        Logger.warning(
+          'Legacy task ${oldTask.taskId} is ${oldTask.status}; '
+          'automatic fresh retry is intentionally disabled.',
+        );
+
+        return null;
+      }
+
+      final resumedId =
           await legacy
               .FlutterDownloader
               .resume(
-        taskId: taskId,
+        taskId:
+            oldTask.taskId,
       );
 
-      if (newTaskId != null) {
+      if (resumedId !=
+          null) {
         _currentTaskId =
-            newTaskId;
+            resumedId;
 
         Logger.info(
-          'Legacy download resumed: '
-          '$taskId -> $newTaskId',
+          'Legacy paused task resumed: '
+          '${oldTask.taskId} -> $resumedId',
         );
       }
 
-      return newTaskId;
+      return resumedId;
     } catch (e) {
       Logger.error(
         'Legacy resume failed: $e',
@@ -675,21 +1032,9 @@ class DownloadManager {
   }
 
   // ===========================================================================
-  // RETRY
+  // RETRY / RECOVERY
   // ===========================================================================
 
-  /// Recovery for a failed download.
-  ///
-  /// For background_downloader, retry means:
-  ///
-  /// first try RESUME of the existing partial transfer.
-  ///
-  /// We deliberately DO NOT create a brand-new task when resume fails.
-  ///
-  /// Exception:
-  ///
-  /// If the task was reported COMPLETE but its downloaded file is proven
-  /// corrupt/truncated, a clean replacement task is allowed.
   static Future<String?> retryDownload() async {
     await _ensureInitialized();
 
@@ -697,27 +1042,37 @@ class DownloadManager {
         _currentTaskId;
 
     if (taskId == null) {
+      await _restoreLatestRecoverableTaskFromDatabase();
+    }
+
+    final resolvedTaskId =
+        _currentTaskId;
+
+    if (resolvedTaskId ==
+        null) {
       Logger.warning(
-        'No failed task available to retry',
+        'No failed task available to recover',
       );
 
       return null;
     }
 
     final record =
-        await _downloader.database
+        await _downloader
+            .database
             .recordForId(
-      taskId,
+      resolvedTaskId,
     );
 
     if (record != null &&
-        record.task is bg.DownloadTask) {
+        record.task
+            is bg.DownloadTask) {
       final task =
           record.task
               as bg.DownloadTask;
 
       // ---------------------------------------------------------------------
-      // Active task: nothing to recreate.
+      // Already active.
       // ---------------------------------------------------------------------
 
       if (record.status ==
@@ -731,8 +1086,9 @@ class DownloadManager {
       }
 
       // ---------------------------------------------------------------------
-      // Paused / failed:
-      // attempt native byte resume.
+      // Failed / paused:
+      //
+      // SAME task native resume only.
       // ---------------------------------------------------------------------
 
       if (record.status ==
@@ -741,7 +1097,8 @@ class DownloadManager {
               bg.TaskStatus.failed) {
         try {
           final resumed =
-              await _downloader.resume(
+              await _downloader
+                  .resume(
             task,
           );
 
@@ -750,7 +1107,7 @@ class DownloadManager {
                 task.taskId;
 
             Logger.info(
-              'Failed/paused model task resumed: '
+              'Failed/paused task resumed using SAME task: '
               '${task.taskId}',
             );
 
@@ -758,9 +1115,9 @@ class DownloadManager {
           }
 
           Logger.warning(
-            'Retry could not resume task '
-            '${task.taskId}. '
-            'Partial data remains preserved.',
+            'Could not resume task ${task.taskId}. '
+            'No zero-start task was created. '
+            'Partial data preserved.',
           );
 
           return null;
@@ -769,15 +1126,17 @@ class DownloadManager {
             'Retry/resume failed: $e',
           );
 
+          Logger.warning(
+            'No replacement task created. '
+            'Partial data preserved.',
+          );
+
           return null;
         }
       }
 
       // ---------------------------------------------------------------------
-      // COMPLETE but corrupt.
-      //
-      // A genuinely completed but truncated file has no useful resumable
-      // transfer anymore. A fresh task is permitted in this specific case.
+      // COMPLETE
       // ---------------------------------------------------------------------
 
       if (record.status ==
@@ -788,12 +1147,26 @@ class DownloadManager {
         );
 
         if (valid) {
+          // CRITICAL:
+          //
+          // COMPLETE + valid final model
+          // NEVER enqueue replacement.
+          Logger.info(
+            'Completed task already has a valid final model. '
+            'Replacement download blocked.',
+          );
+
           return task.taskId;
         }
 
+        // Only this case may create a clean replacement:
+        //
+        // native says COMPLETE
+        // AND final/.part verification proved corruption
+        // AND no valid final/recoverable sibling exists.
         Logger.warning(
-          'Completed task was corrupt. '
-          'Creating a clean replacement download.',
+          'Completed task output is proven corrupt/truncated. '
+          'Checking whether a clean replacement is safe.',
         );
 
         return _enqueueReplacementTask(
@@ -801,37 +1174,114 @@ class DownloadManager {
         );
       }
 
-      // canceled / notFound:
-      // never silently create a new multi-GB task.
       return null;
     }
 
     // -----------------------------------------------------------------------
-    // Legacy failed task migration fallback.
+    // LEGACY FAILED TASK
+    //
+    // flutter_downloader.retry() may create another task ID and cannot give
+    // this manager the same strong byte-resume guarantee.
+    //
+    // Therefore DO NOT automatically call legacy.retry().
     // -----------------------------------------------------------------------
 
     try {
-      final newTaskId =
+      final oldTasks =
           await legacy
-              .FlutterDownloader
-              .retry(
-        taskId: taskId,
-      );
+                  .FlutterDownloader
+              .loadTasks() ??
+              [];
 
-      if (newTaskId != null) {
-        _currentTaskId =
-            newTaskId;
+      legacy.DownloadTask?
+          oldTask;
 
-        Logger.info(
-          'Legacy task retried: '
-          '$taskId -> $newTaskId',
-        );
+      for (final item
+          in oldTasks) {
+        if (item.taskId ==
+            resolvedTaskId) {
+          oldTask =
+              item;
+
+          break;
+        }
       }
 
-      return newTaskId;
+      if (oldTask == null) {
+        return null;
+      }
+
+      if (oldTask.status ==
+              legacy
+                  .DownloadTaskStatus
+                  .running ||
+          oldTask.status ==
+              legacy
+                  .DownloadTaskStatus
+                  .enqueued) {
+        return oldTask.taskId;
+      }
+
+      if (oldTask.status ==
+          legacy
+              .DownloadTaskStatus
+              .paused) {
+        final resumedId =
+            await legacy
+                .FlutterDownloader
+                .resume(
+          taskId:
+              oldTask.taskId,
+        );
+
+        if (resumedId !=
+            null) {
+          _currentTaskId =
+              resumedId;
+        }
+
+        return resumedId;
+      }
+
+      if (oldTask.status ==
+          legacy
+              .DownloadTaskStatus
+              .complete) {
+        final filename =
+            oldTask.filename;
+
+        if (filename !=
+                null &&
+            oldTask.savedDir
+                .isNotEmpty) {
+          final file =
+              File(
+            '${oldTask.savedDir}/$filename',
+          );
+
+          if (await _isValidCompletedFile(
+            file,
+          )) {
+            Logger.info(
+              'Legacy completed task already has a valid model. '
+              'Fresh retry blocked.',
+            );
+
+            return oldTask.taskId;
+          }
+        }
+      }
+
+      Logger.warning(
+        'Legacy failed task cannot be guaranteed to resume byte-for-byte. '
+        'Automatic legacy.retry() is disabled. '
+        'Existing file data is preserved.',
+      );
+
+      return null;
     } catch (e) {
       Logger.error(
-        'Legacy retry failed: $e',
+        'Legacy recovery check failed: $e',
       );
 
       return null;
@@ -839,7 +1289,7 @@ class DownloadManager {
   }
 
   // ===========================================================================
-  // CANCEL WITHOUT EXTRA CLEANUP
+  // CANCEL WITHOUT DELETE
   // ===========================================================================
 
   static Future<void> cancelDownload() async {
@@ -859,7 +1309,8 @@ class DownloadManager {
 
     if (task != null) {
       try {
-        await _downloader.cancel(
+        await _downloader
+            .cancel(
           task,
         );
 
@@ -872,15 +1323,18 @@ class DownloadManager {
         );
       }
 
-      _currentTaskId = null;
+      _currentTaskId =
+          null;
 
       return;
     }
 
     try {
-      await legacy.FlutterDownloader
+      await legacy
+          .FlutterDownloader
           .cancel(
-        taskId: taskId,
+        taskId:
+            taskId,
       );
     } catch (e) {
       Logger.error(
@@ -888,16 +1342,14 @@ class DownloadManager {
       );
     }
 
-    _currentTaskId = null;
+    _currentTaskId =
+        null;
   }
 
   // ===========================================================================
   // EXPLICIT CANCEL + DELETE
   // ===========================================================================
 
-  /// Destructive operation.
-  ///
-  /// Call ONLY after the user explicitly confirms cancellation.
   static Future<void>
       cancelAndDeleteDownload() async {
     await _ensureInitialized();
@@ -926,22 +1378,24 @@ class DownloadManager {
         );
 
         final partPath =
-            await task.filePath();
+            await task
+                .filePath();
 
         final finalPath =
-            await task.filePath(
+            await task
+                .filePath(
           withFilename:
               logicalFileName,
         );
 
-        // Cancel native worker first.
         try {
-          await _downloader.cancel(
+          await _downloader
+              .cancel(
             task,
           );
         } catch (_) {}
 
-        // User explicitly requested deletion.
+        // EXPLICIT USER DELETE.
         await _deleteIfExists(
           partPath,
         );
@@ -950,9 +1404,9 @@ class DownloadManager {
           finalPath,
         );
 
-        // Remove persistent task record.
         try {
-          await _downloader.database
+          await _downloader
+              .database
               .deleteRecordWithId(
             taskId,
           );
@@ -962,10 +1416,11 @@ class DownloadManager {
           );
         }
 
-        _currentTaskId = null;
+        _currentTaskId =
+            null;
 
         Logger.info(
-          'User canceled model download; '
+          'User explicitly canceled model download; '
           'partial/final task files deleted.',
         );
 
@@ -975,15 +1430,12 @@ class DownloadManager {
           'Explicit background download cleanup failed: $e',
         );
 
-        _currentTaskId = null;
+        _currentTaskId =
+            null;
 
         return;
       }
     }
-
-    // -----------------------------------------------------------------------
-    // Old flutter_downloader task.
-    // -----------------------------------------------------------------------
 
     try {
       final oldTasks =
@@ -992,13 +1444,15 @@ class DownloadManager {
               .loadTasks() ??
               [];
 
-      legacy.DownloadTask? oldTask;
+      legacy.DownloadTask?
+          oldTask;
 
-      for (final item in oldTasks) {
+      for (final item
+          in oldTasks) {
         if (item.taskId ==
             taskId) {
-          oldTask = item;
-
+          oldTask =
+              item;
           break;
         }
       }
@@ -1007,26 +1461,33 @@ class DownloadManager {
         await legacy
             .FlutterDownloader
             .cancel(
-          taskId: taskId,
+          taskId:
+              taskId,
         );
       } catch (_) {}
 
-      await legacy.FlutterDownloader
+      await legacy
+          .FlutterDownloader
           .remove(
-        taskId: taskId,
-        shouldDeleteContent: true,
+        taskId:
+            taskId,
+        shouldDeleteContent:
+            true,
       );
 
       if (oldTask != null &&
-          oldTask.filename != null &&
-          oldTask.savedDir.isNotEmpty) {
+          oldTask.filename !=
+              null &&
+          oldTask.savedDir
+              .isNotEmpty) {
         await _deleteLegacyTaskFiles(
           oldTask.savedDir,
           oldTask.filename!,
         );
       }
 
-      _currentTaskId = null;
+      _currentTaskId =
+          null;
 
       Logger.info(
         'Legacy download canceled and deleted.',
@@ -1036,35 +1497,68 @@ class DownloadManager {
         'Legacy cancel/delete failed: $e',
       );
 
-      _currentTaskId = null;
+      _currentTaskId =
+          null;
     }
   }
 
   // ===========================================================================
-  // FINALIZATION
+  // SINGLE-FLIGHT COMPLETED FINALIZATION
   // ===========================================================================
 
-  /// Convert:
-  ///
-  /// model.task.part
-  ///
-  /// into:
-  ///
-  /// model.task
-  ///
-  /// only after final size validation.
-  ///
-  /// Returns true when a verified final file exists.
   static Future<bool> _finalizeCompletedTask(
     bg.Task rawTask,
-  ) async {
-    if (rawTask is! bg.DownloadTask) {
-      return false;
+  ) {
+    if (rawTask
+        is! bg.DownloadTask) {
+      return Future<bool>.value(
+        false,
+      );
     }
 
     final task =
         rawTask;
 
+    final existing =
+        _finalizationFutures[
+          task.taskId
+        ];
+
+    if (existing !=
+        null) {
+      Logger.debug(
+        'Finalization already running for '
+        '${task.taskId}; joining existing operation.',
+      );
+
+      return existing;
+    }
+
+    final future =
+        _finalizeCompletedTaskInternal(
+      task,
+    );
+
+    _finalizationFutures[
+            task.taskId] =
+        future;
+
+    future.whenComplete(
+      () {
+        _finalizationFutures
+            .remove(
+          task.taskId,
+        );
+      },
+    );
+
+    return future;
+  }
+
+  static Future<bool>
+      _finalizeCompletedTaskInternal(
+    bg.DownloadTask task,
+  ) async {
     final logicalFileName =
         _logicalFileName(
       task,
@@ -1072,72 +1566,125 @@ class DownloadManager {
 
     try {
       final partPath =
-          await task.filePath();
+          await task
+              .filePath();
 
       final finalPath =
-          await task.filePath(
+          await task
+              .filePath(
         withFilename:
             logicalFileName,
       );
 
       final partFile =
-          File(partPath);
+          File(
+        partPath,
+      );
 
       final finalFile =
-          File(finalPath);
+          File(
+        finalPath,
+      );
 
       final minimumValidSize =
-          (expectedModelFileSize *
-                  modelSizeTolerance)
-              .round();
+          _minimumValidModelSize;
 
       // ---------------------------------------------------------------------
-      // Final model already exists and is valid.
+      // 1. FINAL ALREADY VALID
       // ---------------------------------------------------------------------
 
-      if (await finalFile.exists()) {
+      if (await finalFile
+          .exists()) {
         final finalSize =
-            await finalFile.length();
+            await finalFile
+                .length();
 
         if (finalSize >=
             minimumValidSize) {
           Logger.info(
             'Verified final model already exists: '
-            '$finalPath ($finalSize bytes)',
+            '$finalPath ($finalSize bytes). '
+            'No replacement download required.',
           );
 
-          // Remove leftover .part only after final model is proven valid.
+          // This task is COMPLETE, therefore its leftover .part is safe to
+          // remove only AFTER final is proven valid.
           if (partPath !=
                   finalPath &&
-              await partFile.exists()) {
+              await partFile
+                  .exists()) {
             try {
-              await partFile.delete();
-            } catch (_) {}
+              await partFile
+                  .delete();
+
+              Logger.info(
+                'Removed leftover completed .part after '
+                'valid final was confirmed.',
+              );
+            } catch (e) {
+              Logger.warning(
+                'Could not remove leftover completed .part: $e',
+              );
+            }
           }
+
+          await _repairCompletedStateFromCanonicalModel();
 
           return true;
         }
 
-        // A task is COMPLETE and its final file is provably truncated.
-        // Safe to remove this corrupt final result.
+        // COMPLETE task + undersized final = proven bad completed output.
         Logger.error(
           'Corrupt completed final file: '
           '$finalSize bytes; '
-          'minimum required: $minimumValidSize',
+          'minimum=$minimumValidSize',
         );
 
         try {
-          await finalFile.delete();
-        } catch (_) {}
+          await finalFile
+              .delete();
+
+          Logger.info(
+            'Deleted proven corrupt completed final file.',
+          );
+        } catch (e) {
+          Logger.warning(
+            'Could not delete corrupt completed final: $e',
+          );
+        }
       }
 
       // ---------------------------------------------------------------------
-      // Completed .part result must exist.
+      // 2. COMPLETED .part MUST EXIST
       // ---------------------------------------------------------------------
 
-      if (!await partFile.exists()) {
+      if (!await partFile
+          .exists()) {
+        // Race safety:
+        //
+        // A previous finalizer might have renamed it just before this check.
+        // Re-check final before declaring failure.
+        if (await finalFile
+            .exists()) {
+          final finalSize =
+              await finalFile
+                  .length();
+
+          if (finalSize >=
+              minimumValidSize) {
+            await _repairCompletedStateFromCanonicalModel();
+
+            Logger.info(
+              'Final file appeared during reconciliation; '
+              'treating task as successfully finalized.',
+            );
+
+            return true;
+          }
+        }
+
         Logger.warning(
-          'Completed task has no .part output: '
+          'Completed task has neither valid final nor .part: '
           '$partPath',
         );
 
@@ -1145,12 +1692,11 @@ class DownloadManager {
       }
 
       final partSize =
-          await partFile.length();
+          await partFile
+              .length();
 
       // ---------------------------------------------------------------------
-      // COMPLETE + undersized means corruption/truncation.
-      //
-      // This is NOT a normal network-failure case.
+      // 3. COMPLETE + TOO-SMALL .part = PROVEN CORRUPT
       // ---------------------------------------------------------------------
 
       if (partSize <
@@ -1158,18 +1704,19 @@ class DownloadManager {
         Logger.error(
           'Completed .part file is truncated: '
           '$partSize bytes; '
-          'minimum required: $minimumValidSize',
+          'minimum=$minimumValidSize',
         );
 
         try {
-          await partFile.delete();
+          await partFile
+              .delete();
 
           Logger.info(
-            'Deleted verified corrupt completed .part file.',
+            'Deleted proven corrupt completed .part file.',
           );
         } catch (e) {
           Logger.error(
-            'Could not delete corrupt .part file: $e',
+            'Could not delete corrupt completed .part file: $e',
           );
         }
 
@@ -1177,21 +1724,23 @@ class DownloadManager {
       }
 
       // ---------------------------------------------------------------------
-      // Atomic same-filesystem rename.
+      // 4. ATOMIC SAME-FILESYSTEM RENAME
       // ---------------------------------------------------------------------
 
       if (partPath !=
           finalPath) {
-        await partFile.rename(
+        await partFile
+            .rename(
           finalPath,
         );
       }
 
       // ---------------------------------------------------------------------
-      // Verify again after rename.
+      // 5. POST-RENAME VALIDATION
       // ---------------------------------------------------------------------
 
-      if (!await finalFile.exists()) {
+      if (!await finalFile
+          .exists()) {
         Logger.error(
           'Final model missing after rename.',
         );
@@ -1200,23 +1749,28 @@ class DownloadManager {
       }
 
       final finalSize =
-          await finalFile.length();
+          await finalFile
+              .length();
 
       if (finalSize <
           minimumValidSize) {
         Logger.error(
-          'Final model failed post-rename validation.',
+          'Final model failed post-rename validation: '
+          '$finalSize bytes',
         );
 
         try {
-          await finalFile.delete();
+          await finalFile
+              .delete();
         } catch (_) {}
 
         return false;
       }
 
+      await _repairCompletedStateFromCanonicalModel();
+
       Logger.info(
-        'Model finalized successfully:\n'
+        'Model finalized exactly once:\n'
         '$partPath\n'
         '->\n'
         '$finalPath\n'
@@ -1225,42 +1779,62 @@ class DownloadManager {
 
       return true;
     } catch (e, st) {
-      // A rename/filesystem error is NOT grounds for deleting a valid .part.
+      // A filesystem/rename error is NOT a reason to delete valid .part data.
       Logger.error(
         'Model finalization failed: $e',
       );
 
-      Logger.error('$st');
+      Logger.error(
+        '$st',
+      );
 
       Logger.warning(
-        'Downloaded .part file was preserved.',
+        'Downloaded .part file was preserved whenever still present.',
       );
+
+      // Last race-safe check.
+      try {
+        if (await _canonicalFinalModelIsValid(
+          logicalFileName,
+          repairState:
+              true,
+        )) {
+          return true;
+        }
+      } catch (_) {}
 
       return false;
     }
   }
 
-  /// App may have been killed after native completion but before Dart had a
-  /// chance to rename .part -> final.
+  // ===========================================================================
+  // STARTUP COMPLETED TASK RECONCILIATION
+  // ===========================================================================
+
   static Future<void>
       _finalizeCompletedTasksFromDatabase() async {
     try {
       final records =
-          await _downloader.database
+          await _downloader
+              .database
               .allRecords(
         group:
             _downloadGroup,
       );
 
-      for (final record in records) {
-        if (record.status ==
-                bg.TaskStatus.complete &&
+      for (final record
+          in records) {
+        if (record.status !=
+                bg.TaskStatus
+                    .complete ||
             record.task
-                is bg.DownloadTask) {
-          await _finalizeCompletedTask(
-            record.task,
-          );
+                is! bg.DownloadTask) {
+          continue;
         }
+
+        await _finalizeCompletedTask(
+          record.task,
+        );
       }
     } catch (e) {
       Logger.warning(
@@ -1270,7 +1844,73 @@ class DownloadManager {
   }
 
   // ===========================================================================
-  // FRESH REPLACEMENT — ONLY FOR VERIFIED CORRUPT COMPLETE TASK
+  // RESTORE RECOVERABLE TASK AFTER PROCESS RESTART
+  // ===========================================================================
+
+  static Future<void>
+      _restoreLatestRecoverableTaskFromDatabase() async {
+    try {
+      final records =
+          await _downloader
+              .database
+              .allRecords(
+        group:
+            _downloadGroup,
+      );
+
+      bg.DownloadTask?
+          selected;
+
+      for (final record
+          in records) {
+        if (record.task
+            is! bg.DownloadTask) {
+          continue;
+        }
+
+        if (!_isRecoverableBackgroundStatus(
+          record.status,
+        )) {
+          continue;
+        }
+
+        final task =
+            record.task
+                as bg.DownloadTask;
+
+        if (selected ==
+                null ||
+            task.creationTime
+                .isAfter(
+              selected
+                  .creationTime,
+            )) {
+          selected =
+              task;
+        }
+      }
+
+      if (selected ==
+          null) {
+        return;
+      }
+
+      _currentTaskId =
+          selected.taskId;
+
+      Logger.info(
+        'Restored recoverable background task after restart: '
+        '${selected.taskId}',
+      );
+    } catch (e) {
+      Logger.warning(
+        'Could not restore background task after restart: $e',
+      );
+    }
+  }
+
+  // ===========================================================================
+  // REPLACEMENT — ONLY PROVEN CORRUPT COMPLETE
   // ===========================================================================
 
   static Future<String?>
@@ -1282,45 +1922,80 @@ class DownloadManager {
       previous,
     );
 
+    // -----------------------------------------------------------------------
+    // Re-check final immediately before replacement.
+    //
+    // Another callback/finalizer may have completed successfully.
+    // -----------------------------------------------------------------------
+
+    if (await _canonicalFinalModelIsValid(
+      logicalFileName,
+      repairState:
+          true,
+    )) {
+      Logger.info(
+        'Replacement canceled: '
+        'valid final model appeared during reconciliation.',
+      );
+
+      return previous.taskId;
+    }
+
+    // -----------------------------------------------------------------------
+    // Never enqueue a replacement while ANOTHER recoverable task exists.
+    // -----------------------------------------------------------------------
+
+    final sibling =
+        await _findRecoverableBackgroundTask(
+      logicalFileName,
+      excludingTaskId:
+          previous.taskId,
+    );
+
+    if (sibling !=
+        null) {
+      _currentTaskId =
+          sibling.taskId;
+
+      Logger.warning(
+        'Replacement canceled: '
+        'another recoverable task already exists '
+        '(${sibling.taskId}).',
+      );
+
+      return sibling.taskId;
+    }
+
     final replacement =
         bg.DownloadTask(
       url:
           previous.url,
-
       filename:
           _partFileName(
         logicalFileName,
       ),
-
       baseDirectory:
-          previous.baseDirectory,
-
+          previous
+              .baseDirectory,
       directory:
           previous.directory,
-
       headers:
           previous.headers,
-
       group:
           _downloadGroup,
-
       updates:
           bg.Updates
               .statusAndProgress,
-
       requiresWiFi:
           previous.requiresWiFi,
-
       retries:
           _automaticRetries,
-
-      allowPause: true,
-
-      priority: 5,
-
+      allowPause:
+          true,
+      priority:
+          5,
       metaData:
           logicalFileName,
-
       displayName:
           previous.displayName
                   .isNotEmpty
@@ -1329,7 +2004,8 @@ class DownloadManager {
     );
 
     final enqueued =
-        await _downloader.enqueue(
+        await _downloader
+            .enqueue(
       replacement,
     );
 
@@ -1344,8 +2020,9 @@ class DownloadManager {
     _currentTaskId =
         replacement.taskId;
 
-    Logger.info(
-      'Created replacement task after verified corruption: '
+    Logger.warning(
+      'Clean replacement created ONLY because '
+      'the previous COMPLETE output was proven corrupt: '
       '${replacement.taskId}',
     );
 
@@ -1353,7 +2030,7 @@ class DownloadManager {
   }
 
   // ===========================================================================
-  // GET BACKGROUND TASK
+  // BACKGROUND TASK LOOKUP
   // ===========================================================================
 
   static Future<bg.DownloadTask?>
@@ -1362,7 +2039,8 @@ class DownloadManager {
   ) async {
     try {
       final activeTask =
-          await _downloader.taskForId(
+          await _downloader
+              .taskForId(
         taskId,
       );
 
@@ -1372,7 +2050,8 @@ class DownloadManager {
       }
 
       final record =
-          await _downloader.database
+          await _downloader
+              .database
               .recordForId(
         taskId,
       );
@@ -1391,17 +2070,80 @@ class DownloadManager {
     return null;
   }
 
+  static Future<bg.DownloadTask?>
+      _findRecoverableBackgroundTask(
+    String logicalFileName, {
+    String? excludingTaskId,
+  }) async {
+    try {
+      final records =
+          await _downloader
+              .database
+              .allRecords(
+        group:
+            _downloadGroup,
+      );
+
+      bg.DownloadTask?
+          selected;
+
+      for (final record
+          in records) {
+        if (record.task
+            is! bg.DownloadTask) {
+          continue;
+        }
+
+        final task =
+            record.task
+                as bg.DownloadTask;
+
+        if (excludingTaskId !=
+                null &&
+            task.taskId ==
+                excludingTaskId) {
+          continue;
+        }
+
+        if (_logicalFileName(
+              task,
+            ) !=
+            logicalFileName) {
+          continue;
+        }
+
+        if (!_isRecoverableBackgroundStatus(
+          record.status,
+        )) {
+          continue;
+        }
+
+        if (selected ==
+                null ||
+            task.creationTime
+                .isAfter(
+              selected
+                  .creationTime,
+            )) {
+          selected =
+              task;
+        }
+      }
+
+      return selected;
+    } catch (e) {
+      Logger.warning(
+        'Recoverable-task lookup failed: $e',
+      );
+
+      return null;
+    }
+  }
+
   // ===========================================================================
   // COMPATIBILITY TASK LIST
   // ===========================================================================
 
-  /// Returns flutter_downloader-compatible task objects so the existing
-  /// download_logic.dart can continue working during migration.
-  ///
-  /// NEW background_downloader records are converted into legacy-looking
-  /// DownloadTask objects.
-  ///
-  /// Old flutter_downloader tasks are appended as-is.
   static Future<List<legacy.DownloadTask>>
       getAllTasks() async {
     await _ensureInitialized();
@@ -1412,19 +2154,17 @@ class DownloadManager {
     final ids =
         <String>{};
 
-    // -----------------------------------------------------------------------
-    // New background_downloader records.
-    // -----------------------------------------------------------------------
-
     try {
       final records =
-          await _downloader.database
+          await _downloader
+              .database
               .allRecords(
         group:
             _downloadGroup,
       );
 
-      for (final record in records) {
+      for (final record
+          in records) {
         if (record.task
             is! bg.DownloadTask) {
           continue;
@@ -1449,10 +2189,6 @@ class DownloadManager {
       );
     }
 
-    // -----------------------------------------------------------------------
-    // Old tasks created before migration.
-    // -----------------------------------------------------------------------
-
     try {
       final oldTasks =
           await legacy
@@ -1460,7 +2196,8 @@ class DownloadManager {
               .loadTasks() ??
               [];
 
-      for (final task in oldTasks) {
+      for (final task
+          in oldTasks) {
         if (ids.add(
           task.taskId,
         )) {
@@ -1470,8 +2207,6 @@ class DownloadManager {
         }
       }
     } catch (e) {
-      // This can happen once flutter_downloader initialization is removed
-      // from main.dart at the END of the migration.
       Logger.debug(
         'Legacy task database unavailable: $e',
       );
@@ -1485,15 +2220,12 @@ class DownloadManager {
     bg.TaskRecord record,
   ) async {
     final task =
-        record.task as bg.DownloadTask;
+        record.task
+            as bg.DownloadTask;
 
-    bg.TaskStatus effectiveStatus =
+    bg.TaskStatus
+        effectiveStatus =
         record.status;
-
-    // -----------------------------------------------------------------------
-    // When native task says complete, perform .part -> final processing before
-    // exposing the task as completed to the old DownloadLogic.
-    // -----------------------------------------------------------------------
 
     if (record.status ==
         bg.TaskStatus.complete) {
@@ -1509,12 +2241,13 @@ class DownloadManager {
     }
 
     final filePath =
-        await task.filePath();
+        await task
+            .filePath();
 
     final savedDir =
-        File(filePath)
-            .parent
-            .path;
+        File(
+      filePath,
+    ).parent.path;
 
     final progress =
         _legacyProgressPercent(
@@ -1524,23 +2257,16 @@ class DownloadManager {
     return legacy.DownloadTask(
       taskId:
           task.taskId,
-
       status:
           _legacyStatus(
         effectiveStatus,
       ),
-
       progress:
           progress,
-
       url:
           task.url,
 
-      // IMPORTANT:
-      //
-      // Existing download_logic.dart expects modelName here.
-      //
-      // The physical downloader output is modelName.part.
+      // Logical model filename, not physical .part filename.
       filename:
           _logicalFileName(
         task,
@@ -1548,11 +2274,9 @@ class DownloadManager {
 
       savedDir:
           savedDir,
-
       timeCreated:
           task.creationTime
               .millisecondsSinceEpoch,
-
       allowCellular:
           !task.requiresWiFi,
     );
@@ -1600,15 +2324,18 @@ class DownloadManager {
   static int _legacyProgressPercent(
     double progress,
   ) {
-    if (progress <= 0) {
+    if (progress <=
+        0) {
       return 0;
     }
 
-    if (progress >= 1) {
+    if (progress >=
+        1) {
       return 100;
     }
 
-    return (progress * 100)
+    return (progress *
+            100)
         .round()
         .clamp(
           0,
@@ -1617,23 +2344,145 @@ class DownloadManager {
   }
 
   // ===========================================================================
-  // FAILED DOWNLOAD CLEANUP
+  // STATUS HELPERS
   // ===========================================================================
 
-  /// SAFE compatibility method.
-  ///
-  /// OLD behavior:
-  ///
-  /// failed
-  /// -> shouldDeleteContent:true
-  /// -> partial progress destroyed
-  ///
-  /// NEW behavior:
-  ///
-  /// failed
-  /// -> KEEP
-  ///
-  /// This method intentionally performs no destructive cleanup.
+  static bool _isRecoverableBackgroundStatus(
+    bg.TaskStatus status,
+  ) {
+    return status ==
+            bg.TaskStatus
+                .running ||
+        status ==
+            bg.TaskStatus
+                .enqueued ||
+        status ==
+            bg.TaskStatus
+                .waitingToRetry ||
+        status ==
+            bg.TaskStatus
+                .paused ||
+        status ==
+            bg.TaskStatus
+                .failed;
+  }
+
+  static bool _isRecoverableLegacyStatus(
+    legacy.DownloadTaskStatus status,
+  ) {
+    return status ==
+            legacy
+                .DownloadTaskStatus
+                .running ||
+        status ==
+            legacy
+                .DownloadTaskStatus
+                .enqueued ||
+        status ==
+            legacy
+                .DownloadTaskStatus
+                .paused ||
+        status ==
+            legacy
+                .DownloadTaskStatus
+                .failed;
+  }
+
+  // ===========================================================================
+  // PHYSICAL FINAL MODEL
+  // ===========================================================================
+
+  static int get _minimumValidModelSize =>
+      (expectedModelFileSize *
+              modelSizeTolerance)
+          .round();
+
+  static Future<bool>
+      _isValidCompletedFile(
+    File file,
+  ) async {
+    try {
+      if (!await file
+          .exists()) {
+        return false;
+      }
+
+      final size =
+          await file
+              .length();
+
+      return size >=
+          _minimumValidModelSize;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<bool>
+      _canonicalFinalModelIsValid(
+    String fileName, {
+    required bool repairState,
+  }) async {
+    try {
+      final documents =
+          await getApplicationDocumentsDirectory();
+
+      final file =
+          File(
+        '${documents.path}/$fileName',
+      );
+
+      if (!await _isValidCompletedFile(
+        file,
+      )) {
+        return false;
+      }
+
+      if (repairState) {
+        try {
+          final size =
+              await file
+                  .length();
+
+          await DownloadStateManager
+              .saveDownloadCompleted(
+            downloadedBytes:
+                size,
+            expectedBytes:
+                expectedModelFileSize,
+            verified:
+                true,
+          );
+        } catch (e) {
+          Logger.warning(
+            'Canonical model is valid but state repair failed: $e',
+          );
+        }
+      }
+
+      return true;
+    } catch (e) {
+      Logger.warning(
+        'Canonical final model check failed: $e',
+      );
+
+      return false;
+    }
+  }
+
+  static Future<bool>
+      _repairCompletedStateFromCanonicalModel() async {
+    return _canonicalFinalModelIsValid(
+      modelName,
+      repairState:
+          true,
+    );
+  }
+
+  // ===========================================================================
+  // SAFE FAILED DOWNLOAD CLEANUP
+  // ===========================================================================
+
   static Future<void>
       cleanupFailedDownloads() async {
     Logger.info(
@@ -1646,30 +2495,29 @@ class DownloadManager {
   // EXPLICIT FULL MODEL CLEANUP
   // ===========================================================================
 
-  /// Destructive maintenance/reset operation.
-  ///
-  /// Do not call automatically after a network failure.
   static Future<void>
       cleanupAllModelFiles() async {
     await _ensureInitialized();
 
     try {
-      // Cancel tasks from our model group.
       try {
-        await _downloader.cancelAll(
+        await _downloader
+            .cancelAll(
           group:
               _downloadGroup,
         );
       } catch (_) {}
 
       final records =
-          await _downloader.database
+          await _downloader
+              .database
               .allRecords(
         group:
             _downloadGroup,
       );
 
-      for (final record in records) {
+      for (final record
+          in records) {
         if (record.task
             is bg.DownloadTask) {
           final task =
@@ -1678,10 +2526,12 @@ class DownloadManager {
 
           try {
             final partPath =
-                await task.filePath();
+                await task
+                    .filePath();
 
             final finalPath =
-                await task.filePath(
+                await task
+                    .filePath(
               withFilename:
                   _logicalFileName(
                 task,
@@ -1699,25 +2549,27 @@ class DownloadManager {
         }
 
         try {
-          await _downloader.database
+          await _downloader
+              .database
               .deleteRecordWithId(
             record.taskId,
           );
         } catch (_) {}
       }
 
-      // Also clean old files/tasks from the migration period.
       final oldTasks =
           await legacy
                   .FlutterDownloader
               .loadTasks() ??
               [];
 
-      for (final task in oldTasks) {
+      for (final task
+          in oldTasks) {
         final filename =
             task.filename;
 
-        if (filename == null) {
+        if (filename ==
+            null) {
           continue;
         }
 
@@ -1743,7 +2595,8 @@ class DownloadManager {
         }
       }
 
-      _currentTaskId = null;
+      _currentTaskId =
+          null;
 
       Logger.info(
         'All model download data explicitly cleaned.',
@@ -1762,7 +2615,8 @@ class DownloadManager {
   static String _partFileName(
     String finalFileName,
   ) {
-    if (finalFileName.endsWith(
+    if (finalFileName
+        .endsWith(
       '.part',
     )) {
       return finalFileName;
@@ -1775,7 +2629,8 @@ class DownloadManager {
     bg.DownloadTask task,
   ) {
     final meta =
-        task.metaData.trim();
+        task.metaData
+            .trim();
 
     if (meta.isNotEmpty) {
       return meta;
@@ -1784,10 +2639,12 @@ class DownloadManager {
     final filename =
         task.filename;
 
-    if (filename.endsWith(
+    if (filename
+        .endsWith(
       '.part',
     )) {
-      return filename.substring(
+      return filename
+          .substring(
         0,
         filename.length -
             '.part'.length,
@@ -1801,14 +2658,18 @@ class DownloadManager {
     String path,
   ) async {
     final file =
-        File(path);
+        File(
+      path,
+    );
 
-    if (!await file.exists()) {
+    if (!await file
+        .exists()) {
       return;
     }
 
     try {
-      await file.delete();
+      await file
+          .delete();
 
       Logger.info(
         'Deleted file: $path',
@@ -1825,8 +2686,10 @@ class DownloadManager {
     String savedDir,
     String filename,
   ) async {
-    if (savedDir.isEmpty ||
-        filename.isEmpty) {
+    if (savedDir
+            .isEmpty ||
+        filename
+            .isEmpty) {
       return;
     }
 
@@ -1853,4 +2716,20 @@ class DownloadManager {
       '$basePath.crdownload',
     );
   }
+}
+
+// =============================================================================
+// INTERNAL RECONCILIATION RESULT
+// =============================================================================
+
+class _DownloadReconciliation {
+  final bool validFinalExists;
+
+  final String? existingTaskId;
+
+  const _DownloadReconciliation({
+    this.validFinalExists =
+        false,
+    this.existingTaskId,
+  });
 }
