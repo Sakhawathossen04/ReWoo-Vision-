@@ -1,8 +1,8 @@
 # ReWoo Vision
 
-Controller-free, Bangla-first visual assistance app for blind and low-vision users.
+Bangla-first visual assistance app for blind and low-vision users.
 
-The original app used an 8BitDo controller as a fast hardware shortcut layer. This version removes the controller from the primary workflow and makes Bengali voice commands the main interaction method while preserving the original on-device Gemma 3n vision pipeline.
+
 
 ## What's new in this release (v1.3 — download fixed)
 
